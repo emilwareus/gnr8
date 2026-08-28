@@ -195,16 +195,27 @@ pub struct GenerateOutcome {
 ///
 /// `--force` is NOT applied here (it lives in [`apply_writes`]) so the classification stays pure.
 #[must_use]
-pub fn plan_writes(
+pub fn plan_writes<'disk>(
     artifacts: &[Artifact],
     manifest: &Manifest,
-    on_disk: &dyn Fn(&str) -> Option<Vec<u8>>,
+    on_disk: &dyn Fn(&str) -> Option<&'disk [u8]>,
 ) -> WritePlan {
+    // Every artifact's own digest depends on nothing but that artifact, and on a large SDK this is
+    // megabytes of it, so the machine computes them at once. The decision below still walks the
+    // artifacts in order.
+    let new_hashes = crate::parallel::map_ordered(artifacts, |artifact| {
+        Ok(blake3_hex(artifact.text.as_bytes()))
+    })
+    .unwrap_or_else(|_| {
+        artifacts
+            .iter()
+            .map(|artifact| blake3_hex(artifact.text.as_bytes()))
+            .collect()
+    });
     let mut files = Vec::with_capacity(artifacts.len());
-    for artifact in artifacts {
+    for (artifact, new_hash) in artifacts.iter().zip(new_hashes) {
         let path = &artifact.path;
         let new_bytes = artifact.text.as_bytes();
-        let new_hash = blake3_hex(new_bytes);
         // The five arms are the documented WS-04/WATCH-01 truth table; arms 1 and 3 deliberately
         // share the `Write` body but are kept as distinct, separately-commented cases for clarity
         // (collapsing them would hide the difference between "absent" and "owned-but-changed").
@@ -216,9 +227,7 @@ pub fn plan_writes(
             // recovers after cache loss or an interrupted manifest save without rewriting bytes.
             (Some(disk), _) if disk == new_bytes => WriteAction::Unchanged,
             // 4. present, recorded, but its CURRENT hash != what we last wrote → user hand-edited it.
-            (Some(disk), Some(recorded)) if blake3_hex(&disk) != recorded => {
-                WriteAction::UserEdited
-            }
+            (Some(disk), Some(recorded)) if blake3_hex(disk) != recorded => WriteAction::UserEdited,
             // 3. present, gnr8-owned, content changed → write the update.
             (Some(_), Some(_)) => WriteAction::Write,
             // 6. present, unowned, and divergent → protect the pre-existing file.
@@ -862,6 +871,12 @@ impl OutputPathGuard {
         let identity = portable_path_identity(rel).map_err(|reason| crate::CoreError::Io {
             message: format!("refusing to write non-portable output path {rel:?}: {reason}"),
         })?;
+        Ok((self.prove(rel)?, identity))
+    }
+
+    /// Everything [`Self::resolve_with_identity`] proves except the portable identity, for the
+    /// caller that already computed that fold.
+    fn prove(&mut self, rel: &str) -> Result<std::path::PathBuf, crate::CoreError> {
         let candidate = Path::new(rel);
         let mut segments = Vec::new();
         for component in candidate.components() {
@@ -920,7 +935,7 @@ impl OutputPathGuard {
                 }
             }
         }
-        Ok((safe, identity))
+        Ok(safe)
     }
 }
 
@@ -2287,8 +2302,19 @@ fn validate_output_paths(
 ) -> Result<(), crate::CoreError> {
     let mut seen = BTreeMap::new();
     let mut paths = OutputPathGuard::new(project_root);
-    for artifact in artifacts {
-        let (_, collision_key) = paths.resolve_with_identity(&artifact.path)?;
+    // Folding a path to its portable identity is Unicode work that depends on nothing but that
+    // path, and there are thousands of them; the walk that reports a collision stays in order,
+    // because the pair it names has to be the first one.
+    let identities = crate::parallel::map_ordered(artifacts, |artifact| {
+        portable_path_identity(&artifact.path).map_err(|reason| crate::CoreError::Io {
+            message: format!(
+                "refusing to write non-portable output path {:?}: {reason}",
+                artifact.path
+            ),
+        })
+    })?;
+    for (artifact, collision_key) in artifacts.iter().zip(identities) {
+        let _ = paths.prove(&artifact.path)?;
         if let Some(previous) = seen.insert(collision_key, artifact.path.as_str()) {
             return Err(crate::CoreError::ArtifactOwnership {
                 code: "artifact.path_collision".to_string(),
@@ -2619,7 +2645,7 @@ pub fn plan_only(
     )
     .map_err(recovery_io_error)?;
     let disk = read_artifacts_from_disk(project_root, artifacts)?;
-    let on_disk = move |path: &str| -> Option<Vec<u8>> { disk.get(path).cloned().flatten() };
+    let on_disk = |path: &str| -> Option<&[u8]> { disk.get(path)?.as_deref() };
     Ok(plan_writes(artifacts, &manifest, &on_disk))
 }
 
@@ -2677,7 +2703,7 @@ pub fn regenerate_with_anchors(
     .map_err(recovery_io_error)?;
 
     let disk = read_artifacts_from_disk(project_root, artifacts)?;
-    let on_disk = move |path: &str| -> Option<Vec<u8>> { disk.get(path).cloned().flatten() };
+    let on_disk = |path: &str| -> Option<&[u8]> { disk.get(path)?.as_deref() };
     let plan = plan_writes(artifacts, &manifest, &on_disk);
 
     let recovery_files = generation_recovery_files(

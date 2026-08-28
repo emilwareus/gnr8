@@ -140,9 +140,9 @@ where
 /// something else — which is the whole point when what the caller does in between is wait on another
 /// process.
 ///
-/// The FIRST task runs on the caller's own thread, because the caller is about to block on it and
-/// nothing is gained by making it share the machine with tasks whose results are not wanted yet. The
-/// rest start behind it, in the window the caller was going to spend elsewhere.
+/// Only the FIRST task starts immediately: the caller is about to block on it, and handing the
+/// machine to tasks whose results are not wanted yet just makes that wait longer. The rest start
+/// once that first result is taken — in the window the caller was going to spend elsewhere.
 ///
 /// Order and failure reporting match [`map_ordered`]: results come back in task order, and a task
 /// that panics becomes a typed error rather than a propagated unwind (RUST-04).
@@ -181,24 +181,29 @@ where
     /// Returns the task's own failure, or [`CoreError::SdkGen`] if it panicked or if more results
     /// were asked for than tasks were given.
     pub(crate) fn next(&mut self) -> Result<T, CoreError> {
-        if let Some(first) = self.waiting.pop_front() {
-            // Everything still waiting goes to the machine now: from here on the caller has other
-            // work between one result and the next, and that window is what pays for them.
-            for task in self.waiting.drain(..) {
-                self.running.push_back(self.scope.spawn(task));
+        if self.running.is_empty() {
+            // Nothing is running yet, so start ONLY what the caller is waiting for. Handing the
+            // machine to tasks whose results are not wanted yet just makes this one take longer.
+            if let Some(first) = self.waiting.pop_front() {
+                self.running.push_back(self.scope.spawn(first));
             }
-            return first();
         }
         let Some(handle) = self.running.pop_front() else {
             return Err(CoreError::SdkGen {
                 message: "asked for the result of a computation that was never started".to_string(),
             });
         };
-        handle.join().unwrap_or_else(|_| {
+        let result = handle.join().unwrap_or_else(|_| {
             Err(CoreError::SdkGen {
                 message: "a generation worker thread stopped unexpectedly".to_string(),
             })
-        })
+        });
+        // From here on the caller has its own work between one result and the next, and that window
+        // is what everything still waiting is paid for out of.
+        for task in self.waiting.drain(..) {
+            self.running.push_back(self.scope.spawn(task));
+        }
+        result
     }
 }
 
