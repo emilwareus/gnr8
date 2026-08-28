@@ -20,8 +20,15 @@
 //! Every message is one self-delimiting, digest-checked frame:
 //!
 //! ```text
-//! b"GN8F" | payload length: u32 big-endian | BLAKE3(payload): 32 bytes | payload: compact JSON
+//! b"GN8F" | payload length: u32 big-endian | BLAKE3(payload): 32 bytes | payload
+//! payload = header length: u32 | header: compact JSON | (body length: u32 | body: UTF-8)*
 //! ```
+//!
+//! The bodies are the one thing a generated artifact is mostly made of: its text. JSON would escape
+//! every quote and newline of a Go or TypeScript file on the way out and unescape them on the way
+//! in, which on a 332-artifact project was 16ms of a warm run to move bytes that need no encoding at
+//! all. So the text travels beside the JSON, length-prefixed, and the header carries everything
+//! else. A message that has no artifacts simply carries no bodies.
 //!
 //! Three properties matter and each is enforced here rather than assumed:
 //!
@@ -47,7 +54,7 @@ use crate::Error;
 /// Bumped on any breaking change to the frame or message shape. Both sides refuse to proceed on a
 /// mismatch, so a `.gnr8/` crate built against a skewed SDK fails with an actionable error rather
 /// than a confusing parse failure or silently-wrong output.
-pub const PROTOCOL_VERSION: u32 = 3;
+pub const PROTOCOL_VERSION: u32 = 4;
 
 /// The frame magic. A stream that does not start with it is not this protocol.
 pub const FRAME_MAGIC: [u8; 4] = *b"GN8F";
@@ -66,7 +73,7 @@ pub const MAX_FRAME_BYTES: usize = 64 * 1024 * 1024;
 #[must_use]
 pub fn capability_digest(sdk_version: &str) -> String {
     let manifest = format!(
-        "gnr8-sdk:{sdk_version};protocol:{PROTOCOL_VERSION};frames:1;plan:1;artifacts:1;patched:1"
+        "gnr8-sdk:{sdk_version};protocol:{PROTOCOL_VERSION};frames:2;plan:1;artifacts:1;patched:1"
     );
     blake3::hash(manifest.as_bytes()).to_hex().to_string()
 }
@@ -307,6 +314,55 @@ pub enum HostMessage {
     Shutdown,
 }
 
+impl HostMessage {
+    /// Lift the artifact text out of this message so it travels beside the JSON, not inside it.
+    #[must_use]
+    pub fn into_frame(mut self) -> Frame<Self> {
+        let bodies = match &mut self {
+            Self::GenerateTargets { artifacts, .. } | Self::RunPosts { artifacts, .. } => {
+                take_bodies(&mut artifacts.fresh)
+            }
+            Self::Hello { .. }
+            | Self::LoadSource { .. }
+            | Self::ApplyTransforms { .. }
+            | Self::FreezeGraph { .. }
+            | Self::Shutdown => Vec::new(),
+        };
+        Frame {
+            message: self,
+            bodies,
+        }
+    }
+}
+
+impl Frame<HostMessage> {
+    /// Put the frame's bodies back on the artifacts that named them.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`Error::Protocol`] when the frame carries a different number of bodies than the
+    /// message has artifacts — a frame that was assembled by something other than
+    /// [`HostMessage::into_frame`].
+    pub fn into_message(self) -> Result<HostMessage, Error> {
+        let Self {
+            mut message,
+            bodies,
+        } = self;
+        match &mut message {
+            HostMessage::GenerateTargets { artifacts, .. }
+            | HostMessage::RunPosts { artifacts, .. } => {
+                put_bodies(&mut artifacts.fresh, bodies)?;
+            }
+            HostMessage::Hello { .. }
+            | HostMessage::LoadSource { .. }
+            | HostMessage::ApplyTransforms { .. }
+            | HostMessage::FreezeGraph { .. }
+            | HostMessage::Shutdown => refuse_unexpected_bodies(&bodies)?,
+        }
+        Ok(message)
+    }
+}
+
 /// A message the worker sends to the host.
 ///
 /// As with [`HostMessage`], one value exists at a time and is serialized immediately.
@@ -352,15 +408,123 @@ pub enum WorkerMessage {
     },
 }
 
-/// Serialize `message` and write it as one frame.
+impl WorkerMessage {
+    /// Lift the artifact text out of this message so it travels beside the JSON, not inside it.
+    #[must_use]
+    pub fn into_frame(mut self) -> Frame<Self> {
+        let bodies = match &mut self {
+            Self::ArtifactChanges { changed } => take_bodies(changed),
+            Self::Ready { .. } | Self::Graph { .. } | Self::Done | Self::Failed { .. } => {
+                Vec::new()
+            }
+        };
+        Frame {
+            message: self,
+            bodies,
+        }
+    }
+}
+
+impl Frame<WorkerMessage> {
+    /// Put the frame's bodies back on the artifacts that named them.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`Error::Protocol`] when the frame carries a different number of bodies than the
+    /// message has artifacts.
+    pub fn into_message(self) -> Result<WorkerMessage, Error> {
+        let Self {
+            mut message,
+            bodies,
+        } = self;
+        match &mut message {
+            WorkerMessage::ArtifactChanges { changed } => put_bodies(changed, bodies)?,
+            WorkerMessage::Ready { .. }
+            | WorkerMessage::Graph { .. }
+            | WorkerMessage::Done
+            | WorkerMessage::Failed { .. } => refuse_unexpected_bodies(&bodies)?,
+        }
+        Ok(message)
+    }
+}
+
+/// Take every artifact's text, leaving the artifacts as the header the frame's JSON carries.
+fn take_bodies(artifacts: &mut [Artifact]) -> Vec<String> {
+    artifacts
+        .iter_mut()
+        .map(|artifact| std::mem::take(&mut artifact.text))
+        .collect()
+}
+
+/// Give every artifact back the text the frame carried for it.
+fn put_bodies(artifacts: &mut [Artifact], bodies: Vec<String>) -> Result<(), Error> {
+    if artifacts.len() != bodies.len() {
+        return Err(Error::protocol(format!(
+            "a frame carries {} artifact bodies for {} artifacts",
+            bodies.len(),
+            artifacts.len()
+        )));
+    }
+    for (artifact, body) in artifacts.iter_mut().zip(bodies) {
+        artifact.text = body;
+    }
+    Ok(())
+}
+
+/// A message that carries no artifacts carries no bodies either.
+fn refuse_unexpected_bodies(bodies: &[String]) -> Result<(), Error> {
+    if bodies.is_empty() {
+        return Ok(());
+    }
+    Err(Error::protocol(format!(
+        "a frame carries {} artifact bodies for a message that has no artifacts",
+        bodies.len()
+    )))
+}
+
+/// One frame's contents: the message, and the generated text it carries beside the JSON.
+///
+/// Every send goes through [`HostMessage::into_frame`] / [`WorkerMessage::into_frame`] and every
+/// receive through [`Frame::into_message`], so lifting the text out and putting it back is one
+/// operation per direction rather than something each call site remembers to do.
+#[derive(Debug)]
+pub struct Frame<M> {
+    /// The message, with the text of every artifact it carries left empty.
+    pub message: M,
+    /// The text of those artifacts, in the order the message lists them.
+    pub bodies: Vec<String>,
+}
+
+/// The frame a message with no artifact text is written as.
+impl<M> From<M> for Frame<M> {
+    fn from(message: M) -> Self {
+        Self {
+            message,
+            bodies: Vec::new(),
+        }
+    }
+}
+
+/// Serialize `frame` and write it as one frame.
 ///
 /// # Errors
 ///
 /// Returns [`Error::Protocol`] when the payload cannot be serialized, exceeds
 /// [`MAX_FRAME_BYTES`], or cannot be written.
-pub fn write_frame<W: Write>(writer: &mut W, message: &impl serde::Serialize) -> Result<(), Error> {
-    let payload = serde_json::to_vec(message)
+pub fn write_frame<W: Write, M: serde::Serialize>(
+    writer: &mut W,
+    frame: &Frame<M>,
+) -> Result<(), Error> {
+    let header = serde_json::to_vec(&frame.message)
         .map_err(|err| Error::protocol(format!("failed to serialize a frame payload: {err}")))?;
+    let bodies: usize = frame.bodies.iter().map(|body| body.len() + 4).sum();
+    let mut payload = Vec::with_capacity(4 + header.len() + bodies);
+    payload.extend_from_slice(&section_len(header.len())?.to_be_bytes());
+    payload.extend_from_slice(&header);
+    for body in &frame.bodies {
+        payload.extend_from_slice(&section_len(body.len())?.to_be_bytes());
+        payload.extend_from_slice(body.as_bytes());
+    }
     if payload.len() > MAX_FRAME_BYTES {
         return Err(Error::protocol(format!(
             "refusing to send a {} byte frame; the limit is {MAX_FRAME_BYTES} bytes",
@@ -379,14 +543,22 @@ pub fn write_frame<W: Write>(writer: &mut W, message: &impl serde::Serialize) ->
         .map_err(|err| Error::protocol(format!("failed to write a frame: {err}")))
 }
 
+/// The `u32` length of one payload section, refused rather than truncated when it does not fit.
+fn section_len(len: usize) -> Result<u32, Error> {
+    u32::try_from(len)
+        .map_err(|_| Error::protocol("a frame section is longer than u32 bytes".to_string()))
+}
+
 /// Read one frame and deserialize its payload.
 ///
 /// # Errors
 ///
 /// Returns [`Error::Protocol`] when the stream ends, the magic is wrong, the declared length
-/// exceeds [`MAX_FRAME_BYTES`], the digest does not match, or the payload is not the expected
-/// message.
-pub fn read_frame<R: Read, T: serde::de::DeserializeOwned>(reader: &mut R) -> Result<T, Error> {
+/// exceeds [`MAX_FRAME_BYTES`], the digest does not match, the sections do not add up, or the
+/// payload is not the expected message.
+pub fn read_frame<R: Read, T: serde::de::DeserializeOwned>(
+    reader: &mut R,
+) -> Result<Frame<T>, Error> {
     let mut magic = [0u8; 4];
     read_exact(reader, &mut magic, "frame magic")?;
     if magic != FRAME_MAGIC {
@@ -413,8 +585,33 @@ pub fn read_frame<R: Read, T: serde::de::DeserializeOwned>(reader: &mut R) -> Re
             "frame digest mismatch; the payload was truncated or corrupted in transit".to_string(),
         ));
     }
-    serde_json::from_slice(&payload)
-        .map_err(|err| Error::protocol(format!("failed to parse a frame payload: {err}")))
+    let mut rest = payload.as_slice();
+    let header = take_section(&mut rest, "frame header")?;
+    let message = serde_json::from_slice(header)
+        .map_err(|err| Error::protocol(format!("failed to parse a frame payload: {err}")))?;
+    let mut bodies = Vec::new();
+    while !rest.is_empty() {
+        let body = take_section(&mut rest, "frame body")?;
+        bodies.push(
+            std::str::from_utf8(body)
+                .map_err(|err| Error::protocol(format!("a frame body is not UTF-8 text: {err}")))?
+                .to_string(),
+        );
+    }
+    Ok(Frame { message, bodies })
+}
+
+/// Split the next length-prefixed section off `rest`.
+fn take_section<'payload>(rest: &mut &'payload [u8], what: &str) -> Result<&'payload [u8], Error> {
+    let (len_bytes, tail) = rest
+        .split_at_checked(4)
+        .ok_or_else(|| Error::protocol(format!("a frame ended before its {what} length")))?;
+    let len = u32::from_be_bytes([len_bytes[0], len_bytes[1], len_bytes[2], len_bytes[3]]) as usize;
+    let (section, tail) = tail
+        .split_at_checked(len)
+        .ok_or_else(|| Error::protocol(format!("a frame declares a {what} it does not carry")))?;
+    *rest = tail;
+    Ok(section)
 }
 
 fn read_exact<R: Read>(reader: &mut R, buf: &mut [u8], what: &str) -> Result<(), Error> {
@@ -432,8 +629,8 @@ mod tests {
     #![allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
 
     use super::{
-        capability_digest, read_frame, write_frame, GraphPatch, HeldGraph, HostMessage, Patched,
-        WorkerMessage, FRAME_MAGIC, MAX_FRAME_BYTES, PROTOCOL_VERSION,
+        capability_digest, read_frame, write_frame, Frame, GraphPatch, HeldGraph, HostMessage,
+        Patched, WorkerMessage, FRAME_MAGIC, MAX_FRAME_BYTES, PROTOCOL_VERSION,
     };
     use crate::graph::{ApiGraph, Schema};
     use crate::sdk::Artifact;
@@ -576,7 +773,8 @@ mod tests {
                 &mut bytes,
                 &WorkerMessage::Graph {
                     graph: GraphPatch::of(&mut next.clone(), &HeldGraph::default()),
-                },
+                }
+                .into_frame(),
             )
             .unwrap();
             bytes.len()
@@ -586,7 +784,8 @@ mod tests {
             &mut patched,
             &WorkerMessage::Graph {
                 graph: GraphPatch::of(&mut next, &held),
-            },
+            }
+            .into_frame(),
         )
         .unwrap();
         assert!(
@@ -598,8 +797,98 @@ mod tests {
 
     fn encoded(message: &HostMessage) -> Vec<u8> {
         let mut buf = Vec::new();
-        write_frame(&mut buf, message).unwrap();
+        write_frame(&mut buf, &Frame::from(message.clone())).unwrap();
         buf
+    }
+
+    fn targets(artifacts: &[Artifact]) -> HostMessage {
+        HostMessage::GenerateTargets {
+            indices: vec![0],
+            artifacts: Patched::of(artifacts, &[], |artifact| artifact.path.as_str()),
+        }
+    }
+
+    /// The text of a generated file crosses beside the JSON, so it must arrive byte-identical —
+    /// quotes, backslashes, newlines and non-ASCII included.
+    #[test]
+    fn artifact_text_survives_the_body_channel_verbatim() {
+        let text = "package main\n\nvar s = \"a\\tb\"\n// ✓ é 𝄞\n";
+        let message = targets(&[
+            Artifact::new("sdk/client.go", text),
+            Artifact::new("sdk/empty.go", ""),
+        ]);
+        let mut bytes = Vec::new();
+        write_frame(&mut bytes, &message.into_frame()).unwrap();
+        let back = read_frame::<_, HostMessage>(&mut bytes.as_slice())
+            .unwrap()
+            .into_message()
+            .unwrap();
+        let HostMessage::GenerateTargets { artifacts, .. } = back else {
+            panic!("expected a target request");
+        };
+        assert_eq!(artifacts.fresh[0].text, text);
+        assert_eq!(artifacts.fresh[1].text, "");
+    }
+
+    /// The point of the body channel: the text is not escaped on the way through.
+    #[test]
+    fn artifact_text_is_not_escaped_into_the_payload() {
+        let text = "var s = \"quoted\"\nnext\n";
+        let mut bytes = Vec::new();
+        write_frame(
+            &mut bytes,
+            &targets(&[Artifact::new("sdk/client.go", text)]).into_frame(),
+        )
+        .unwrap();
+        let window = bytes.windows(text.len());
+        assert!(
+            window.into_iter().any(|slice| slice == text.as_bytes()),
+            "the artifact text must appear in the frame exactly as written"
+        );
+    }
+
+    /// A frame whose bodies do not match the artifacts it names is a protocol error, never an
+    /// artifact silently given someone else's contents.
+    #[test]
+    fn a_body_count_that_does_not_match_the_message_is_refused() {
+        let frame = Frame {
+            message: targets(&[Artifact::new("a.go", "a"), Artifact::new("b.go", "b")]),
+            bodies: vec!["only one".to_string()],
+        };
+        let err = frame.into_message().unwrap_err();
+        assert!(err.to_string().contains("2 artifacts"), "{err}");
+    }
+
+    #[test]
+    fn a_body_on_a_message_that_carries_no_artifacts_is_refused() {
+        let frame = Frame {
+            message: HostMessage::Shutdown,
+            bodies: vec!["stowaway".to_string()],
+        };
+        let err = frame.into_message().unwrap_err();
+        assert!(err.to_string().contains("no artifacts"), "{err}");
+    }
+
+    /// A worker's answer takes the same road back.
+    #[test]
+    fn artifact_changes_carry_their_text_beside_the_json() {
+        let mut bytes = Vec::new();
+        write_frame(
+            &mut bytes,
+            &WorkerMessage::ArtifactChanges {
+                changed: vec![Artifact::new("sdk/patched.ts", "export const x = \"1\";\n")],
+            }
+            .into_frame(),
+        )
+        .unwrap();
+        let back = read_frame::<_, WorkerMessage>(&mut bytes.as_slice())
+            .unwrap()
+            .into_message()
+            .unwrap();
+        let WorkerMessage::ArtifactChanges { changed } = back else {
+            panic!("expected artifact changes");
+        };
+        assert_eq!(changed[0].text, "export const x = \"1\";\n");
     }
 
     #[test]
@@ -612,7 +901,10 @@ mod tests {
         };
         let bytes = encoded(&message);
         assert_eq!(&bytes[..4], &FRAME_MAGIC);
-        let back: HostMessage = read_frame(&mut bytes.as_slice()).unwrap();
+        let back = read_frame::<_, HostMessage>(&mut bytes.as_slice())
+            .unwrap()
+            .into_message()
+            .unwrap();
         let HostMessage::Hello { host_version, .. } = back else {
             panic!("expected Hello");
         };
@@ -622,15 +914,15 @@ mod tests {
     #[test]
     fn several_frames_stream_back_to_back() {
         let mut buf = Vec::new();
-        write_frame(&mut buf, &HostMessage::LoadSource { index: 0 }).unwrap();
-        write_frame(&mut buf, &HostMessage::Shutdown).unwrap();
+        write_frame(&mut buf, &Frame::from(HostMessage::LoadSource { index: 0 })).unwrap();
+        write_frame(&mut buf, &Frame::from(HostMessage::Shutdown)).unwrap();
         let mut cursor = buf.as_slice();
         assert!(matches!(
-            read_frame::<_, HostMessage>(&mut cursor).unwrap(),
+            read_frame::<_, HostMessage>(&mut cursor).unwrap().message,
             HostMessage::LoadSource { index: 0 }
         ));
         assert!(matches!(
-            read_frame::<_, HostMessage>(&mut cursor).unwrap(),
+            read_frame::<_, HostMessage>(&mut cursor).unwrap().message,
             HostMessage::Shutdown
         ));
     }
@@ -685,10 +977,14 @@ mod tests {
             &mut buf,
             &WorkerMessage::Failed {
                 message: "boom".to_string(),
-            },
+            }
+            .into_frame(),
         )
         .unwrap();
-        let back: WorkerMessage = read_frame(&mut buf.as_slice()).unwrap();
+        let back = read_frame::<_, WorkerMessage>(&mut buf.as_slice())
+            .unwrap()
+            .into_message()
+            .unwrap();
         let WorkerMessage::Failed { message } = back else {
             panic!("expected Failed");
         };

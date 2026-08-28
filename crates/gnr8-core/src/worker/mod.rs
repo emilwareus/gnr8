@@ -27,8 +27,8 @@ use std::sync::{Arc, Condvar, Mutex};
 use std::time::Duration;
 
 use gnr8::protocol::{
-    capability_digest, read_frame, sdk_version, write_frame, GraphPatch, HeldGraph, HostMessage,
-    Patched, WorkerMessage, PROTOCOL_VERSION,
+    capability_digest, read_frame, sdk_version, write_frame, Frame, GraphPatch, HeldGraph,
+    HostMessage, Patched, WorkerMessage, PROTOCOL_VERSION,
 };
 
 use crate::graph::ApiGraph;
@@ -268,7 +268,7 @@ impl WorkerSession {
             capability_digest: capability_digest(sdk_version()),
             project_root: project_root.to_string_lossy().into_owned(),
         };
-        self.send(&hello)?;
+        self.send(hello)?;
         match self.receive()? {
             WorkerMessage::Ready {
                 protocol,
@@ -330,7 +330,7 @@ impl WorkerSession {
     }
 
     fn shutdown_inner(&mut self) -> Result<(), CoreError> {
-        self.send(&HostMessage::Shutdown)?;
+        self.send(HostMessage::Shutdown)?;
         match self.receive()? {
             WorkerMessage::Done => Ok(()),
             WorkerMessage::Failed { message } => Err(self.worker_error(&message)),
@@ -355,18 +355,22 @@ impl WorkerSession {
         self.finished = true;
     }
 
-    fn send(&mut self, message: &HostMessage) -> Result<(), CoreError> {
+    /// Write one request, with the artifact text it carries lifted out of the JSON.
+    fn send(&mut self, message: HostMessage) -> Result<(), CoreError> {
+        let frame = message.into_frame();
         let stdin = self.stdin.as_mut().ok_or_else(|| CoreError::WorkerRun {
             message: "the .gnr8 worker session is already closed".to_string(),
         })?;
-        write_frame(stdin, message).map_err(|err| self.transport_error(&err.to_string()))
+        write_frame(stdin, &frame).map_err(|err| self.transport_error(&err.to_string()))
     }
 
+    /// Read one reply, putting the text the frame carried back on the artifacts that named it.
     fn receive(&mut self) -> Result<WorkerMessage, CoreError> {
         let stdout = self.stdout.as_mut().ok_or_else(|| CoreError::WorkerRun {
             message: "the .gnr8 worker session is already closed".to_string(),
         })?;
-        match read_frame::<_, WorkerMessage>(stdout) {
+        match read_frame::<_, WorkerMessage>(stdout).and_then(Frame::<WorkerMessage>::into_message)
+        {
             Ok(message) => Ok(message),
             Err(err) => Err(self.transport_error(&err.to_string())),
         }
@@ -419,7 +423,7 @@ impl WorkerSession {
     ///
     /// The reply is measured against the graph the worker holds, which is the one this session last
     /// recorded, so resolving it here is what keeps the two sides naming the same vectors.
-    fn expect_graph(&mut self, request: &HostMessage) -> Result<ApiGraph, CoreError> {
+    fn expect_graph(&mut self, request: HostMessage) -> Result<ApiGraph, CoreError> {
         self.send(request)?;
         match self.receive()? {
             WorkerMessage::Graph { graph } => {
@@ -454,7 +458,7 @@ impl WorkerSession {
         // The worker holds what this frame describes the moment it is written, so record it before
         // the reply is read: the reply's changes are merged into exactly this set.
         self.held_artifacts = artifacts;
-        self.send(&make_request(patch))?;
+        self.send(make_request(patch))?;
         match self.receive()? {
             WorkerMessage::ArtifactChanges { changed } => {
                 let merged =
@@ -506,7 +510,7 @@ impl Drop for WorkerSession {
 
 impl StageRunner for WorkerSession {
     fn load_source(&mut self, index: usize) -> Result<ApiGraph, CoreError> {
-        self.expect_graph(&HostMessage::LoadSource { index })
+        self.expect_graph(HostMessage::LoadSource { index })
     }
 
     fn apply_transforms(
@@ -518,7 +522,7 @@ impl StageRunner for WorkerSession {
         // The worker holds this graph the moment the frame is written, and the caller is done with
         // it, so its vectors are moved into the record rather than copied into one.
         self.held_graph = HeldGraph::taken_from(graph);
-        self.expect_graph(&HostMessage::ApplyTransforms {
+        self.expect_graph(HostMessage::ApplyTransforms {
             indices: indices.to_vec(),
             graph: patch,
         })
@@ -531,7 +535,7 @@ impl StageRunner for WorkerSession {
         // comes. Dropping it in step is what keeps a later patch — were one ever added — measured
         // against a vector both sides agree on.
         self.held_graph = HeldGraph::default();
-        self.send(&HostMessage::FreezeGraph { graph: patch })?;
+        self.send(HostMessage::FreezeGraph { graph: patch })?;
         match self.receive()? {
             WorkerMessage::Done => Ok(()),
             WorkerMessage::Failed { message } => Err(self.worker_error(&message)),

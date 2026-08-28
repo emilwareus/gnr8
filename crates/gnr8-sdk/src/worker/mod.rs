@@ -90,7 +90,9 @@ pub(crate) fn serve<R: Read, W: Write>(
     // sides advance these on the same frame, so they name the same vectors at every point.
     let mut session = Held::default();
     loop {
-        let request: HostMessage = read_frame(input).map_err(Session::Run)?;
+        let request = read_frame::<_, HostMessage>(input)
+            .and_then(crate::protocol::Frame::<HostMessage>::into_message)
+            .map_err(Session::Run)?;
         match request {
             HostMessage::Hello { .. } => {
                 let err = Error::protocol("the host sent a second handshake in one session");
@@ -98,7 +100,7 @@ pub(crate) fn serve<R: Read, W: Write>(
                 return Err(Session::Run(err));
             }
             HostMessage::Shutdown => {
-                write_frame(output, &WorkerMessage::Done).map_err(Session::Run)?;
+                write_frame(output, &WorkerMessage::Done.into_frame()).map_err(Session::Run)?;
                 return Ok(());
             }
             HostMessage::FreezeGraph { graph } => {
@@ -116,10 +118,12 @@ pub(crate) fn serve<R: Read, W: Write>(
                         return Err(Session::Run(err));
                     }
                 }
-                write_frame(output, &WorkerMessage::Done).map_err(Session::Run)?;
+                write_frame(output, &WorkerMessage::Done.into_frame()).map_err(Session::Run)?;
             }
             other => match dispatch(pipeline, &cx, frozen.as_ref(), &mut session, other) {
-                Ok(reply) => write_frame(output, &reply).map_err(Session::Run)?,
+                Ok(reply) => {
+                    write_frame(output, &reply.into_frame()).map_err(Session::Run)?;
+                }
                 Err(err) => {
                     report(output, &err);
                     return Err(Session::Run(err));
@@ -144,7 +148,9 @@ fn handshake<R: Read, W: Write>(
     input: &mut R,
     output: &mut W,
 ) -> Result<Cx, Session> {
-    let hello: HostMessage = read_frame(input).map_err(Session::Handshake)?;
+    let hello = read_frame::<_, HostMessage>(input)
+        .and_then(crate::protocol::Frame::<HostMessage>::into_message)
+        .map_err(Session::Handshake)?;
     let HostMessage::Hello {
         protocol,
         host_version,
@@ -189,7 +195,8 @@ fn handshake<R: Read, W: Write>(
             sdk_version: sdk_version().to_string(),
             capability_digest: expected_digest,
             plan: pipeline.plan(),
-        },
+        }
+        .into_frame(),
     )
     .map_err(Session::Handshake)?;
     Ok(Cx::new(project_root))
@@ -293,7 +300,8 @@ fn report<W: Write>(output: &mut W, err: &Error) {
         output,
         &WorkerMessage::Failed {
             message: err.to_string(),
-        },
+        }
+        .into_frame(),
     );
 }
 
@@ -363,7 +371,7 @@ mod tests {
     fn drive(pipeline: &Pipeline, requests: &[HostMessage]) -> (Result<(), Session>, Vec<u8>) {
         let mut input = Vec::new();
         for request in requests {
-            write_frame(&mut input, request).unwrap();
+            write_frame(&mut input, &request.clone().into_frame()).unwrap();
         }
         let mut output = Vec::new();
         let result = serve(pipeline, &mut input.as_slice(), &mut output);
@@ -374,7 +382,12 @@ mod tests {
         let mut cursor = output;
         let mut out = Vec::new();
         while !cursor.is_empty() {
-            out.push(read_frame::<_, WorkerMessage>(&mut cursor).unwrap());
+            out.push(
+                read_frame::<_, WorkerMessage>(&mut cursor)
+                    .unwrap()
+                    .into_message()
+                    .unwrap(),
+            );
         }
         out
     }

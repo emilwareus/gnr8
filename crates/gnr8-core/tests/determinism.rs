@@ -190,13 +190,17 @@ fn through_a_frame(
         &HostMessage::ApplyTransforms {
             indices: vec![0],
             graph: patch,
-        },
+        }
+        .into_frame(),
     )
     .expect("the graph must fit in one frame");
     let HostMessage::ApplyTransforms {
         graph: round_tripped,
         ..
-    } = read_frame::<_, HostMessage>(&mut frame.as_slice()).expect("the frame must parse back")
+    } = read_frame::<_, HostMessage>(&mut frame.as_slice())
+        .expect("the frame must parse back")
+        .into_message()
+        .expect("the frame must carry the bodies its message names")
     else {
         panic!("the frame must decode as the request it was written from");
     };
