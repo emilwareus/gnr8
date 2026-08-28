@@ -284,7 +284,7 @@ pub fn run(
     let diagnostics: Vec<Diagnostic> = ir.diagnostics.clone();
     let source_files = distinct_source_files(&ir);
 
-    let mut artifacts = Artifacts::new();
+    let mut files: Vec<Artifact> = Vec::new();
     if !plan.targets.is_empty() {
         // Every target, including a user-defined one, receives the same canonical directional
         // graph. `build_ir` and `inspect` intentionally retain the unsplit source facts; the
@@ -299,22 +299,49 @@ pub fn run(
         {
             runner.freeze_graph(&mut generation_ir)?;
         }
-        for span in spans {
-            match span {
-                StageSpan::Builtin(position, spec) => {
-                    artifacts.begin_stage(builtin_target_producer(position, spec));
-                    builtins::generate_target(spec, &generation_ir, &mut artifacts, cx)?;
-                }
-                StageSpan::Custom(indices) => {
-                    let sent = artifacts.into_files();
-                    let paths = artifact_paths(&sent);
-                    let produced = runner.generate_targets(&indices, sent)?;
-                    require_no_dropped_artifacts("target", &indices, &paths, &produced)?;
-                    artifacts = Artifacts::from_files(produced);
+        // A BUILT-IN target is a pure function of the frozen graph: every one of them only creates
+        // files, and not one reads the set it writes into. WHEN it runs is therefore not observable
+        // — only WHERE its files land in the accumulated set is. So they all start at once, and the
+        // loop takes each one's files back at the position the plan gives it. A run that spends a
+        // tenth of a second inside one worker stage emits its whole Go SDK during that wait instead
+        // of after it.
+        let graph = &generation_ir;
+        std::thread::scope(|scope| -> Result<(), CoreError> {
+            let mut produced = crate::parallel::start_all(
+                scope,
+                spans
+                    .iter()
+                    .filter_map(|span| match span {
+                        StageSpan::Builtin(position, spec) => Some((*position, *spec)),
+                        StageSpan::Custom(_) => None,
+                    })
+                    .map(|(position, spec)| {
+                        move || {
+                            let mut out = Artifacts::new();
+                            out.begin_stage(builtin_target_producer(position, spec));
+                            builtins::generate_target(spec, graph, &mut out, cx)?;
+                            Ok(out.into_files())
+                        }
+                    })
+                    .collect(),
+            );
+            for span in spans {
+                match span {
+                    StageSpan::Builtin(_, _) => adopt_produced(&mut files, produced.next()?)?,
+                    StageSpan::Custom(indices) => {
+                        let paths = artifact_paths(&files);
+                        let produced =
+                            runner.generate_targets(&indices, std::mem::take(&mut files))?;
+                        require_no_dropped_artifacts("target", &indices, &paths, &produced)?;
+                        files = produced;
+                        files.sort_by(|left, right| left.path.cmp(&right.path));
+                    }
                 }
             }
-        }
+            Ok(())
+        })?;
     }
+    let mut artifacts = Artifacts::from_files(files);
 
     for span in stage_spans(&plan.posts) {
         match span {
@@ -341,6 +368,46 @@ pub fn run(
         readiness_targets: readiness_targets(plan),
         source_files,
     })
+}
+
+/// Fold a built-in target's finished files into the accumulated set, keeping it sorted by path.
+///
+/// The built-in produced them into an accumulator of its own, so its own path collisions were
+/// already refused there. What is left to check is the one thing only the accumulated set knows: a
+/// path an earlier stage already owns. Both sides are sorted, so one merge walk answers it — and the
+/// artifacts are carried across whole, so a file records the same producer and ownership it would
+/// have had if the built-in had written straight into the set.
+fn adopt_produced(into: &mut Vec<Artifact>, produced: Vec<Artifact>) -> Result<(), CoreError> {
+    if into.is_empty() {
+        *into = produced;
+        return Ok(());
+    }
+    let mut merged = Vec::with_capacity(into.len() + produced.len());
+    let mut held = std::mem::take(into).into_iter().peekable();
+    for artifact in produced {
+        while held.peek().is_some_and(|owned| owned.path < artifact.path) {
+            if let Some(owned) = held.next() {
+                merged.push(owned);
+            }
+        }
+        if let Some(owned) = held.peek() {
+            if owned.path == artifact.path {
+                return Err(CoreError::ArtifactOwnership {
+                    code: "artifact.path_collision".to_string(),
+                    path: artifact.path,
+                    producer: artifact.producer,
+                    message: format!(
+                        "path is already owned by {}; use overlay or rewrite explicitly",
+                        owned.producer
+                    ),
+                });
+            }
+        }
+        merged.push(artifact);
+    }
+    merged.extend(held);
+    *into = merged;
+    Ok(())
 }
 
 /// A stage may create, overlay or rewrite an artifact. It may not make one disappear.
@@ -690,6 +757,124 @@ mod tests {
             outcome.output_anchors,
             vec!["generated/custom-0.md".to_string()]
         );
+    }
+
+    /// Built-in targets are produced ahead of the loop that places them, so the set they land in
+    /// still has to refuse a path another stage already owns — and name that stage.
+    #[test]
+    fn a_builtin_target_that_lands_on_an_owned_path_is_refused_naming_its_owner() {
+        let plan = Pipeline::new()
+            .source(Custom(CustomSource))
+            .target(decl::OpenApi31::new().to("generated/openapi.yaml"))
+            .target(decl::OpenApi31::new().to("generated/openapi.yaml"))
+            .plan();
+        let err = run(&plan, &cx(), &mut RecordingRunner::default()).unwrap_err();
+        let CoreError::ArtifactOwnership {
+            code,
+            path,
+            producer,
+            message,
+        } = &err
+        else {
+            panic!("expected an ownership error, got {err:?}");
+        };
+        assert_eq!(code, "artifact.path_collision");
+        assert_eq!(path, "generated/openapi.yaml");
+        assert_eq!(producer, "target[1]:OpenApi31");
+        assert!(message.contains("target[0]:OpenApi31"), "{message}");
+    }
+
+    /// The same refusal when the path was claimed by a WORKER stage the host cannot see inside.
+    #[test]
+    fn a_builtin_target_that_lands_on_a_custom_targets_path_is_refused() {
+        struct ClaimsOpenApi;
+        impl Target for ClaimsOpenApi {
+            fn generate(
+                &self,
+                _ir: &ApiGraph,
+                _out: &mut Artifacts,
+                _cx: &Cx,
+            ) -> Result<(), gnr8::Error> {
+                Ok(())
+            }
+        }
+        struct ClaimingRunner;
+        impl StageRunner for ClaimingRunner {
+            fn load_source(&mut self, _index: usize) -> Result<ApiGraph, CoreError> {
+                Ok(ApiGraph::default())
+            }
+            fn apply_transforms(
+                &mut self,
+                _indices: &[usize],
+                graph: ApiGraph,
+            ) -> Result<ApiGraph, CoreError> {
+                Ok(graph)
+            }
+            fn freeze_graph(&mut self, _graph: &mut ApiGraph) -> Result<(), CoreError> {
+                Ok(())
+            }
+            fn generate_targets(
+                &mut self,
+                _indices: &[usize],
+                mut artifacts: Vec<Artifact>,
+            ) -> Result<Vec<Artifact>, CoreError> {
+                artifacts.push(Artifact::new("generated/openapi.yaml", "claimed"));
+                Ok(artifacts)
+            }
+            fn run_posts(
+                &mut self,
+                _indices: &[usize],
+                artifacts: Vec<Artifact>,
+            ) -> Result<Vec<Artifact>, CoreError> {
+                Ok(artifacts)
+            }
+        }
+        let plan = Pipeline::new()
+            .source(Custom(CustomSource))
+            .target(Custom(ClaimsOpenApi))
+            .target(decl::OpenApi31::new().to("generated/openapi.yaml"))
+            .plan();
+        let err = run(&plan, &cx(), &mut ClaimingRunner).unwrap_err();
+        assert!(
+            err.to_string().contains("already owned"),
+            "a built-in must not silently take a path a custom target claimed: {err}"
+        );
+    }
+
+    /// Built-in targets all start at once, so the one thing that must not move is where their files
+    /// land relative to the custom stages between them.
+    #[test]
+    fn builtin_target_files_land_in_plan_order_around_the_custom_ones() {
+        let plan = Pipeline::new()
+            .source(Custom(CustomSource))
+            .target(decl::OpenApi31::new().to("generated/a-openapi.yaml"))
+            .target(Custom(CustomTarget))
+            .target(decl::OpenApi31Json::new().to("generated/z-openapi.json"))
+            .plan();
+        let mut runner = RecordingRunner::default();
+        let outcome = run(&plan, &cx(), &mut runner).unwrap();
+        let paths: Vec<&str> = outcome
+            .artifacts
+            .iter()
+            .map(|artifact| artifact.path.as_str())
+            .collect();
+        assert_eq!(
+            paths,
+            vec![
+                "generated/a-openapi.yaml",
+                "generated/custom-1.md",
+                "generated/z-openapi.json"
+            ]
+        );
+        // The custom run saw the first built-in's file and none of the second's.
+        assert_eq!(runner.calls, vec!["source[0]", "freeze", "targets[1]"]);
+        let producers: Vec<&str> = outcome
+            .artifacts
+            .iter()
+            .map(|artifact| artifact.producer.as_str())
+            .collect();
+        assert_eq!(producers[0], "target[0]:OpenApi31");
+        assert_eq!(producers[2], "target[2]:OpenApi31Json");
     }
 
     #[test]

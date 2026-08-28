@@ -133,6 +133,55 @@ where
     }
 }
 
+/// Start every task at once and take the results back in the order the tasks were given.
+///
+/// [`map_ordered`] makes the caller wait for all of it. This does not: [`Started::next`] blocks only
+/// on the task whose turn it is, so the tasks the caller has not reached keep running while it does
+/// something else — which is the whole point when what the caller does in between is wait on another
+/// process.
+///
+/// Order and failure reporting match [`map_ordered`]: results come back in task order, and a task
+/// that panics becomes a typed error rather than a propagated unwind (RUST-04).
+pub(crate) fn start_all<'scope, 'env, T, F>(
+    scope: &'scope std::thread::Scope<'scope, 'env>,
+    tasks: Vec<F>,
+) -> Started<'scope, T>
+where
+    F: FnOnce() -> Result<T, CoreError> + Send + 'scope,
+    T: Send + 'scope,
+{
+    Started {
+        handles: tasks.into_iter().map(|task| scope.spawn(task)).collect(),
+    }
+}
+
+/// Tasks started by [`start_all`], taken back in the order they were given.
+pub(crate) struct Started<'scope, T> {
+    handles:
+        std::collections::VecDeque<std::thread::ScopedJoinHandle<'scope, Result<T, CoreError>>>,
+}
+
+impl<T> Started<'_, T> {
+    /// Wait for the next task's result.
+    ///
+    /// # Errors
+    ///
+    /// Returns the task's own failure, or [`CoreError::SdkGen`] if it panicked or if more results
+    /// were asked for than tasks were started.
+    pub(crate) fn next(&mut self) -> Result<T, CoreError> {
+        let Some(handle) = self.handles.pop_front() else {
+            return Err(CoreError::SdkGen {
+                message: "asked for the result of a computation that was never started".to_string(),
+            });
+        };
+        handle.join().unwrap_or_else(|_| {
+            Err(CoreError::SdkGen {
+                message: "a generation worker thread stopped unexpectedly".to_string(),
+            })
+        })
+    }
+}
+
 /// Run two independent computations at once and return both results.
 ///
 /// For the places where a run must read two large, unrelated things before it can decide anything:
