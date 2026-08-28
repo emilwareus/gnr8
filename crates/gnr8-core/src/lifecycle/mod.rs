@@ -379,8 +379,62 @@ pub fn apply_writes_with_anchors(
     // Every output directory is opened and scanned for interrupted transactions once, on first
     // reach, and every file in it is then served from that one scan.
     let mut dirs = OutputDirs::new(&project_dir);
+    // Reaching a directory is what recovers an interrupted write to it, and recovery is what
+    // decides whether a leaf's current bytes are the finished write or the abandoned original. So
+    // every planned file is reached, and its own recovery run, before any of them is read — and
+    // then the reads happen together, because each one is a different file in a directory this pass
+    // already holds open and says nothing about any other.
+    let mut homes = Vec::with_capacity(plan.files.len());
     for (file, safe) in plan.files.iter().zip(&safe_paths) {
-        apply_planned_file(&mut dirs, file, safe, manifest, force, &mut out)?;
+        let (parent_rel, leaf) =
+            split_output_path(&file.path).map_err(|err| crate::CoreError::Io {
+                message: format!("failed to resolve output path {}: {err}", safe.display()),
+            })?;
+        let recovery_error = |err: &dyn std::fmt::Display| crate::CoreError::Io {
+            message: format!(
+                "failed to recover an interrupted write for {}: {err}",
+                safe.display()
+            ),
+        };
+        let Some(home) = dirs
+            .reach(parent_rel, false)
+            .map_err(|err| recovery_error(&err))?
+        else {
+            homes.push(None);
+            continue;
+        };
+        let recovered = match dirs.at_mut(home) {
+            Some(parent) => parent
+                .recover_leaf(leaf)
+                .map_err(|err| recovery_error(&err))?,
+            None => None,
+        };
+        if let Some(hash) = recovered {
+            manifest.record(&file.path, &hash, SOURCE_GENERATED);
+        }
+        homes.push(Some((home, leaf)));
+    }
+    let current = crate::parallel::map_ordered(&homes, |home| match home {
+        Some((home, leaf)) => match dirs.at(*home) {
+            Some(parent) => {
+                read_file_optional(&parent.dir, leaf).map_err(|err| crate::CoreError::Io {
+                    message: format!("failed to revalidate {leaf:?} before writing: {err}"),
+                })
+            }
+            None => Ok(None),
+        },
+        None => Ok(None),
+    })?;
+    for ((file, safe), current) in plan.files.iter().zip(&safe_paths).zip(&current) {
+        apply_planned_file(
+            &mut dirs,
+            file,
+            safe,
+            current.as_deref(),
+            manifest,
+            force,
+            &mut out,
+        )?;
     }
 
     let current_paths = plan
@@ -407,15 +461,17 @@ pub fn apply_writes_with_anchors(
     Ok(out)
 }
 
-/// Write one planned output, revalidating its on-disk bytes under the generation lock.
+/// Write one planned output, given its on-disk bytes as the write pass read them under the lock.
 ///
 /// The plan's own `action` is advisory: it was decided against a snapshot of the tree, so the file
-/// is reclassified here against what the directory holds right now. `dirs` supplies the output
-/// directory already scanned for interrupted transactions.
+/// is reclassified here against `current`, which the caller read from the directory this same pass
+/// had already scanned for interrupted transactions. `dirs` supplies that directory again for the
+/// write itself. A directory that does not exist yet holds no current bytes; the write creates it.
 fn apply_planned_file(
     dirs: &mut OutputDirs<'_>,
     file: &PlannedFile,
     safe: &Path,
+    current: Option<&[u8]>,
     manifest: &mut Manifest,
     force: bool,
     out: &mut GenerateOutcome,
@@ -423,38 +479,7 @@ fn apply_planned_file(
     let (parent_rel, leaf) = split_output_path(&file.path).map_err(|err| crate::CoreError::Io {
         message: format!("failed to resolve output path {}: {err}", safe.display()),
     })?;
-    // A directory that does not exist yet holds no interrupted write and no current bytes; the
-    // write below creates it.
-    let current = match dirs
-        .dir(parent_rel, false)
-        .map_err(|err| crate::CoreError::Io {
-            message: format!(
-                "failed to recover an interrupted write for {}: {err}",
-                safe.display()
-            ),
-        })? {
-        Some(parent) => {
-            let recovered_hash = parent
-                .recover_leaf(leaf)
-                .map_err(|err| crate::CoreError::Io {
-                    message: format!(
-                        "failed to recover an interrupted write for {}: {err}",
-                        safe.display()
-                    ),
-                })?;
-            if let Some(hash) = recovered_hash {
-                manifest.record(&file.path, &hash, SOURCE_GENERATED);
-            }
-            read_file_optional(&parent.dir, leaf).map_err(|err| crate::CoreError::Io {
-                message: format!(
-                    "failed to revalidate {} before writing: {err}",
-                    safe.display()
-                ),
-            })?
-        }
-        None => None,
-    };
-    let current_action = classify_planned_file(file, manifest, current.as_deref());
+    let current_action = classify_planned_file(file, manifest, current);
     if current_action == WriteAction::Unchanged {
         // This is idempotent for an owned no-op and safely reconstructs ownership when the
         // disposable local manifest was absent but the deterministic bytes already matched.
@@ -1036,33 +1061,60 @@ impl OutputDir {
 }
 
 /// The generated-output directories one write pass has reached, each opened and scanned once.
+///
+/// They are held in a vector and named by position rather than handed out as borrows, so a pass can
+/// reach every directory it needs and then read from all of them at once: an index keeps no borrow
+/// of the collection alive, which a `&mut OutputDir` would.
 struct OutputDirs<'a> {
     project_dir: &'a Dir,
-    dirs: HashMap<String, OutputDir>,
+    reached: Vec<OutputDir>,
+    positions: HashMap<String, usize>,
 }
 
 impl<'a> OutputDirs<'a> {
     fn new(project_dir: &'a Dir) -> Self {
         Self {
             project_dir,
-            dirs: HashMap::new(),
+            reached: Vec::new(),
+            positions: HashMap::new(),
         }
     }
 
-    /// The scanned directory that holds `parent_rel`, opening and scanning it on first reach.
+    /// Where the scanned directory that holds `parent_rel` sits, opening and scanning it on first
+    /// reach.
     ///
     /// `Ok(None)` means the directory does not exist and `create` did not ask for it; nothing is
     /// remembered in that case, so a later write may still create it.
-    fn dir(&mut self, parent_rel: &str, create: bool) -> std::io::Result<Option<&mut OutputDir>> {
-        if !self.dirs.contains_key(parent_rel) {
-            let Some(dir) = open_output_dir(self.project_dir, parent_rel, create)? else {
-                return Ok(None);
-            };
-            let pending = scan_transactions(&dir)?;
-            self.dirs
-                .insert(parent_rel.to_string(), OutputDir { dir, pending });
+    fn reach(&mut self, parent_rel: &str, create: bool) -> std::io::Result<Option<usize>> {
+        if let Some(position) = self.positions.get(parent_rel) {
+            return Ok(Some(*position));
         }
-        Ok(self.dirs.get_mut(parent_rel))
+        let Some(dir) = open_output_dir(self.project_dir, parent_rel, create)? else {
+            return Ok(None);
+        };
+        let pending = scan_transactions(&dir)?;
+        self.reached.push(OutputDir { dir, pending });
+        let position = self.reached.len() - 1;
+        self.positions.insert(parent_rel.to_string(), position);
+        Ok(Some(position))
+    }
+
+    /// The directory at `position`, which only a [`Self::reach`] of this same pass can have named.
+    fn at(&self, position: usize) -> Option<&OutputDir> {
+        self.reached.get(position)
+    }
+
+    /// The directory at `position`, for the recovery a reach owes its caller.
+    fn at_mut(&mut self, position: usize) -> Option<&mut OutputDir> {
+        self.reached.get_mut(position)
+    }
+
+    /// The scanned directory that holds `parent_rel`, opening and scanning it on first reach.
+    fn dir(&mut self, parent_rel: &str, create: bool) -> std::io::Result<Option<&mut OutputDir>> {
+        let Some(position) = self.reach(parent_rel, create)? else {
+            return Ok(None);
+        };
+        Ok(self.reached.get_mut(position))
     }
 }
 
