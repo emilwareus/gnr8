@@ -38,26 +38,28 @@ The CLI install path is the GitHub release archive:
 curl -fsSL https://raw.githubusercontent.com/emilwareus/gnr8/main/scripts/install.sh | bash
 ```
 
-The crates.io package named `gnr8` is the public Rust API. Generated `.gnr8/Cargo.toml` files use the
-exact `crates/gnr8-core` path from the selected source tree or complete release archive. `gnr8 init`
-fails with an actionable error when that resource is missing; it never silently switches to a
-registry version.
+The crates.io package named `gnr8` is the thin code-as-config SDK a `.gnr8/` crate depends on — not a
+CLI install path; it ships no binary. In-repo builds scaffold `.gnr8/Cargo.toml` against the exact
+`crates/gnr8-sdk` path from the selected source tree or complete release archive; a packaged build
+pins `gnr8 = "=<version>"` instead. `gnr8 init` fails with an actionable error when that resource is
+missing; it never silently switches to a registry version.
 
 ## Canonical workflow
 ```
 cd <your-go-service>      # the dir whose .gnr8/ crate drives generation; inputs resolve from here
 gnr8 init --source go-gin --sdk go
 # edit .gnr8/src/main.rs: the Pipeline IS the config — source, transforms, targets, post-process
-gnr8 generate             # compile + run .gnr8/, write OpenAPI + Go SDK; track ownership; skip unchanged
+gnr8 generate             # build (once) + run .gnr8/, write OpenAPI + Go SDK; skip unchanged
 gnr8 check                # CI gate: exit 1 if any output is stale/drifted, else 0
 ```
 
 ## CLI
 All commands except `inspect` operate on the **current project** (cwd must hold the `.gnr8/` crate, i.e.
-`.gnr8/Cargo.toml`). `generate`/`check`/`watch`/`doctor` **delegate to the `.gnr8/` crate**: the host
-runs `cargo run --manifest-path .gnr8/Cargo.toml -- __emit` (cwd = project root), parses the JSON
-artifact bundle the child prints, and owns the writes. Global flags: `--json` (machine output),
-`-v`/`-vv` (verbosity).
+`.gnr8/Cargo.toml`). `generate`/`check`/`watch`/`doctor` run the project's **worker**: the host builds
+`.gnr8/` once with `cargo build` (and skips that build entirely while `.gnr8/` is unchanged), starts
+the resulting binary with `cwd = project root`, and drives a framed protocol over its stdio. The host
+executes every built-in stage itself and asks the worker only for the stages you wrote. Global flags:
+`--json` (machine output), `-v`/`-vv` (verbosity), `--no-build`, `--no-execute`.
 
 | Command | Args/flags | Reads | Writes | Exit |
 |---|---|---|---|---|
@@ -112,21 +114,23 @@ A pipeline composes four kinds of stage, decoupling **N sources** from **M targe
 
 | Trait | Signature | Role | Built-ins |
 |---|---|---|---|
-| `Source` | `load(&self, &Cx) -> Result<ApiGraph, CoreError>` | source code/artifact → IR | `GoGin`, `FastApi`, `Flask`, `NestJs`, `OpenApi` |
-| `Transform` | `apply(&self, &mut ApiGraph, &Cx) -> Result<(), CoreError>` | IR → IR (where TOML knobs now live, as code) | `SetBasePath`, `SetTitle`, `ApplySecurity`, `RenameOperation`, `RenameType`, `GroupOperations`, `ApiOverrides`, `SetEnumOrder` |
-| `Target` | `generate(&self, &ApiGraph, &mut Artifacts, &Cx) -> Result<(), CoreError>` (+ `output_anchors()`) | frozen IR → `Artifacts` | `OpenApi31`, `GoSdk`, `PySdk`, `TsSdk` |
-| `PostProcess` | `run(&self, &mut Artifacts, &Cx) -> Result<(), CoreError>` | `Artifacts` → `Artifacts` (after all targets) | `Header` |
+| `Source` | `load(&self, &Cx) -> Result<ApiGraph, Error>` | source code/artifact → IR | `GoGin`, `FastApi`, `Flask`, `NestJs`, `OpenApi` |
+| `Transform` | `apply(&self, &mut ApiGraph, &Cx) -> Result<(), Error>` | IR → IR (where TOML knobs now live, as code) | `SetBasePath`, `SetTitle`, `ApplySecurity`, `RenameOperation`, `RenameType`, `GroupOperations`, `ApiOverrides`, `SetEnumOrder` |
+| `Target` | `generate(&self, &ApiGraph, &mut Artifacts, &Cx) -> Result<(), Error>` (+ `output_anchors()`) | frozen IR → `Artifacts` | `OpenApi31`, `GoSdk`, `PySdk`, `TsSdk` |
+| `PostProcess` | `run(&self, &mut Artifacts, &Cx) -> Result<(), Error>` | `Artifacts` → `Artifacts` (after all targets) | `Header` |
 
 Before the first target runs, the pipeline projects the frozen source facts into their canonical
 input/output schemas. Built-in and custom targets therefore see the same split names and transitive
-references. `build_ir` and `__inspect` deliberately retain the unsplit extraction facts for inspection;
-direct artifact tooling can call `ApiGraph::project_for_generation()` at the same boundary.
+references. `build_ir` and `gnr8 inspect` deliberately retain the unsplit extraction facts for inspection.
 
 - `Pipeline::new().source(..).transform(..).target(..).post(..)` — builder, stages kept in call order.
 - `Cx { project_root }` — the root relative paths resolve against. `Artifacts::create(path, text)` adds
   a generated file with explicit ownership and rejects collisions.
-- `gnr8::runner::run(pipeline) -> ExitCode` — the entry point `main()` returns. It parses argv
-  (`__emit` → print the artifact bundle JSON; `__inspect` → print the frozen IR JSON) and never panics.
+- `Custom(stage)` — wraps your own `Source`/`Transform`/`Target`/`PostProcess`. Built-ins are passed
+  bare; the wrapper is what marks a stage as yours, and therefore as worker-executed.
+- `gnr8::worker::run(pipeline) -> ExitCode` — the entry point `main()` returns. It serves the host's
+  framed requests on stdin/stdout and never panics. Exit `0` clean, `1` on a stage error, `2` if the
+  handshake is absent (which is what you get running the binary by hand).
 
 Built-in builder methods (each replaces a former TOML key):
 
@@ -150,7 +154,7 @@ Example `.gnr8/src/main.rs` (the bookstore lifecycle):
 use gnr8::sdk::prelude::*;
 
 fn main() -> std::process::ExitCode {
-    gnr8::runner::run(
+    gnr8::worker::run(
         Pipeline::new()
             .source(GoGin::new().inputs(["."]))
             .transform(SetBasePath::new("/books"))
@@ -172,13 +176,13 @@ generator, no config DSL. The IR (`gnr8::graph`) is read/write so a `Transform` 
 ```rust
 use gnr8::graph::ApiGraph;
 use gnr8::sdk::prelude::*;
-use gnr8::CoreError;
+use gnr8::Error;
 
 // A custom Transform: edit the IR before generation (e.g. drop internal routes
 // that existed in an old generator input but should not ship in public SDKs).
 struct DropInternalRoutes;
 impl Transform for DropInternalRoutes {
-    fn apply(&self, ir: &mut ApiGraph, _cx: &Cx) -> Result<(), CoreError> {
+    fn apply(&self, ir: &mut ApiGraph, _cx: &Cx) -> Result<(), Error> {
         ir.operations.retain(|op| !op.path.starts_with("/internal/"));
         Ok(())
     }
@@ -187,7 +191,7 @@ impl Transform for DropInternalRoutes {
 // A custom Target: write your own generator (e.g. an API.md summary).
 struct ApiMarkdown { path: String }
 impl Target for ApiMarkdown {
-    fn generate(&self, ir: &ApiGraph, out: &mut Artifacts, _cx: &Cx) -> Result<(), CoreError> {
+    fn generate(&self, ir: &ApiGraph, out: &mut Artifacts, _cx: &Cx) -> Result<(), Error> {
         let mut md = format!("# {}\n\n", ir.title);
         for op in &ir.operations { md.push_str(&format!("- {} {} ({})\n", op.method, op.path, op.id)); }
         out.create(self.path.clone(), md)
@@ -209,13 +213,38 @@ OpenApi31 + PySdk), `examples/flask-bookstore/` (Python, the honest typed-envelo
 become diagnostics → OpenApi31 + PySdk), and `examples/nestjs-bookstore/` (TypeScript → OpenApi31 + TsSdk).
 All five examples (plus `examples/bookstore/` Go/Gin) are byte-identical-regen-gated by `make examples-check`.
 
-### Host ↔ child boundary
-`gnr8 generate` runs `cargo run --manifest-path .gnr8/Cargo.toml -- __emit` with `cwd = project root`.
-The child runs the pipeline (source → transforms → freeze → targets → post) and prints a versioned JSON
-bundle (`{ version, artifacts: [{path, text}], diagnostics }`) on stdout. The **host** then owns the
-writes: the ownership manifest, no-op skip (byte-identical), edit-protection (warn+skip user-edited
-unless `--force`), and excluding the pipeline's own output paths from analysis. The child is a pure,
-side-effect-free function; the host is the single trusted writer — so `check`/`watch`/`doctor` reuse it.
+### Host ↔ worker boundary
+`gnr8 generate` builds `.gnr8/` once (`cargo build --target-dir .gnr8/target`), then runs the produced
+binary directly with `cwd = project root` and speaks a framed protocol over its stdio:
+
+```
+b"GN8F" | payload length: u32 be | BLAKE3(payload): 32 bytes | payload: compact JSON
+```
+
+The worker's first frame is its **stage plan** — the ordered list of stages, each either a built-in
+declaration or the position of one of your own. The host then runs the pipeline itself
+(source → transforms → freeze → targets → post), executing every built-in natively and sending a
+frame only when it reaches a `Custom(...)` stage. A pipeline with no custom stages exchanges exactly
+two frames.
+
+The **host** owns everything after that: artifact-path portability, the ownership manifest, no-op skip
+(byte-identical), edit-protection (warn+skip user-edited unless `--force`), and excluding the
+pipeline's own output paths from analysis. So `check`/`watch`/`doctor` reuse one writer.
+
+Bounds: frames are capped at 64 MiB and digest-checked; worker stderr is captured to 1 MiB and then
+truncated with a marker; a session has a 300 s budget (`GNR8_WORKER_TIMEOUT_SECS`). Only the direct
+worker process is killed on timeout — a process your own stage spawned is not tracked.
+
+**Trust.** Building and running `.gnr8/` compiles and executes Rust from the repository — `build.rs`,
+proc macros, and your `main()` — with your privileges. It is not sandboxed. `--no-build` refuses to
+invoke cargo; `--no-execute` refuses to build *or* run. `gnr8 inspect routes <path>` never touches
+`.gnr8/` at all.
+
+**Worker reuse.** `.gnr8/cache/worker.json` records a fingerprint over every file under `.gnr8/`
+(except `target/` and `cache/`), the host executable's own content hash, and the protocol constants,
+plus the built binary's hash. If all of that still matches, the recorded binary *is* the build output
+of those inputs and cargo is not invoked. `gnr8 generate -v` reports `worker: reused` or
+`worker: built`.
 
 ## Supported source frontends (the honest envelope)
 gnr8 supports four source frontends across three languages. Each row states what is actually recognized
@@ -532,7 +561,7 @@ lists every diagnostic.
 | `unsupported security scheme` | `kind`/`location` not `apiKey`/`header` | use `ApplySecurity::api_key(..)` (apiKey/header is the supported scheme) |
 | `duplicate security scheme id` | two `ApplySecurity` transforms share an `id` | dedupe |
 | `no .gnr8/ workspace … run `gnr8 init`` | no `.gnr8/Cargo.toml` in cwd | run `gnr8 init` (and `cd` to the project root) |
-| child won't compile / `cargo` not found | `.gnr8/src/main.rs` has a Rust error, or no cargo on PATH | fix the reported compile error; install a Rust toolchain |
+| worker won't compile / `cargo` not found | `.gnr8/src/main.rs` has a Rust error, or no cargo on PATH | fix the reported compile error; install a Rust toolchain |
 | go toolchain / module load error (reported, not crash) | `go` missing or target not buildable | install Go; make the target module `go build`-clean |
 
 ## Recipes
@@ -560,15 +589,20 @@ Runnable end-to-end example with committed input + generated output: [`../exampl
 |---|---|
 | `goextract/internal/load` | load+typecheck target module (Go helper) |
 | `goextract/internal/{routes,handlers,types}` | recognize Gin routes/handlers, extract structs/types → JSON facts |
-| `crates/gnr8-core/src/analyze` | subprocess driver + serde facts DTOs |
-| `crates/gnr8-core/src/graph` | the API graph (stable ids, sorted) |
+| `crates/gnr8-core/src/analyze` | subprocess driver for the language sidecars |
+| `crates/gnr8-sdk/src/facts.rs` | the neutral facts DTO every sidecar emits |
+| `crates/gnr8-sdk/src/graph.rs` | the API graph (stable ids, sorted) |
+| `crates/gnr8-core/src/graph` | direction analysis + the generation projection |
 | `crates/gnr8-core/src/lower` | graph → OpenAPI 3.1 (`to_openapi(graph, title, base_path, security)`) + YAML writer |
 | `crates/gnr8-core/src/gosdk` | graph → Go SDK (`generate(graph, package, base_path)`, emit, split bundle) |
-| `crates/gnr8-core/src/sdk` | the code-as-config SDK: `Pipeline`, the 4 traits, built-in stages, `Artifacts`/`Cx`, `prelude` |
-| `crates/gnr8-core/src/runner` | the `.gnr8/` child entry (`run`): `__emit`/`__inspect`, the `ArtifactBundle` wire schema |
+| `crates/gnr8-sdk/src/sdk` | the code-as-config SDK: `Pipeline`, the 4 traits, built-in declarations, `Artifacts`/`Cx`, `prelude` |
+| `crates/gnr8-sdk/src/{protocol,worker}` | the frame protocol + the `.gnr8/` worker entry point (`gnr8::worker::run`) |
+| `crates/gnr8-core/src/sdk/builtins.rs` | execution of every built-in declaration |
+| `crates/gnr8-core/src/pipeline` | host-side stage ordering (`StageRunner`, `run`, `build_ir`) |
+| `crates/gnr8-core/src/worker` | host-side worker build, fingerprint, session |
 | `crates/gnr8-core/src/lifecycle` | manifest, `plan_writes`, no-op, `regenerate`, `check`, output-path exclusion |
 | `crates/gnr8-core/src/{workspace,diagnostics}` | `init` (scaffolds the `.gnr8/` crate); diagnostics aggregation |
-| `crates/gnr8/src/{main,cli,child,doctor,watch,render}` | CLI dispatch, the host→child driver, exit codes, doctor, watch, rendering |
+| `crates/gnr8/src/{main,cli,doctor,watch,render}` | CLI dispatch, trust flags, exit codes, doctor, watch, rendering |
 | `crates/gnr8-core/tests` | contract snapshots (`snapshot_{graph,openapi,sdk,diagnostics}`), `sdk_compile`, `determinism`, `lifecycle` |
 
 When editing: obey `../CLAUDE.md`. Changing emitted output requires regenerating snapshots

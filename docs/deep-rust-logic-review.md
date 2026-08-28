@@ -1,5 +1,10 @@
 # Deep Rust Logic Review
 
+> **Historical.** This is a point-in-time review of `origin/main` at `2e0d3b38`. Several symbols it
+> names — `pre_child_verified_noop`, the artifact cache, `gnr8::runner` — were removed in 0.9.0 when
+> the `.gnr8` contract split into a thin SDK and a host-owned engine. It is kept as the record of
+> what was reviewed, not as a description of current code.
+
 Date: 2026-06-27
 Branch reviewed: `deep-rust-code-review` at `2e0d3b38`, equal to `origin/main`
 Scope: Rust core/CLI logic, generated SDK emitters, OpenAPI lowering, artifact lifecycle, and the extractor contracts that feed the Rust IR.

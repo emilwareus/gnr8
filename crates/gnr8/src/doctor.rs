@@ -4,10 +4,10 @@
 //! performs NO I/O: [`DoctorReport::assemble`] takes already-collected facts (the lifecycle booleans,
 //! the pipeline's structured `diagnostics`, and the dry-run drift `WritePlan`) and groups them into a
 //! serializable report. The impure half — probing `.gnr8/`, probing the source-language toolchain, and RUNNING the
-//! user's `.gnr8/` pipeline (the child) to harvest its diagnostics + compute drift — lives in
+//! user's `.gnr8/` pipeline (via the worker) to harvest its diagnostics + compute drift — lives in
 //! `main::run_doctor`, mirroring the `run_check` shell-vs-decision split. Keeping `assemble` pure makes
 //! the entire exit-policy truth table (Pitfall 1 — INFO/WARN diagnostics must not force a non-zero exit)
-//! unit-testable without a filesystem, a toolchain, or a child process.
+//! unit-testable without a filesystem, a toolchain, or a worker process.
 //!
 //! ## Exit policy (Pitfall 1 / HARD-01)
 //!
@@ -24,8 +24,8 @@
 
 use std::fmt::Write as _;
 
-use gnr8::graph::Diagnostic;
-use gnr8::lifecycle::{WriteAction, WritePlan};
+use gnr8_engine::graph::Diagnostic;
+use gnr8_engine::lifecycle::{WriteAction, WritePlan};
 
 /// The read-only lifecycle facts `doctor` reports (each is an ACTIONABLE problem when false). Collected
 /// by `run_doctor` and handed to [`DoctorReport::assemble`].
@@ -75,7 +75,7 @@ pub(crate) struct DoctorDiagnostic {
     /// Severity copied from the source diagnostic (`"INFO"`, `"WARN"`, or `"ERROR"`).
     pub(crate) severity: String,
     /// Stable diagnostic category.
-    pub(crate) category: gnr8::graph::DiagnosticCategory,
+    pub(crate) category: gnr8_engine::graph::DiagnosticCategory,
     /// The original analyzer message (rule + identity).
     pub(crate) message: String,
     /// The source file the diagnostic applies to (module-relative).
@@ -577,8 +577,8 @@ mod tests {
     #![allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
 
     use super::DoctorReport;
-    use gnr8::graph::{Diagnostic, DiagnosticCategory, SourceSpan};
-    use gnr8::lifecycle::{PlannedFile, WriteAction, WritePlan};
+    use gnr8_engine::graph::{Diagnostic, DiagnosticCategory, SourceSpan};
+    use gnr8_engine::lifecycle::{PlannedFile, WriteAction, WritePlan};
     use std::collections::HashSet;
 
     /// One informational analysis warning.

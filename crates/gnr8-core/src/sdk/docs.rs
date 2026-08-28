@@ -8,47 +8,7 @@ use crate::graph::{ApiGraph, MediaExample, OperationDocsPolicy, Type};
 use crate::sdk::model::SdkModel;
 use crate::sdk::Artifacts;
 
-/// SDK documentation output mode.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct SdkDocs {
-    reference: bool,
-}
-
-impl SdkDocs {
-    /// Do not emit generated SDK documentation.
-    #[must_use]
-    pub fn none() -> Self {
-        Self { reference: false }
-    }
-
-    /// Emit the historical gnr8 `README.md` and `reference.md` files.
-    #[must_use]
-    pub fn reference() -> Self {
-        Self { reference: true }
-    }
-
-    /// Whether no documentation should be emitted.
-    #[must_use]
-    pub const fn is_none(&self) -> bool {
-        !self.reference
-    }
-}
-
-impl Default for SdkDocs {
-    fn default() -> Self {
-        Self::reference()
-    }
-}
-
-impl From<bool> for SdkDocs {
-    fn from(enabled: bool) -> Self {
-        if enabled {
-            Self::reference()
-        } else {
-            Self::none()
-        }
-    }
-}
+pub use gnr8::sdk::docs::SdkDocs;
 
 /// Write SDK documentation artifacts under `dir`.
 ///
@@ -65,7 +25,7 @@ pub(crate) fn write_sdk_docs(
         return Ok(());
     }
     let dir = dir.trim_end_matches('/');
-    if docs.reference {
+    if !docs.is_none() {
         out.create(
             format!("{dir}/README.md"),
             sdk_readme(language, package, ir),

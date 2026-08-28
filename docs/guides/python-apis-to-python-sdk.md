@@ -21,7 +21,7 @@ gnr8 init --source flask --sdk python
 use gnr8::sdk::prelude::*;
 
 fn main() -> std::process::ExitCode {
-    gnr8::runner::run(
+    gnr8::worker::run(
         Pipeline::new()
             .source(FastApi::new().inputs(["."]))
             .transform(SetBasePath::new("/api"))

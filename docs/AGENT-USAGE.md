@@ -61,7 +61,7 @@ facts that source code cannot express reliably. Target stages write artifacts.
 use gnr8::sdk::prelude::*;
 
 fn main() -> std::process::ExitCode {
-    gnr8::runner::run(
+    gnr8::worker::run(
         Pipeline::new()
             .source(FastApi::new().inputs(["."]))
             .transform(SetBasePath::new("/api"))
@@ -72,6 +72,21 @@ fn main() -> std::process::ExitCode {
             .post(Header::generated()),
     )
 }
+```
+
+Built-in stages — `FastApi`, `SetBasePath`, `OpenApi31`, `PySdk`, `Header` — are declarations the
+installed CLI executes; none of that machinery is compiled into this crate. A stage you write
+yourself is wrapped in `Custom(...)` and runs in this process:
+
+```rust
+struct DropInternalRoutes;
+impl Transform for DropInternalRoutes {
+    fn apply(&self, ir: &mut ApiGraph, _cx: &Cx) -> Result<(), gnr8::Error> {
+        ir.operations.retain(|op| !op.path.starts_with("/_"));
+        Ok(())
+    }
+}
+// ... .transform(Custom(DropInternalRoutes))
 ```
 
 Common changes:

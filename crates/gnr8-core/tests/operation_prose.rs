@@ -23,17 +23,20 @@ use std::path::{Path, PathBuf};
 
 const FIXTURE_DIR: &str = concat!(env!("CARGO_MANIFEST_DIR"), "/../../fixtures/goalservice");
 
-fn goalservice_graph() -> gnr8::graph::ApiGraph {
-    gnr8::analyze::build_graph(FIXTURE_DIR)
+fn goalservice_graph() -> gnr8_engine::graph::ApiGraph {
+    gnr8_engine::analyze::build_graph(FIXTURE_DIR)
         .expect("analyze::build_graph must succeed (requires the Go toolchain)")
 }
 
-fn openapi_of(graph: &gnr8::graph::ApiGraph) -> String {
-    gnr8::lower::to_openapi(graph, &graph.title, &graph.base_path, &[])
+fn openapi_of(graph: &gnr8_engine::graph::ApiGraph) -> String {
+    gnr8_engine::lower::to_openapi(graph, &graph.title, &graph.base_path, &[])
         .expect("lowering must succeed")
 }
 
-fn operation<'a>(graph: &'a gnr8::graph::ApiGraph, id: &str) -> &'a gnr8::graph::Operation {
+fn operation<'a>(
+    graph: &'a gnr8_engine::graph::ApiGraph,
+    id: &str,
+) -> &'a gnr8_engine::graph::Operation {
     graph
         .operations
         .iter()
@@ -106,7 +109,7 @@ fn doc_comments_cannot_change_structure() {
     let documented_yaml = openapi_of(&documented);
 
     let stripped_dir = copy_fixture_without_doc_comments();
-    let stripped = gnr8::analyze::build_graph(stripped_dir.to_str().unwrap())
+    let stripped = gnr8_engine::analyze::build_graph(stripped_dir.to_str().unwrap())
         .expect("analyze::build_graph must succeed on the stripped copy");
     let stripped_yaml = openapi_of(&stripped);
 
@@ -171,7 +174,8 @@ fn copy_dir(from: &Path, to: &Path) {
 /// names the operation id, method, path, and handler — the four things needed to find it.
 #[test]
 fn require_operation_docs_fails_and_names_the_operation() {
-    use gnr8::sdk::prelude::*;
+    use gnr8_engine::sdk::prelude::*;
+    use gnr8_engine::sdk::TransformExec as _;
 
     let mut graph = goalservice_graph();
     let removed = graph
@@ -199,7 +203,8 @@ fn require_operation_docs_fails_and_names_the_operation() {
 /// usable as a standing CI check rather than a one-off.
 #[test]
 fn require_operation_docs_passes_when_every_operation_is_documented() {
-    use gnr8::sdk::prelude::*;
+    use gnr8_engine::sdk::prelude::*;
+    use gnr8_engine::sdk::TransformExec as _;
 
     let mut graph = goalservice_graph();
     let cx = Cx::new(std::env::temp_dir());
@@ -213,7 +218,8 @@ fn require_operation_docs_passes_when_every_operation_is_documented() {
 /// fact is the defect; picking a winner between them is the same defect with extra steps.
 #[test]
 fn document_operation_colliding_with_source_prose_is_an_error() {
-    use gnr8::sdk::prelude::*;
+    use gnr8_engine::sdk::prelude::*;
+    use gnr8_engine::sdk::TransformExec as _;
 
     let mut graph = goalservice_graph();
     let cx = Cx::new(std::env::temp_dir());
@@ -241,7 +247,8 @@ fn document_operation_colliding_with_source_prose_is_an_error() {
 /// is refused.
 #[test]
 fn document_operation_still_documents_an_undocumented_operation() {
-    use gnr8::sdk::prelude::*;
+    use gnr8_engine::sdk::prelude::*;
+    use gnr8_engine::sdk::TransformExec as _;
 
     let mut graph = goalservice_graph();
     let target = graph
@@ -273,7 +280,8 @@ fn document_operation_still_documents_an_undocumented_operation() {
 /// summary, so the route trailer must be suppressed in exactly that case.
 #[test]
 fn go_doc_comment_does_not_repeat_the_route_line() {
-    use gnr8::sdk::prelude::*;
+    use gnr8_engine::sdk::prelude::*;
+    use gnr8_engine::sdk::TransformExec as _;
 
     let mut graph = goalservice_graph();
     let target = graph
@@ -290,7 +298,7 @@ fn go_doc_comment_does_not_repeat_the_route_line() {
         .apply(&mut graph, &cx)
         .expect("a description without a summary is legal configuration");
 
-    let source = gnr8::gosdk::generate(&graph, "goalservice", &graph.base_path)
+    let source = gnr8_engine::gosdk::generate(&graph, "goalservice", &graph.base_path)
         .expect("Go SDK generation must succeed (requires gofmt)");
 
     let occurrences = source
@@ -307,7 +315,8 @@ fn go_doc_comment_does_not_repeat_the_route_line() {
 /// untouched, so the outcome does not depend on the order operations happen to be in.
 #[test]
 fn document_operation_conflict_does_not_partially_apply() {
-    use gnr8::sdk::prelude::*;
+    use gnr8_engine::sdk::prelude::*;
+    use gnr8_engine::sdk::TransformExec as _;
 
     let mut graph = goalservice_graph();
     // deleteGoal loses its prose; createGoal keeps its source prose. A selector matching
@@ -368,7 +377,7 @@ fn comment_hostile_prose_cannot_break_the_generated_sdks() {
         Some("Closes a block: */ and \"\"\" and a lone \r carriage return".to_string());
     target.description = Some("Second line has */ too.\nAnd \"\"\" here.".to_string());
 
-    let ts = gnr8::tssdk::generate(&graph, "sdk", &graph.base_path)
+    let ts = gnr8_engine::tssdk::generate(&graph, "sdk", &graph.base_path)
         .expect("TypeScript SDK generation must succeed");
     assert!(
         !ts.contains("*/ and"),
@@ -379,7 +388,7 @@ fn comment_hostile_prose_cannot_break_the_generated_sdks() {
         "the `*/` must be neutralized, not dropped:\n{ts}"
     );
 
-    let py = gnr8::pysdk::generate(&graph, "sdk", &graph.base_path)
+    let py = gnr8_engine::pysdk::generate(&graph, "sdk", &graph.base_path)
         .expect("Python SDK generation must succeed");
     let docstring_line = py
         .lines()
@@ -419,7 +428,7 @@ fn python_docstring_stays_compilable_for_quote_and_backslash_endings() {
             .expect("fixture must contain deleteGoal");
         target.summary = Some(format!("Summary with {ending}"));
 
-        let py = gnr8::pysdk::generate(&graph, "sdk", &graph.base_path)
+        let py = gnr8_engine::pysdk::generate(&graph, "sdk", &graph.base_path)
             .expect("Python SDK generation must succeed");
         let opener = py
             .lines()
@@ -445,7 +454,7 @@ fn operation_prose_reaches_all_three_sdk_method_docs() {
     let summary = "Creates a goal for the calling actor.";
     let description_start = "The goal starts in the pending state";
 
-    let go = gnr8::gosdk::generate(&graph, "goalservice", &graph.base_path)
+    let go = gnr8_engine::gosdk::generate(&graph, "goalservice", &graph.base_path)
         .expect("Go SDK generation must succeed (requires gofmt)");
     assert!(
         go.contains(&format!("// CreateGoal {summary}")),
@@ -456,7 +465,7 @@ fn operation_prose_reaches_all_three_sdk_method_docs() {
         "Go method comment must carry the description:\n{go}"
     );
 
-    let py = gnr8::pysdk::generate(&graph, "sdk", &graph.base_path)
+    let py = gnr8_engine::pysdk::generate(&graph, "sdk", &graph.base_path)
         .expect("Python SDK generation must succeed");
     assert!(
         py.contains(&format!("\"\"\"{summary}")),
@@ -467,7 +476,7 @@ fn operation_prose_reaches_all_three_sdk_method_docs() {
         "Python docstring must carry the description:\n{py}"
     );
 
-    let ts = gnr8::tssdk::generate(&graph, "sdk", &graph.base_path)
+    let ts = gnr8_engine::tssdk::generate(&graph, "sdk", &graph.base_path)
         .expect("TypeScript SDK generation must succeed");
     assert!(
         ts.contains(&format!("   * {summary}")),
@@ -492,14 +501,14 @@ fn undocumented_operations_emit_no_doc_comment() {
         op.description = None;
     }
 
-    let py = gnr8::pysdk::generate(&graph, "sdk", &graph.base_path)
+    let py = gnr8_engine::pysdk::generate(&graph, "sdk", &graph.base_path)
         .expect("Python SDK generation must succeed");
     assert!(
         !py.contains("Creates a goal"),
         "no prose may survive into an undocumented Python SDK"
     );
 
-    let ts = gnr8::tssdk::generate(&graph, "sdk", &graph.base_path)
+    let ts = gnr8_engine::tssdk::generate(&graph, "sdk", &graph.base_path)
         .expect("TypeScript SDK generation must succeed");
     // The operation methods carry no JSDoc; only the hand-written runtime preamble does.
     assert!(
@@ -507,7 +516,7 @@ fn undocumented_operations_emit_no_doc_comment() {
         "no prose may survive into an undocumented TypeScript SDK"
     );
 
-    let go = gnr8::gosdk::generate(&graph, "goalservice", &graph.base_path)
+    let go = gnr8_engine::gosdk::generate(&graph, "goalservice", &graph.base_path)
         .expect("Go SDK generation must succeed (requires gofmt)");
     assert!(
         go.contains("// CreateGoal -> POST "),

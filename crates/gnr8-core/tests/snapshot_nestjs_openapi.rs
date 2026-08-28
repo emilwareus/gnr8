@@ -26,8 +26,8 @@ const FIXTURE_DIR: &str = concat!(
 
 /// The fixture's security schemes — code-as-config (CLAUDE.md rule 4); security is supplied, never
 /// scraped. One `ApiKeyAuth` / `X-API-Key` scheme.
-fn fixture_security() -> Vec<gnr8::graph::SecurityScheme> {
-    vec![gnr8::graph::SecurityScheme {
+fn fixture_security() -> Vec<gnr8_engine::graph::SecurityScheme> {
+    vec![gnr8_engine::graph::SecurityScheme {
         id: "ApiKeyAuth".to_string(),
         kind: "apiKey".to_string(),
         location: "header".to_string(),
@@ -46,9 +46,9 @@ fn openapi_matches_expected_for_nestjs() {
     }
     // 04-03: build_graph runs the tsextract helper; lowering is REUSED unchanged. title/base_path/
     // security are TEST-supplied (rule 4, Pitfall 9) — the sidecar never emits them.
-    let graph = gnr8::analyze::build_graph(FIXTURE_DIR)
+    let graph = gnr8_engine::analyze::build_graph(FIXTURE_DIR)
         .expect("analyze::build_graph must succeed (requires node + the vendored typescript)");
-    let openapi = gnr8::lower::to_openapi(&graph, "bookstore", "", &fixture_security())
+    let openapi = gnr8_engine::lower::to_openapi(&graph, "bookstore", "", &fixture_security())
         .expect("lower::to_openapi must succeed");
     insta::assert_snapshot!("nestjs_openapi", openapi);
 }

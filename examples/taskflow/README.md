@@ -68,12 +68,12 @@ Built-ins and your own Rust compose freely:
 ```rust
 use gnr8::graph::ApiGraph;
 use gnr8::sdk::prelude::*;
-use gnr8::CoreError;
+use gnr8::Error;
 
 // 1) A custom Transform — edit the IR in Rust before generation.
 struct DropDebugRoutes;
 impl Transform for DropDebugRoutes {
-    fn apply(&self, ir: &mut ApiGraph, _cx: &Cx) -> Result<(), CoreError> {
+    fn apply(&self, ir: &mut ApiGraph, _cx: &Cx) -> Result<(), Error> {
         ir.operations.retain(|op| !op.path.contains("_debug"));
         Ok(())
     }
@@ -82,7 +82,7 @@ impl Transform for DropDebugRoutes {
 // 2) A custom Target — write your own generator in ~30 lines. Emits API.md.
 struct ApiMarkdown { path: String }
 impl Target for ApiMarkdown {
-    fn generate(&self, ir: &ApiGraph, out: &mut Artifacts, _cx: &Cx) -> Result<(), CoreError> {
+    fn generate(&self, ir: &ApiGraph, out: &mut Artifacts, _cx: &Cx) -> Result<(), Error> {
         let mut md = format!("# {}\n\n## Operations\n\n| Method | Path | Operation |\n|--|--|--|\n", ir.title);
         for op in &ir.operations {
             md.push_str(&format!("| {} | `{}` | {} |\n", op.method, op.path, op.id));
@@ -93,16 +93,16 @@ impl Target for ApiMarkdown {
 }
 
 fn main() -> std::process::ExitCode {
-    gnr8::runner::run(
+    gnr8::worker::run(
         Pipeline::new()
             .source(GoGin::new().inputs(["."]))                                   // built-in source
             .transform(SetBasePath::new("/tasks"))                               // built-in transforms
             .transform(SetTitle::new("Taskflow API"))
             .transform(ApplySecurity::api_key("ApiKeyAuth", "X-API-Key"))
-            .transform(DropDebugRoutes)                                          // <-- YOUR transform
+            .transform(Custom(DropDebugRoutes))                                  // <-- YOUR transform
             .target(OpenApi31::new().to("generated/openapi.yaml"))               // built-in targets
             .target(GoSdk::new().module("example.com/taskflow/sdk").to("generated/sdk"))
-            .target(ApiMarkdown { path: "generated/API.md".into() })            // <-- YOUR generator
+            .target(Custom(ApiMarkdown { path: "generated/API.md".into() }))  // <-- YOUR generator
             .post(Header::generated()),                                          // built-in post-process
     )
 }

@@ -17,7 +17,8 @@ the feature pages for behavior and examples; use rustdoc for complete method sig
 
 | Symbol | Use |
 |---|---|
-| `Pipeline` | compose stages; optionally run/build IR directly or inspect cache/output declarations |
+| `Pipeline` | compose stages, in call order, and describe them with `plan()` |
+| `Custom` | wrap your own stage; built-ins are passed bare |
 | `Source` | trait for project source/artifact → `ApiGraph` |
 | `Transform` | trait for ordered graph mutation |
 | `Target` | trait for graph → artifacts |
@@ -115,7 +116,6 @@ See [OpenAPI generation](../openapi/generation.md).
 | `OperationFileSplit` | compact/per-tag/per-endpoint operation layout enum |
 | `SdkDocs` | none/reference generated docs policy |
 | `SdkPackageMetadata` | registry name, version, description, URLs, license, keywords |
-| `SdkModel` | normalized target-facing SDK model built from the graph |
 | `PyModelStyle` | Pydantic v2 or stdlib dataclass model policy |
 | `StaticFiles` | copy exact companion files or included directory trees |
 | `ReadinessTarget` | declare a generated package/artifact for `doctor` validation |
@@ -134,14 +134,23 @@ See [SDK generation](../sdk/generation.md).
 
 | Path | Use |
 |---|---|
-| `gnr8::runner::run` | required `.gnr8` child entry point |
-| `gnr8::runner::ArtifactBundle` | versioned child/host wire envelope |
-| `gnr8::runner::PROTOCOL_VERSION` | current host/child protocol number |
-| `gnr8::graph::ApiGraph` | neutral extracted/transformed API graph; `project_for_generation()` returns the canonical input/output artifact view |
-| `gnr8::CoreError` | typed core error enum |
-| `gnr8::sdk::validate_openapi_artifact` | generated OpenAPI readiness validation |
+| `gnr8::worker::run` | required `.gnr8` worker entry point |
+| `gnr8::sdk::Custom` | wraps your own stage so a pipeline can hold it |
+| `gnr8::protocol::PROTOCOL_VERSION` | current host/worker frame protocol number |
+| `gnr8::protocol::{read_frame, write_frame, HostMessage, WorkerMessage}` | the frame wire format |
+| `gnr8::sdk::StagePlan` | the ordered plan a worker reports to the host |
+| `gnr8::graph::ApiGraph` | neutral extracted/transformed API graph |
+| `gnr8::Error` | typed stage error enum (`#[non_exhaustive]`) |
 
 Prefer the CLI for lifecycle operations. Direct module APIs are useful for custom tooling and tests.
+
+## What is *not* in the `gnr8` crate
+
+Source extraction, OpenAPI lowering, the Go/Python/TypeScript emitters, the ownership manifest and the
+filesystem writer live in the host engine, which ships inside the installed `gnr8` binary and is not a
+dependency of any project. A built-in stage in your pipeline is a **declaration** the host executes;
+that is why the published crate's whole dependency list is `serde`, `serde_json`, `blake3` and
+`thiserror`.
 
 ## Choosing the right extension seam
 
@@ -154,5 +163,5 @@ Prefer the CLI for lifecycle operations. Direct module APIs are useful for custo
 | ingest an existing OpenAPI document as input | `OpenApi` source |
 | reproduce another generator's SDK surface | nothing — a non-goal (CLAUDE.md rule 0) |
 
-Keep custom stages deterministic, return `CoreError` instead of panicking, and use explicit artifact
-ownership transitions.
+Keep custom stages deterministic, return `gnr8::Error` instead of panicking, and use explicit artifact
+ownership transitions. Your stages run in the worker process; built-in declarations run in the host.

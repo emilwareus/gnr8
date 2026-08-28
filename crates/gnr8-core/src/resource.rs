@@ -2,7 +2,7 @@
 //!
 //! The in-repo development path can resolve sidecars with `CARGO_MANIFEST_DIR`, but a released
 //! `gnr8` binary runs from an install/archive layout. Release archives place the source resources under
-//! `share/gnr8/`, and the host passes that location to the `.gnr8` child via `GNR8_RESOURCE_DIR`.
+//! `share/gnr8/`, discovered from that layout or named explicitly by `GNR8_RESOURCE_DIR`.
 //!
 //! Exactly one root is *selected* per process, then validated. Nothing is probed: when the selected
 //! root is incomplete the call fails with the path that was selected and why, rather than silently
@@ -10,25 +10,25 @@
 //! that did not ship it.
 //!
 //! The selection:
-//! - `$GNR8_RESOURCE_DIR` when set — the host's explicit declaration to the `.gnr8` child, and the
-//!   user's escape hatch. Always wins, in every build kind.
+//! - `$GNR8_RESOURCE_DIR` when set — the user's escape hatch. Always wins, in every build kind.
 //! - otherwise, in debug builds, the compile-time repository root (`CARGO_MANIFEST_DIR/../..`).
 //! - otherwise, `../share/gnr8` relative to the **canonicalized** executable, so invoking the
 //!   installer's `~/.local/bin/gnr8` symlink resolves against the real `~/.local/gnr8/bin/gnr8`.
 
 use std::path::{Path, PathBuf};
 
-/// Environment variable used by the host to tell the `.gnr8` child where release resources live.
+/// Environment variable naming the directory a release archive's resources live in.
 pub const GNR8_RESOURCE_DIR_ENV: &str = "GNR8_RESOURCE_DIR";
 
 /// Resolve the one resource root selected for this process.
 ///
-/// The expected root contains `goextract/`, `pyextract/`, `tsextract/`, and `crates/gnr8-core/`.
+/// The expected root contains `goextract/`, `pyextract/`, `tsextract/`, and `crates/gnr8-sdk/`.
 ///
-/// `$GNR8_RESOURCE_DIR` selects the root when set — this is how the host hands its own resolved
-/// root to the `.gnr8` child, so the child agrees with the host by construction instead of
-/// re-deriving it. With the variable unset, debug builds select the compile-time repository root and
-/// release builds select `../share/gnr8` beside the canonicalized executable.
+/// `$GNR8_RESOURCE_DIR` selects the root when set — the user's escape hatch, and how a release
+/// archive points at its own bundled resources. With the variable unset, debug builds select the
+/// compile-time repository root and release builds select `../share/gnr8` beside the canonicalized
+/// executable. Only the host reads this: extraction runs host-side now, so a project's worker never
+/// needs a sidecar.
 ///
 /// The selected root is validated and a failure is reported against that one path; no alternate
 /// location is probed.
@@ -95,7 +95,7 @@ fn looks_like_resource_dir(path: &Path) -> bool {
         && path.join("tsextract").join("index.js").is_file()
         && path
             .join("crates")
-            .join("gnr8-core")
+            .join("gnr8-sdk")
             .join("Cargo.toml")
             .is_file()
 }
@@ -135,7 +135,7 @@ mod tests {
             ("goextract/go.mod", "module example\n"),
             ("pyextract/__main__.py", "print('ok')\n"),
             ("tsextract/index.js", "export {}\n"),
-            ("crates/gnr8-core/Cargo.toml", "[package]\nname=\"gnr8\"\n"),
+            ("crates/gnr8-sdk/Cargo.toml", "[package]\nname=\"gnr8\"\n"),
         ] {
             let path = root.join(rel);
             if let Some(parent) = path.parent() {

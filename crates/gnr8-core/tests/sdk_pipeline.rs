@@ -1,4 +1,4 @@
-//! Integration test for the code-as-config SDK (`gnr8::sdk`): a `Pipeline` composed from the
+//! Integration test for the code-as-config SDK (`gnr8_engine::sdk`): a `Pipeline` composed from the
 //! built-in stages over the goalservice fixture produces an `OpenAPI` artifact + the Go SDK artifacts,
 //! and the key generation facts (title, base path, an operationId, a security scheme, the generated
 //! header) all flow through the built-ins exactly as the host path produces them.
@@ -13,7 +13,7 @@
 // to this test target so the workspace-wide RUST-04 deny stays intact for production code.
 #![allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
 
-use gnr8::sdk::prelude::*;
+use gnr8_engine::sdk::prelude::*;
 
 /// The Go Gin fixture, resolved relative to this crate's manifest dir (mirrors the snapshot tests).
 const FIXTURE_DIR: &str = concat!(env!("CARGO_MANIFEST_DIR"), "/../../fixtures/goalservice");
@@ -30,13 +30,13 @@ fn go_available() -> bool {
 
 /// Build the goalservice pipeline (the same shape the bookstore `.gnr8` uses) and run it, rooted at
 /// the fixture dir so `GoGin::new().inputs(["."])` analyzes the fixture module.
-fn run_goalservice_pipeline() -> Option<gnr8::sdk::RunOutcome> {
+fn run_goalservice_pipeline() -> Option<gnr8_engine::pipeline::PipelineOutcome> {
     if !go_available() {
         eprintln!("skipping sdk_pipeline: go toolchain unavailable");
         return None;
     }
     let cx = Cx::new(FIXTURE_DIR);
-    let outcome = Pipeline::new()
+    let pipeline = Pipeline::new()
         .source(GoGin::new().inputs(["."]))
         .transform(SetBasePath::new("/goal"))
         .transform(SetTitle::new("Goal Service"))
@@ -47,8 +47,8 @@ fn run_goalservice_pipeline() -> Option<gnr8::sdk::RunOutcome> {
                 .module("example.com/goalservice/sdk")
                 .to("generated/sdk"),
         )
-        .post(Header::generated())
-        .run(&cx)
+        .post(Header::generated());
+    let outcome = gnr8_engine::pipeline::run_in_process(&pipeline, &cx)
         .expect("the goalservice pipeline must run (requires the Go toolchain)");
     Some(outcome)
 }
@@ -58,7 +58,7 @@ fn pipeline_emits_openapi_and_sdk_artifacts_with_key_facts() {
     let Some(outcome) = run_goalservice_pipeline() else {
         return;
     };
-    let files = outcome.artifacts.files();
+    let files = &outcome.artifacts;
 
     // The OpenAPI artifact is present at the configured path and carries the transform-set facts.
     let openapi = files
@@ -126,8 +126,8 @@ fn pipeline_is_deterministic_across_two_runs() {
         return;
     };
     // Same input ⇒ byte-identical artifact set (path + text), in the same order.
-    let fa = a.artifacts.files();
-    let fb = b.artifacts.files();
+    let fa = &a.artifacts;
+    let fb = &b.artifacts;
     assert_eq!(fa.len(), fb.len(), "same number of artifacts across runs");
     for (x, y) in fa.iter().zip(fb.iter()) {
         assert_eq!(x.path, y.path, "artifact paths must match in order");

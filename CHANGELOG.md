@@ -9,6 +9,98 @@ must move the minor version.
 
 ## Unreleased
 
+### Breaking
+
+- **A project's `.gnr8/` crate no longer links the gnr8 engine.** The published `gnr8` crate is now a
+  thin code-as-config SDK — the API graph, the four stage traits, `Pipeline`, the built-in stage
+  declarations, and the host/worker frame protocol — whose entire dependency list is `serde`,
+  `serde_json`, `blake3` and `thiserror`. Source extraction, OpenAPI lowering, the Go/Python/
+  TypeScript emitters, the ownership manifest and the filesystem writer moved to `gnr8-engine`, which
+  ships inside the installed CLI and is not published.
+
+  The old boundary was a JSON document handed between two processes that linked the *same* 53k-line
+  library: `gnr8 generate` ran `cargo run --manifest-path .gnr8/Cargo.toml -- __emit` and parsed an
+  `ArtifactBundle` from the child's stdout. Every project compiled the whole generator, and every
+  gnr8 upgrade recompiled it.
+
+  Measured on one machine (Linux, warm crates.io cache, `--offline`, dev profile), for the
+  `examples/bookstore` project:
+
+  | | before | after |
+  |---|---|---|
+  | cold `.gnr8` build | 19.4 s, 60 compile units, 561 MB target dir | 9.8 s, 23 units, 212 MB |
+  | cold `gnr8 generate` | 33.0 s | 12.0 s |
+  | warm `gnr8 generate` | 0.27–0.31 s | 0.054–0.069 s |
+  | warm `gnr8 check` | 0.28 s | 0.049–0.051 s |
+  | `.gnr8/Cargo.lock` | 59 packages | 23 packages |
+
+- **`gnr8 generate` no longer invokes `cargo` for an unchanged project.** The host builds `.gnr8/`
+  with `cargo build --target-dir .gnr8/target`, then executes the resulting binary directly.
+  `.gnr8/cache/worker.json` records a fingerprint over every file under `.gnr8/` (excluding `target/`
+  and `cache/`), the host executable's own content hash, and the protocol constants, plus the built
+  binary's hash. When all of that matches, that binary *is* the build output of those inputs and the
+  build step is skipped outright. `gnr8 generate -v` reports `worker: reused` or `worker: built`.
+
+- **The host↔child JSON bundle is replaced by a framed host↔worker protocol.**
+  `b"GN8F" | len:u32be | BLAKE3(payload):32 | payload:JSON`, bounded at 64 MiB and digest-checked on
+  both sides. The worker's first frame is its **stage plan**; the host then runs the pipeline itself,
+  executing every built-in natively and sending a frame only for a stage the user wrote. A pipeline
+  with no custom stages exchanges exactly two frames. Worker stderr is captured to 1 MiB and then
+  truncated with a marker; a session has a 300 s budget (`GNR8_WORKER_TIMEOUT_SECS`).
+  `gnr8::runner::{run, ArtifactBundle, PROTOCOL_VERSION}` and the
+  `GNR8_HOST_PROTOCOL_VERSION`/`GNR8_HOST_CLI_VERSION`/`GNR8_HOST_CAPABILITY_FINGERPRINT` environment
+  handshake are removed.
+
+- **Migrating a `.gnr8/` crate.** `gnr8 init --upgrade` repoints `.gnr8/Cargo.toml` at this gnr8's SDK
+  — preserving your own dependencies and comments — and deletes the stale `Cargo.lock` and worker
+  stamp. It never edits your Rust; it prints the three edits to make in `.gnr8/src/main.rs`:
+
+  1. `gnr8::runner::run(` → `gnr8::worker::run(`;
+  2. wrap each of your own stages in `Custom(...)`, e.g. `.transform(Custom(MyTransform))` —
+     built-in stages are still passed bare, and the wrapper is what makes the host/worker split
+     visible in the pipeline;
+  3. `gnr8::CoreError` → `gnr8::Error` in your stage signatures.
+
+  A manifest that still pins a pre-0.9 `gnr8`, or that depends on `gnr8-engine`/`gnr8-core`, is
+  refused **before** anything is compiled, with those instructions in the error. There is no
+  compatibility mode and no fallback path. `--upgrade` adds a `[dependencies]` table when the
+  manifest has none, and refuses — with the exact line to write — a manifest that states the
+  dependency as a `[dependencies.gnr8]` table, which its line-based rewrite will not touch.
+
+- **`gnr8` gained `--no-build` and `--no-execute`.** Building and running `.gnr8/` compiles and
+  executes Rust from the repository — build scripts, proc macros, and the pipeline's `main()` — with
+  the invoking user's privileges, and is **not sandboxed**. `--no-build` refuses to invoke cargo and
+  requires an already-matching worker; `--no-execute` refuses to build *or* run. `gnr8 inspect routes
+  <path>` still analyzes a source tree without touching `.gnr8/`. Honest limitation: on timeout only
+  the direct worker process is killed — the workspace forbids `unsafe`, so gnr8 cannot create a
+  process group, and a process one of your own stages spawned is not tracked.
+
+- **Removed: two unreachable cache subsystems.** `runner::PRE_CHILD_NOOP_SUPPORTED` and
+  `sdk::ARTIFACT_CACHE_SUPPORTED` were both `false`, so the pre-child verified-no-op stamps and the
+  artifact cache never ran. Their inputs were child-emitted bundle fields that no longer exist, so
+  they are deleted rather than revived: `sdk::{load_artifact_cache_files, load_artifact_cache_metadata,
+  discard_artifact_cache, cache_config_input_paths, stamp_project_paths…}`, the
+  `Source::cache_input_roots` / `Target::{cache_input_files, verified_noop_input_*}` /
+  `PostProcess::{cache_key_fragment, verified_noop_input_*}` trait hooks, and
+  `lifecycle::{plan_only_cached, regenerate_cached_with_anchors, plan_metadata_writes,
+  recover_cached_output_transactions}`.
+
+- **`SdkModel` left the prelude.** It is the SDK emitters' internal model and needs the generation
+  projection, which is host-only. Custom targets read `ApiGraph` directly.
+
+- **`Pipeline` no longer runs itself, and `validate_openapi_artifact` is host-only.**
+  `Pipeline::{run, build_ir, output_anchors, readiness_targets}` and
+  `sdk::validate_openapi_artifact` needed the engine, so they moved to it as
+  `gnr8_engine::pipeline::{run_in_process, build_ir_in_process, output_anchors, readiness_targets}`
+  and `gnr8_engine::sdk::validate_openapi_artifact`. A `.gnr8/` worker never called them — it hands
+  its `Pipeline` to `gnr8::worker::run` — so this affects only tooling that linked the old crate as a
+  library. Composing, and every custom `Source`/`Transform`/`Target`/`PostProcess`, is unchanged.
+
+- **`gnr8 generate --json` / `check --json` renamed `cache_mode` to `worker`** (`"built"` or
+  `"reused"`), and `timings_ms` lost `hot_noop` (the subsystem it measured is gone) — `pipeline`,
+  `write` and `total` are now plain numbers rather than nullable. `source_files` now counts the files
+  that contributed a fact to the graph rather than every file under the source root.
+
 ### Fixed
 
 - **Named string-enum request parameters now compile in generated Go SDKs.** Query, header, and

@@ -51,12 +51,12 @@ if [[ "$binary_name" == "gnr8" ]]; then
 fi
 
 cp README.md LICENSE Cargo.toml Cargo.lock rust-toolchain.toml "$stage/share/gnr8/"
-cp -R crates/gnr8-core "$stage/share/gnr8/crates/"
+cp -R crates/gnr8-sdk "$stage/share/gnr8/crates/"
 cp -R crates/gnr8 "$stage/share/gnr8/crates/"
 cp -R goextract pyextract tsextract "$stage/share/gnr8/"
 
 rm -rf \
-  "$stage/share/gnr8/crates/gnr8-core/target" \
+  "$stage/share/gnr8/crates/gnr8-sdk/target" \
   "$stage/share/gnr8/crates/gnr8/target" \
   "$stage/share/gnr8/tsextract/node_modules" \
   "$stage/share/gnr8/pyextract/__pycache__"
@@ -72,7 +72,8 @@ The share/gnr8 directory is required. gnr8 discovers it automatically from this 
 can set GNR8_RESOURCE_DIR="\$PWD/share/gnr8" explicitly.
 
 Runtime toolchains:
-  - Rust/cargo: required because gnr8 compiles each project's .gnr8 generation crate.
+  - Rust/cargo: required because gnr8 compiles each project's .gnr8 worker crate the first time,
+    and again whenever that crate changes.
   - Go: required for Go/Gin sources.
   - python3: required for FastAPI/Flask sources.
   - node + the target project's typescript dev dependency: required for NestJS sources.

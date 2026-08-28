@@ -51,6 +51,10 @@ jobs:
       matrix:
         include:
           - package: gnr8
+            needs_go: "false"
+            needs_python: "false"
+            needs_node: "false"
+          - package: gnr8-engine
             needs_go: "true"
             needs_python: "true"
             needs_node: "true"

@@ -5,7 +5,7 @@
 //! compact SDK while larger APIs choose a navigable, split layout.
 
 /// How an SDK target maps generated API shapes to files.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct SdkFileLayout {
     kind: SdkFileLayoutKind,
     operation_split: OperationFileSplit,
@@ -178,14 +178,14 @@ impl Default for SdkFileLayout {
     }
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 enum SdkFileLayoutKind {
     Compact,
     Split,
 }
 
 /// How a split SDK layout distributes generated client operation methods.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub enum OperationFileSplit {
     /// Keep operation methods in the compact client/operations file.
     Compact,

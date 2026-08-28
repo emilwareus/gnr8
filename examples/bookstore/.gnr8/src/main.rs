@@ -1,13 +1,13 @@
 //! gnr8 generation lifecycle for the bookstore example. This file IS the config — edit it to adapt
 //! how the API is parsed and how the OpenAPI document + Go SDK are generated. It is an ordinary Rust
-//! binary that composes a `Pipeline` and hands it to the gnr8 runner; the runner parses argv
-//! (`__emit` / `__inspect`) and prints a JSON bundle to stdout.
+//! binary that composes a `Pipeline` and hands it to the gnr8 worker runtime. The built-in stages
+//! below are declarations the installed `gnr8` host executes; only your own stages run here.
 //!
 //! Run it from the bookstore module root so `GoGin::new().inputs(["."])` analyzes the Go module here:
 //!
 //! ```sh
 //! cd examples/bookstore
-//! cargo run --quiet --manifest-path .gnr8/Cargo.toml -- __emit
+//! gnr8 generate
 //! ```
 //!
 //! This reproduces the committed `examples/bookstore/generated/` output (same routes/schemas/security/
@@ -23,7 +23,7 @@
 use gnr8::sdk::prelude::*;
 
 fn main() -> std::process::ExitCode {
-    gnr8::runner::run(
+    gnr8::worker::run(
         Pipeline::new()
             .source(GoGin::new().inputs(["."]))
             .transform(SetBasePath::new("/"))

@@ -5,7 +5,7 @@
 use std::path::{Path, PathBuf};
 use std::process::Command;
 
-use gnr8::sdk::prelude::*;
+use gnr8_engine::sdk::prelude::*;
 
 const FIXTURE_DIR: &str = concat!(
     env!("CARGO_MANIFEST_DIR"),
@@ -48,22 +48,22 @@ fn unique_temp_dir(label: &str) -> PathBuf {
     dir
 }
 
-fn run_pipeline() -> Option<gnr8::sdk::RunOutcome> {
+fn run_pipeline() -> Option<gnr8_engine::pipeline::PipelineOutcome> {
     if !go_available() {
         eprintln!("skipping gin_contract_regression: go toolchain unavailable");
         return None;
     }
     let fixture = unique_temp_dir("fixture");
     copy_fixture(Path::new(FIXTURE_DIR), &fixture);
+    let pipeline = Pipeline::new()
+        .source(GoGin::new().inputs(["."]))
+        .transform(ApiOverrides::new().sse_response("GET", "/v1/items/raw-stream"))
+        .target(OpenApi31::new().to("generated/openapi.yaml"))
+        .target(TsSdk::new().module("@example/sdk").to("generated/ts"))
+        .target(PySdk::new().module("example_sdk").to("generated/py"))
+        .target(GoSdk::new().module("example.com/sdk").to("generated/go"));
     Some(
-        Pipeline::new()
-            .source(GoGin::new().inputs(["."]))
-            .transform(ApiOverrides::new().sse_response("GET", "/v1/items/raw-stream"))
-            .target(OpenApi31::new().to("generated/openapi.yaml"))
-            .target(TsSdk::new().module("@example/sdk").to("generated/ts"))
-            .target(PySdk::new().module("example_sdk").to("generated/py"))
-            .target(GoSdk::new().module("example.com/sdk").to("generated/go"))
-            .run(&Cx::new(&fixture))
+        gnr8_engine::pipeline::run_in_process(&pipeline, &Cx::new(&fixture))
             .expect("gin contract pipeline must generate SDKs"),
     )
 }
@@ -86,10 +86,9 @@ fn copy_fixture(src: &Path, dst: &Path) {
     }
 }
 
-fn artifact<'a>(outcome: &'a gnr8::sdk::RunOutcome, path: &str) -> &'a str {
+fn artifact<'a>(outcome: &'a gnr8_engine::pipeline::PipelineOutcome, path: &str) -> &'a str {
     outcome
         .artifacts
-        .files()
         .iter()
         .find(|artifact| artifact.path == path)
         .unwrap_or_else(|| panic!("missing artifact {path}"))
@@ -259,7 +258,7 @@ fn go_gin_contract_pipeline_generates_expected_sdk_surfaces() {
     assert_openapi(artifact(&outcome, "generated/openapi.yaml"));
     assert_go_operations(artifact(&outcome, "generated/go/operations.go"));
 
-    for file in outcome.artifacts.files() {
+    for file in &outcome.artifacts {
         assert!(
             !file.text.contains("gin.H") && !file.text.contains("github.com/gin-gonic/gin.H"),
             "{} must not contain gin.H refs",
@@ -326,8 +325,8 @@ fn generated_go_and_typescript_sdks_compile() {
     );
 }
 
-fn write_artifacts(outcome: &gnr8::sdk::RunOutcome, prefix: &str, dir: &Path) {
-    for artifact in outcome.artifacts.files() {
+fn write_artifacts(outcome: &gnr8_engine::pipeline::PipelineOutcome, prefix: &str, dir: &Path) {
+    for artifact in &outcome.artifacts {
         let Some(relative) = artifact.path.strip_prefix(prefix) else {
             continue;
         };

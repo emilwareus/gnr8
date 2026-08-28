@@ -15,7 +15,12 @@
 // this test target so the workspace-wide RUST-04 deny stays intact for production code (Pitfall 2).
 // `doc_markdown` is allowed too: these test-target doc comments name many proper nouns (NestJS,
 // FastAPI, OpenAPI, ...) where backtick-per-noun hurts readability.
-#![allow(clippy::unwrap_used, clippy::expect_used, clippy::doc_markdown)]
+#![allow(
+    clippy::unwrap_used,
+    clippy::expect_used,
+    clippy::panic,
+    clippy::doc_markdown
+)]
 
 mod nestjs_toolchain;
 
@@ -47,8 +52,8 @@ const FLASK_FIXTURE_DIR: &str = concat!(
 /// The fixture's security schemes — the single source of truth for security (CLAUDE.md rule 4): one
 /// `ApiKeyAuth` / `X-API-Key` scheme. Security is no longer scraped from the source, so the contract
 /// tests supply it here to drive lowering (graph-owned `SecurityScheme`s).
-fn fixture_security() -> Vec<gnr8::graph::SecurityScheme> {
-    vec![gnr8::graph::SecurityScheme {
+fn fixture_security() -> Vec<gnr8_engine::graph::SecurityScheme> {
+    vec![gnr8_engine::graph::SecurityScheme {
         id: "ApiKeyAuth".to_string(),
         kind: "apiKey".to_string(),
         location: "header".to_string(),
@@ -60,12 +65,12 @@ fn fixture_security() -> Vec<gnr8::graph::SecurityScheme> {
 #[test]
 fn build_graph_is_byte_identical_across_two_runs() {
     // Skip gracefully if the Go toolchain is absent so the test never fails for a missing dependency.
-    let Ok(first) = gnr8::analyze::build_graph(FIXTURE_DIR) else {
+    let Ok(first) = gnr8_engine::analyze::build_graph(FIXTURE_DIR) else {
         eprintln!("skipping determinism test: go toolchain unavailable for {FIXTURE_DIR}");
         return;
     };
-    let second =
-        gnr8::analyze::build_graph(FIXTURE_DIR).expect("second build_graph run must also succeed");
+    let second = gnr8_engine::analyze::build_graph(FIXTURE_DIR)
+        .expect("second build_graph run must also succeed");
 
     let a = serde_json::to_string(&first).expect("serialize first graph");
     let b = serde_json::to_string(&second).expect("serialize second graph");
@@ -76,22 +81,121 @@ fn build_graph_is_byte_identical_across_two_runs() {
     );
 }
 
+/// The graph now crosses a process boundary as JSON inside a protocol frame, so any field the
+/// snapshot silently drops is a fact every custom stage stops seeing — and, because the host sends
+/// the returned graph on to its targets, a fact that stops reaching the generated output.
+///
+/// A real, transform-enriched graph is therefore pushed through the exact frame the host writes and
+/// checked twice: the snapshot must re-serialize byte-identically, and the OpenAPI lowered from the
+/// round-tripped graph must equal the one lowered from the original.
+#[test]
+fn a_graph_survives_the_worker_frame_without_losing_a_field() {
+    use gnr8::protocol::{read_frame, write_frame, HostMessage};
+    use gnr8_engine::sdk::builtins;
+    use gnr8_engine::sdk::BuiltinTransform;
+
+    // Skip gracefully if the Go toolchain is absent so the test never fails for a missing dependency.
+    let Ok(mut graph) = gnr8_engine::analyze::build_graph(FIXTURE_DIR) else {
+        eprintln!("skipping frame round-trip test: go toolchain unavailable for {FIXTURE_DIR}");
+        return;
+    };
+
+    // Extraction alone leaves every configured field at its default, and a default field serializes
+    // to nothing — which is exactly the case a round-trip test must not accidentally check. Populate
+    // the transform-owned metadata first.
+    let cx = gnr8_engine::sdk::Cx::new(std::path::PathBuf::from(FIXTURE_DIR));
+    for transform in [
+        BuiltinTransform::SetBasePath(builtins::SetBasePath::new("/goal")),
+        BuiltinTransform::SetTitle(builtins::SetTitle::new("goalservice")),
+        BuiltinTransform::OpenApiMetadata(
+            builtins::OpenApiMetadata::new()
+                .version("2.1.0")
+                .description("Round-trip fixture")
+                .terms_of_service("https://example.com/tos"),
+        ),
+        BuiltinTransform::ApplySecurity(builtins::ApplySecurity::api_key(
+            "ApiKeyAuth",
+            "X-API-Key",
+        )),
+        BuiltinTransform::ConfigureSdkRuntime(
+            builtins::ConfigureSdkRuntime::new()
+                .max_retries(3)
+                .retry_statuses([429, 503])
+                .request_hooks()
+                .response_hooks()
+                .error_hooks(),
+        ),
+    ] {
+        builtins::apply_transform(&transform, &mut graph, &cx)
+            .expect("the fixture graph must accept every built-in transform used here");
+    }
+
+    // Guard against a vacuously-passing round trip: if the snapshot below no longer carries the
+    // configured metadata, the assertions would compare two empty defaults and prove nothing.
+    let snapshot = serde_json::to_string(&graph).expect("serialize the original graph");
+    for marker in [
+        "2.1.0",
+        "Round-trip fixture",
+        "ApiKeyAuth",
+        "max_retries",
+        "operations",
+        "schemas",
+    ] {
+        assert!(
+            snapshot.contains(marker),
+            "the round-trip fixture must actually carry {marker:?}"
+        );
+    }
+
+    let mut frame = Vec::new();
+    write_frame(
+        &mut frame,
+        &HostMessage::ApplyTransform {
+            index: 0,
+            graph: graph.clone(),
+        },
+    )
+    .expect("the graph must fit in one frame");
+    let HostMessage::ApplyTransform {
+        graph: round_tripped,
+        ..
+    } = read_frame::<_, HostMessage>(&mut frame.as_slice()).expect("the frame must parse back")
+    else {
+        panic!("the frame must decode as the request it was written from");
+    };
+
+    assert_eq!(
+        snapshot,
+        serde_json::to_string(&round_tripped).expect("serialize the round-tripped graph"),
+        "a field that does not survive the frame is a fact every custom stage stops seeing"
+    );
+
+    let security = fixture_security();
+    assert_eq!(
+        gnr8_engine::lower::to_openapi(&graph, "goalservice", "/goal", &security)
+            .expect("lowering the original graph must succeed"),
+        gnr8_engine::lower::to_openapi(&round_tripped, "goalservice", "/goal", &security)
+            .expect("lowering the round-tripped graph must succeed"),
+        "the artifact lowered from a round-tripped graph must be byte-identical"
+    );
+}
+
 #[test]
 fn to_openapi_is_byte_identical_across_two_runs() {
     // Skip gracefully if the Go toolchain is absent so the test never fails for a missing dependency.
-    let Ok(first) = gnr8::analyze::build_graph(FIXTURE_DIR) else {
+    let Ok(first) = gnr8_engine::analyze::build_graph(FIXTURE_DIR) else {
         eprintln!("skipping OpenAPI determinism test: go toolchain unavailable for {FIXTURE_DIR}");
         return;
     };
-    let second =
-        gnr8::analyze::build_graph(FIXTURE_DIR).expect("second build_graph run must also succeed");
+    let second = gnr8_engine::analyze::build_graph(FIXTURE_DIR)
+        .expect("second build_graph run must also succeed");
 
     // Build the graph twice AND lower twice — proving both the upstream graph and the lowering are
     // deterministic end-to-end (idempotent OpenAPI generation, RESEARCH Pitfall 4 / TARGET-API §5.6).
     let security = fixture_security();
-    let a = gnr8::lower::to_openapi(&first, "goalservice", "/goal", &security)
+    let a = gnr8_engine::lower::to_openapi(&first, "goalservice", "/goal", &security)
         .expect("first to_openapi must succeed");
-    let b = gnr8::lower::to_openapi(&second, "goalservice", "/goal", &security)
+    let b = gnr8_engine::lower::to_openapi(&second, "goalservice", "/goal", &security)
         .expect("second to_openapi must succeed");
 
     assert_eq!(
@@ -103,18 +207,18 @@ fn to_openapi_is_byte_identical_across_two_runs() {
 #[test]
 fn sdk_generate_is_byte_identical_across_two_runs() {
     // Skip gracefully if the Go toolchain is absent (build_graph + gofmt both need it).
-    let Ok(first) = gnr8::analyze::build_graph(FIXTURE_DIR) else {
+    let Ok(first) = gnr8_engine::analyze::build_graph(FIXTURE_DIR) else {
         eprintln!("skipping SDK determinism test: go toolchain unavailable for {FIXTURE_DIR}");
         return;
     };
-    let second =
-        gnr8::analyze::build_graph(FIXTURE_DIR).expect("second build_graph run must also succeed");
+    let second = gnr8_engine::analyze::build_graph(FIXTURE_DIR)
+        .expect("second build_graph run must also succeed");
 
     // Build the graph twice AND generate twice — proving the SDK emission (gofmt'd, file-marker-framed)
     // is byte-identical end-to-end (idempotent SDK generation).
-    let a = gnr8::gosdk::generate(&first, "goalservice", "/goal")
+    let a = gnr8_engine::gosdk::generate(&first, "goalservice", "/goal")
         .expect("first sdk::generate must succeed (requires gofmt)");
-    let b = gnr8::gosdk::generate(&second, "goalservice", "/goal")
+    let b = gnr8_engine::gosdk::generate(&second, "goalservice", "/goal")
         .expect("second sdk::generate must succeed (requires gofmt)");
 
     assert_eq!(
@@ -126,13 +230,13 @@ fn sdk_generate_is_byte_identical_across_two_runs() {
 #[test]
 fn fastapi_build_graph_is_byte_identical_across_two_runs() {
     // Skip gracefully if the python3 toolchain is absent so the test never fails for a missing dep.
-    let Ok(first) = gnr8::analyze::build_graph(FASTAPI_FIXTURE_DIR) else {
+    let Ok(first) = gnr8_engine::analyze::build_graph(FASTAPI_FIXTURE_DIR) else {
         eprintln!(
             "skipping FastAPI determinism test: python3 toolchain unavailable for {FASTAPI_FIXTURE_DIR}"
         );
         return;
     };
-    let second = gnr8::analyze::build_graph(FASTAPI_FIXTURE_DIR)
+    let second = gnr8_engine::analyze::build_graph(FASTAPI_FIXTURE_DIR)
         .expect("second FastAPI build_graph run must also succeed");
 
     let a = serde_json::to_string(&first).expect("serialize first FastAPI graph");
@@ -147,21 +251,21 @@ fn fastapi_build_graph_is_byte_identical_across_two_runs() {
 #[test]
 fn fastapi_to_openapi_is_byte_identical_across_two_runs() {
     // Skip gracefully if the python3 toolchain is absent.
-    let Ok(first) = gnr8::analyze::build_graph(FASTAPI_FIXTURE_DIR) else {
+    let Ok(first) = gnr8_engine::analyze::build_graph(FASTAPI_FIXTURE_DIR) else {
         eprintln!(
             "skipping FastAPI OpenAPI determinism test: python3 toolchain unavailable for {FASTAPI_FIXTURE_DIR}"
         );
         return;
     };
-    let second = gnr8::analyze::build_graph(FASTAPI_FIXTURE_DIR)
+    let second = gnr8_engine::analyze::build_graph(FASTAPI_FIXTURE_DIR)
         .expect("second FastAPI build_graph run must also succeed");
 
     // Build twice AND lower twice — proving both the upstream graph and the reused lowering are
     // deterministic end-to-end for the Python path (idempotent OpenAPI generation).
     let security = fixture_security();
-    let a = gnr8::lower::to_openapi(&first, "bookstore", "/books", &security)
+    let a = gnr8_engine::lower::to_openapi(&first, "bookstore", "/books", &security)
         .expect("first FastAPI to_openapi must succeed");
-    let b = gnr8::lower::to_openapi(&second, "bookstore", "/books", &security)
+    let b = gnr8_engine::lower::to_openapi(&second, "bookstore", "/books", &security)
         .expect("second FastAPI to_openapi must succeed");
 
     assert_eq!(
@@ -173,13 +277,13 @@ fn fastapi_to_openapi_is_byte_identical_across_two_runs() {
 #[test]
 fn flask_build_graph_is_byte_identical_across_two_runs() {
     // Skip gracefully if the python3 toolchain is absent so the test never fails for a missing dep.
-    let Ok(first) = gnr8::analyze::build_graph(FLASK_FIXTURE_DIR) else {
+    let Ok(first) = gnr8_engine::analyze::build_graph(FLASK_FIXTURE_DIR) else {
         eprintln!(
             "skipping Flask determinism test: python3 toolchain unavailable for {FLASK_FIXTURE_DIR}"
         );
         return;
     };
-    let second = gnr8::analyze::build_graph(FLASK_FIXTURE_DIR)
+    let second = gnr8_engine::analyze::build_graph(FLASK_FIXTURE_DIR)
         .expect("second Flask build_graph run must also succeed");
 
     let a = serde_json::to_string(&first).expect("serialize first Flask graph");
@@ -194,21 +298,21 @@ fn flask_build_graph_is_byte_identical_across_two_runs() {
 #[test]
 fn flask_openapi_failure_is_deterministic_across_two_runs() {
     // Skip gracefully if the python3 toolchain is absent.
-    let Ok(first) = gnr8::analyze::build_graph(FLASK_FIXTURE_DIR) else {
+    let Ok(first) = gnr8_engine::analyze::build_graph(FLASK_FIXTURE_DIR) else {
         eprintln!(
             "skipping Flask OpenAPI determinism test: python3 toolchain unavailable for {FLASK_FIXTURE_DIR}"
         );
         return;
     };
-    let second = gnr8::analyze::build_graph(FLASK_FIXTURE_DIR)
+    let second = gnr8_engine::analyze::build_graph(FLASK_FIXTURE_DIR)
         .expect("second Flask build_graph run must also succeed");
 
     // The typed-envelope fixture intentionally contains one untyped raw handler. Lowering must reject
     // the missing response facts consistently rather than fabricate a response on either run.
     let security = fixture_security();
-    let a = gnr8::lower::to_openapi(&first, "bookstore", "/orders", &security)
+    let a = gnr8_engine::lower::to_openapi(&first, "bookstore", "/orders", &security)
         .expect_err("first Flask to_openapi must reject incomplete response facts");
-    let b = gnr8::lower::to_openapi(&second, "bookstore", "/orders", &security)
+    let b = gnr8_engine::lower::to_openapi(&second, "bookstore", "/orders", &security)
         .expect_err("second Flask to_openapi must reject incomplete response facts");
 
     assert_eq!(
@@ -229,9 +333,9 @@ fn nestjs_build_graph_is_byte_identical_across_two_runs() {
         );
         return;
     }
-    let first = gnr8::analyze::build_graph(NESTJS_FIXTURE_DIR)
+    let first = gnr8_engine::analyze::build_graph(NESTJS_FIXTURE_DIR)
         .expect("first NestJS build_graph run must succeed (requires node + vendored typescript)");
-    let second = gnr8::analyze::build_graph(NESTJS_FIXTURE_DIR)
+    let second = gnr8_engine::analyze::build_graph(NESTJS_FIXTURE_DIR)
         .expect("second NestJS build_graph run must also succeed");
 
     let a = serde_json::to_string(&first).expect("serialize first NestJS graph");
@@ -252,17 +356,17 @@ fn nestjs_to_openapi_is_byte_identical_across_two_runs() {
         );
         return;
     }
-    let first = gnr8::analyze::build_graph(NESTJS_FIXTURE_DIR)
+    let first = gnr8_engine::analyze::build_graph(NESTJS_FIXTURE_DIR)
         .expect("first NestJS build_graph run must succeed (requires node + vendored typescript)");
-    let second = gnr8::analyze::build_graph(NESTJS_FIXTURE_DIR)
+    let second = gnr8_engine::analyze::build_graph(NESTJS_FIXTURE_DIR)
         .expect("second NestJS build_graph run must also succeed");
 
     // Build twice AND lower twice — proving both the upstream graph and the reused lowering are
     // deterministic end-to-end for the TypeScript path (idempotent OpenAPI generation).
     let security = fixture_security();
-    let a = gnr8::lower::to_openapi(&first, "bookstore", "/books", &security)
+    let a = gnr8_engine::lower::to_openapi(&first, "bookstore", "/books", &security)
         .expect("first NestJS to_openapi must succeed");
-    let b = gnr8::lower::to_openapi(&second, "bookstore", "/books", &security)
+    let b = gnr8_engine::lower::to_openapi(&second, "bookstore", "/books", &security)
         .expect("second NestJS to_openapi must succeed");
 
     assert_eq!(

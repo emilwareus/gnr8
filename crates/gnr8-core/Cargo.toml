@@ -1,17 +1,21 @@
 [package]
-name = "gnr8"
+name = "gnr8-engine"
+publish = false
 version.workspace = true
 edition.workspace = true
 rust-version.workspace = true
 license.workspace = true
 readme.workspace = true
 repository.workspace = true
-description = "Code-first API extraction to OpenAPI 3.1 and generated client SDKs"
+description = "gnr8 host engine: source extraction, OpenAPI lowering, SDK emission, and the generated-output lifecycle"
 
 [lints]
 workspace = true
 
 [dependencies]
+# The thin published SDK: the API graph, the stage traits, the built-in declarations, and the
+# host<->worker protocol. The engine EXECUTES what the SDK declares.
+gnr8 = { workspace = true }
 thiserror = { workspace = true }
 serde = { workspace = true }
 # serde_json deserializes the goextract JSON facts (analyze::facts), serializes the artifact bundle

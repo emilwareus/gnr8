@@ -62,7 +62,10 @@ Important invariants:
 - Extraction is static. gnr8 does not import or run the analyzed application.
 - Unsupported or ambiguous facts become structured diagnostics; they are never guessed silently.
 - All targets consume the same graph, so one transform changes OpenAPI and every SDK consistently.
-- The project-local `.gnr8` child computes artifacts; the installed CLI owns filesystem writes.
+- The installed CLI executes every built-in stage and owns filesystem writes; the project-local
+  `.gnr8` worker runs only stages you wrote and wrapped in `Custom(...)`.
+- Building and running `.gnr8` executes Rust from the repository and is not sandboxed. `--no-build`
+  refuses to invoke cargo; `--no-execute` refuses to build or run.
 - Generated paths and content are deterministic for identical inputs and configuration.
 
 ## Retrieval rules for agents

@@ -54,9 +54,12 @@ The first supported frontend reads **Go + Gin** via `go/types`; Python and TypeS
 static sidecars for FastAPI, Flask, and NestJS. A native engine builds a deterministic
 model (identical input → byte-identical output) and generates the OpenAPI document and SDKs. The
 generation lifecycle is **a Rust crate at `.gnr8/`** — `gnr8 init` scaffolds it, and `gnr8 generate`
-compiles and runs it, so adapting how your code is parsed and generated is just editing code. That same
-`.gnr8/` workspace tracks what it generated (so it never overwrites your edits), regenerates only what
-changed, can watch for source edits, and a `doctor` command reports anything it couldn't represent.
+compiles and runs it, so adapting how your code is parsed and generated is just editing code. That
+crate depends on a deliberately thin SDK: the built-in stages you compose are declarations the
+installed CLI executes, so only the stages you write yourself are compiled into your project. That
+same `.gnr8/` workspace tracks what it generated (so it never overwrites your edits), regenerates only
+what changed, can watch for source edits, and a `doctor` command reports anything it couldn't
+represent.
 
 ---
 
@@ -99,7 +102,7 @@ API is parsed and generated (no TOML, no flags file):
 use gnr8::sdk::prelude::*;
 
 fn main() -> std::process::ExitCode {
-    gnr8::runner::run(
+    gnr8::worker::run(
         Pipeline::new()
             .source(GoGin::new().inputs(["."]))
             .transform(SetBasePath::new("/books"))
@@ -113,7 +116,7 @@ fn main() -> std::process::ExitCode {
 ```
 
 ```bash
-gnr8 generate    # compile + run .gnr8/, write openapi.yaml + the client SDK
+gnr8 generate    # build (once) + run .gnr8/, write openapi.yaml + the client SDK
 ```
 
 Out comes OpenAPI 3.1:
@@ -163,9 +166,9 @@ Install the CLI from the GitHub release archive:
 curl -fsSL https://raw.githubusercontent.com/emilwareus/gnr8/main/scripts/install.sh | bash
 ```
 
-The crates.io package named `gnr8` exposes the public Rust API; it is not the primary CLI install path.
-Generated `.gnr8/Cargo.toml` files use the matching `gnr8-core` source bundled in the complete release
-archive, alongside the extractor resources needed by `gnr8 init`/`gnr8 generate`.
+The crates.io package named `gnr8` is the thin code-as-config SDK a `.gnr8/` crate depends on; it is
+not the CLI install path. Generated `.gnr8/Cargo.toml` files use the matching SDK source bundled in
+the complete release archive, alongside the extractor resources `gnr8 generate` needs.
 
 For local development from this checkout:
 
@@ -222,7 +225,11 @@ OpenAPI 3.1 plus compiling/typechecked Go, Python, and TypeScript client SDKs; t
 lifecycle — there is **no TOML/YAML config file**. You (or an agent) edit `.gnr8/src/main.rs`: it builds
 a `Pipeline` of a source, transforms, targets, and post-processors, and `gnr8 generate` compiles and
 runs it. Built-ins cover the common cases (`GoGin`, `SetBasePath`/`SetTitle`/`ApplySecurity`,
-`OpenApi31`, `GoSdk`); anything else is ordinary Rust — implement a trait and add it to the pipeline.
+`OpenApi31`, `GoSdk`); anything else is ordinary Rust — implement a trait and compose it with
+`Custom(...)`.
+
+Building and running `.gnr8/` executes Rust from your repository with your privileges, and is not
+sandboxed. `gnr8 --no-build` refuses to invoke cargo; `gnr8 --no-execute` refuses to build or run.
 
 **By design, additive:** the internal model is language- and router-agnostic, so additional source
 frameworks and SDK targets extend it rather than reshape it — a new source or target is a Rust type that
@@ -244,7 +251,8 @@ implements one trait and composes into the same pipeline.
 
 | Path | What |
 |------|------|
-| `crates/gnr8-core/` | the engine: model, OpenAPI lowering, SDK generation, lifecycle, diagnostics |
+| `crates/gnr8-sdk/` | the published `gnr8` crate: the API graph, the four stage traits, the built-in declarations, the worker protocol |
+| `crates/gnr8-core/` | the host engine: extraction, OpenAPI lowering, SDK generation, lifecycle, diagnostics |
 | `crates/gnr8/` | the `gnr8` CLI (`init`, `guide`, `generate`, `check`, `inspect`, `watch`, `doctor`) |
 | `goextract/` | the Go frontend that reads Gin source via `go/types` |
 | `examples/bookstore/` | a runnable example + its real generated output (the basic `.gnr8/` lifecycle) |

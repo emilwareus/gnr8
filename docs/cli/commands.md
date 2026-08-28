@@ -8,9 +8,17 @@ Run commands from the application repository root. Global options are:
 ```text
 --json          emit machine-readable output and suppress progress text
 -v, --verbose   show more detail; repeat for additional verbosity
+--no-build      never invoke cargo; require an already-built, matching .gnr8 worker
+--no-execute    never build and never run the .gnr8 worker
 -h, --help      print help for the selected command
 -V, --version   print the CLI version
 ```
+
+`generate`, `check`, `watch`, `doctor`, and `inspect` without a path all build and run the project's
+`.gnr8` worker. That compiles and executes Rust from the repository — build scripts, proc macros, and
+the pipeline itself — with your privileges, and is not sandboxed. `--no-build` withholds the compile
+step; `--no-execute` withholds both. `gnr8 inspect routes <path>` analyzes a source tree without
+touching `.gnr8` at all.
 
 For automation, put `--json` before the command, capture stdout as JSON, and treat stderr as human
 diagnostics.
@@ -19,7 +27,7 @@ diagnostics.
 
 | Command | Purpose | Writes project files |
 |---|---|---:|
-| `init` | Scaffold the project-local Rust pipeline | yes |
+| `init` | Scaffold the project-local Rust pipeline (`--upgrade` repoints an existing one) | yes |
 | `guide` | Print a built-in scenario guide | no |
 | `generate` | Run the pipeline and reconcile generated files | yes |
 | `watch` | Regenerate after source changes | yes |
@@ -78,8 +86,8 @@ protected. Any protected output makes the command exit non-zero after reporting 
   ownership manifest records. It never deletes unrelated files merely because they share an output
   directory.
 
-JSON includes changed-file groups, counts, timings, diagnostics, cache mode, input/output identity,
-and cleanup guidance.
+JSON includes changed-file groups, counts, timings, diagnostics, whether the worker was `built` or
+`reused` for this run, and input/output counts.
 
 ## `watch`
 
@@ -132,7 +140,7 @@ gnr8 doctor
 gnr8 --json doctor
 ```
 
-Checks workspace setup, child protocol compatibility, pipeline execution, output freshness, protected
+Checks workspace setup, worker protocol compatibility, pipeline execution, output freshness, protected
 edits, and generated OpenAPI readiness. Analysis warnings are informational by themselves. Exit `1`
 means at least one actionable lifecycle or output problem exists.
 

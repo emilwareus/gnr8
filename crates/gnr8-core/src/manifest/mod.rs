@@ -171,7 +171,7 @@ pub struct ManifestEntry {
     /// The blake3 hex digest of the bytes gnr8 last wrote to `path`.
     pub hash: String,
     /// Generator provenance tag. The host writes a single `"generated"` tag for every artifact (it
-    /// owns the child's whole bundle uniformly); reserved for future per-target attribution.
+    /// owns the pipeline's whole artifact set uniformly); reserved for future per-target attribution.
     pub source: String,
 }
 

@@ -1,0 +1,32 @@
+# The published `gnr8` crate: the THIN code-as-config SDK a project-local `.gnr8/` worker links.
+#
+# This crate is deliberately small. It carries the API graph (IR), the four stage traits, the
+# `Pipeline` container, the built-in stage DECLARATIONS, and the host<->worker frame protocol —
+# and nothing else. Source extraction, OpenAPI lowering, SDK emission, the filesystem writer and
+# the CLI all live in `gnr8-engine`, which is compiled ONCE into the installed `gnr8` binary and is
+# never a dependency of a user's `.gnr8/` crate.
+#
+# The dependency list below is a contract, not a convenience. `tests/thin_boundary.rs` asserts it
+# exactly, because every crate added here is compiled in every user's project on every gnr8 upgrade.
+[package]
+name = "gnr8"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+readme.workspace = true
+repository.workspace = true
+description = "Code-as-config SDK for gnr8: the API graph, pipeline stages, and worker protocol"
+
+[lints]
+workspace = true
+
+[dependencies]
+# Serialization of the graph snapshot, the stage plan, and every protocol frame.
+serde = { workspace = true }
+serde_json = { workspace = true }
+# Frame payload digests, so a truncated or corrupted pipe is detected rather than parsed.
+blake3 = { workspace = true }
+# Typed stage errors (RUST-04). Its proc-macro closure is already pulled in by serde's derive, so
+# this costs one extra compile unit and keeps one error style across the workspace.
+thiserror = { workspace = true }

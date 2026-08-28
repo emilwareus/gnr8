@@ -234,19 +234,59 @@ pub enum CoreError {
         message: String,
     },
 
-    /// Running the user's `.gnr8/` generation crate (the code-as-config child process) failed.
+    /// Preparing the user's `.gnr8/` worker failed before it ever ran.
     ///
-    /// The host runs the child via `cargo run --manifest-path .gnr8/Cargo.toml -- <subcommand>`; this
-    /// variant carries a categorized, actionable message for the failure modes that surface there: the
-    /// `.gnr8/` workspace is missing (run `gnr8 init`), `cargo` is not installed, the user's pipeline
-    /// code does not compile, or the child exited non-zero / emitted output the host cannot parse. The
-    /// child's own stderr is folded into `message` so the user sees the compiler/runtime error directly.
-    /// Never a panic (RUST-04).
+    /// Covers a missing or invalid `.gnr8/` workspace, a manifest that declares the previous
+    /// contract, a symlinked workspace gnr8 refuses to fingerprint, a `cargo` that cannot be
+    /// spawned, and a worker crate that does not compile. Never a panic.
     #[error("{message}")]
-    ChildRun {
-        /// The categorized, actionable failure detail (including the child's stderr where relevant).
+    WorkerBuild {
+        /// The categorized, actionable failure detail (including cargo's stderr where relevant).
         message: String,
     },
+
+    /// Running the user's `.gnr8/` worker, or talking to it, failed.
+    ///
+    /// Covers a spawn failure, a stage that returned an error, a connection that dropped, and a
+    /// session that exceeded its wall-clock budget. The worker's own stderr is folded into
+    /// `message` where it exists. Never a panic.
+    #[error("{message}")]
+    WorkerRun {
+        /// The categorized, actionable failure detail (including the worker's stderr).
+        message: String,
+    },
+}
+
+/// A stage error crossing from the SDK into the engine.
+///
+/// The SDK's [`gnr8::Error`] is the small surface a stage author sees; the engine's [`CoreError`] is
+/// the full one. Each SDK variant maps to its exact engine twin, so nothing is flattened into a
+/// string and no information is invented.
+impl From<gnr8::Error> for CoreError {
+    fn from(error: gnr8::Error) -> Self {
+        match error {
+            gnr8::Error::Config { message } => Self::Config { message },
+            gnr8::Error::Io { message } => Self::Io { message },
+            gnr8::Error::Generation { message } => Self::SdkGen { message },
+            gnr8::Error::ArtifactOwnership {
+                code,
+                path,
+                producer,
+                message,
+            } => Self::ArtifactOwnership {
+                code,
+                path,
+                producer,
+                message,
+            },
+            gnr8::Error::Protocol { message } => Self::Protocol { message },
+            // `gnr8::Error` is `#[non_exhaustive]`: a variant added later still reaches the engine
+            // as a protocol-level disagreement rather than being silently dropped.
+            other => Self::Protocol {
+                message: other.to_string(),
+            },
+        }
+    }
 }
 
 #[cfg(test)]

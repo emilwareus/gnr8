@@ -7,9 +7,10 @@ see [`reference/public-api.md`](reference/public-api.md); for the real trait sig
 [`USAGE.md`](USAGE.md).
 
 Companion to [`code-as-config.md`](code-as-config.md). That doc establishes *how* config is code (the
-`.gnr8/` Rust lifecycle crate + host/child model). This doc designs *what that code can compose*: the
-multi-source / multi-target architecture, the extension interfaces a user implements to add their own
-parsers and generators, and the pre/post-process hooks — so it feels powerful and flexible.
+`.gnr8/` Rust lifecycle crate; its host/child mechanics were superseded by the 0.9 host/worker
+split). This doc designs *what that code can compose*: the multi-source / multi-target architecture,
+the extension interfaces a user implements to add their own parsers and generators, and the
+pre/post-process hooks — so it feels powerful and flexible.
 
 ---
 
@@ -177,6 +178,7 @@ pub trait Target {
 Built-in SDK targets use a shared SDK planning boundary before language rendering. See
 [`sdk-model.md`](sdk-model.md) for the current `ApiGraph -> SdkModel -> emitter` contract and the rule
 that cross-target SDK semantics should be added to `SdkModel` before Go/Python/TypeScript rendering.
+(`SdkModel` is host-internal as of 0.9.0; a custom `Target` reads `ApiGraph` directly.)
 
 How a user adds a target (sketch):
 ```rust
@@ -269,12 +271,13 @@ Two hook points total: **pre** = `Transform` on the IR (semantic), **post** = `P
 
 ## 8. How it all composes — the pipeline & lifecycle
 
-The user's `.gnr8/src/main.rs` builds one pipeline; the host runs it (the child process from
-`code-as-config.md`), receives the `Artifacts` bundle, and owns writing.
+The user's `.gnr8/src/main.rs` builds one pipeline. As shipped in 0.9, the host executes that
+pipeline itself — running every built-in stage natively and calling the project's worker only for the
+stages wrapped in `Custom(...)` — and owns writing the resulting artifacts.
 
 ```rust
 fn main() -> ExitCode {
-    gnr8::runner::run(
+    gnr8::worker::run(
         Pipeline::new()
             // sources (one or many → merged)
             .source(GoGin::new().inputs(["./core"]))

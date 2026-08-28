@@ -55,7 +55,7 @@ prefixes come from static source:
 use gnr8::sdk::prelude::*;
 
 fn main() -> std::process::ExitCode {
-    gnr8::runner::run(
+    gnr8::worker::run(
         Pipeline::new()
             .source(FastApi::new().inputs(["."]))              // analyze this project (the app/ package)
             .transform(SetTitle::new("Bookstore API"))         // OpenAPI info.title

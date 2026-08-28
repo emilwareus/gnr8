@@ -19,6 +19,8 @@ The current research question:
 - [Speed and incrementality](speed-and-incrementality.md)
 - [Validation plan](validation-plan.md)
 - [Adoption support for code-first SDK publishing](adoption-support.md)
+- [The `.gnr8` boundary is not a boundary — a thin SDK + host-owned engine](2026-08-27-thin-sdk-worker-boundary.md)
+  ([implementation plan](2026-08-27-thin-sdk-worker-boundary-plan.md))
 
 ## Current Position
 

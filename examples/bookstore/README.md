@@ -67,7 +67,7 @@ paths are all method calls in a small Rust `Pipeline` that gnr8 compiles + runs:
 use gnr8::sdk::prelude::*;
 
 fn main() -> std::process::ExitCode {
-    gnr8::runner::run(
+    gnr8::worker::run(
         Pipeline::new()
             .source(GoGin::new().inputs(["."]))                 // analyze this Go module
             .transform(SetBasePath::new("/books"))              // mount path (a runtime value in Gin)

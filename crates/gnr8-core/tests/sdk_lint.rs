@@ -92,12 +92,12 @@ fn go_sdk_is_gofmt_and_go_vet_clean() {
         eprintln!("skipping go_sdk lint: go toolchain unavailable");
         return;
     }
-    let graph = gnr8::analyze::build_graph(GO_FIXTURE)
+    let graph = gnr8_engine::analyze::build_graph(GO_FIXTURE)
         .expect("build_graph must succeed (requires the Go toolchain)");
-    let bundle = gnr8::gosdk::generate(&graph, "goalservice", &graph.base_path)
+    let bundle = gnr8_engine::gosdk::generate(&graph, "goalservice", &graph.base_path)
         .expect("gosdk::generate must succeed");
     let dir = unique_temp_dir("go");
-    gnr8::sdk::bundle::write_to_dir(&bundle, &dir).expect("materialize Go SDK");
+    gnr8_engine::sdk::bundle::write_to_dir(&bundle, &dir).expect("materialize Go SDK");
     // A hermetic, stdlib-only module so `go vet` builds offline. A LOW `go` directive keeps the module
     // buildable by any modern Go (the generated SDK uses only long-stable stdlib), so an older CI Go does
     // not try to fetch a newer toolchain — which `GOTOOLCHAIN=local` + `GOPROXY=off` below also forbids.
@@ -139,14 +139,14 @@ fn python_sdk_is_ruff_clean() {
         eprintln!("skipping python_sdk lint: ruff unavailable");
         return;
     }
-    let graph = gnr8::analyze::build_graph(PY_FIXTURE)
+    let graph = gnr8_engine::analyze::build_graph(PY_FIXTURE)
         .expect("build_graph must succeed (requires python3 for pyextract)");
-    let bundle = gnr8::pysdk::generate(&graph, "bookstore", &graph.base_path)
+    let bundle = gnr8_engine::pysdk::generate(&graph, "bookstore", &graph.base_path)
         .expect("pysdk::generate must succeed");
     let dir = unique_temp_dir("py");
     let pkg = dir.join("bookstore");
     std::fs::create_dir_all(&pkg).expect("create package dir");
-    gnr8::sdk::bundle::write_to_dir(&bundle, &pkg).expect("materialize Python SDK");
+    gnr8_engine::sdk::bundle::write_to_dir(&bundle, &pkg).expect("materialize Python SDK");
     let pkg_str = pkg.to_str().expect("utf-8 path");
 
     let (check_ok, check_out, check_err) = run(
@@ -183,17 +183,17 @@ fn python_sdk_is_ruff_clean() {
     // The split layout moves every method signature out of client.py into api_*.py, which builds
     // its own imports — so a name used there but imported only by the compact client (RequestOptions,
     // Union, Literal) is invisible to the check above. Lint that layout too.
-    let split_bundle = gnr8::pysdk::generate_with_layout(
+    let split_bundle = gnr8_engine::pysdk::generate_with_layout(
         &graph,
         "bookstore",
         &graph.base_path,
-        &gnr8::sdk::layout::SdkFileLayout::split().operations_per_tag(),
+        &gnr8_engine::sdk::layout::SdkFileLayout::split().operations_per_tag(),
     )
     .expect("pysdk::generate_with_layout must succeed");
     let split_dir = unique_temp_dir("py-split");
     let split_pkg = split_dir.join("bookstore");
     std::fs::create_dir_all(&split_pkg).expect("create split package dir");
-    gnr8::sdk::bundle::write_to_dir(&split_bundle, &split_pkg)
+    gnr8_engine::sdk::bundle::write_to_dir(&split_bundle, &split_pkg)
         .expect("materialize split Python SDK");
     let split_str = split_pkg.to_str().expect("utf-8 path");
 
@@ -237,7 +237,7 @@ fn typescript_sdk_is_prettier_clean() {
         eprintln!("skipping typescript_sdk lint: node unavailable for graph-building");
         return;
     }
-    let graph = match gnr8::analyze::build_graph(TS_FIXTURE) {
+    let graph = match gnr8_engine::analyze::build_graph(TS_FIXTURE) {
         Ok(graph) => graph,
         Err(err) => {
             // No vendored `typescript` sidecar (tsextract deps not restored) → skip, don't hard-fail.
@@ -245,10 +245,10 @@ fn typescript_sdk_is_prettier_clean() {
             return;
         }
     };
-    let bundle = gnr8::tssdk::generate(&graph, "bookstore", &graph.base_path)
+    let bundle = gnr8_engine::tssdk::generate(&graph, "bookstore", &graph.base_path)
         .expect("tssdk::generate must succeed");
     let dir = unique_temp_dir("ts");
-    gnr8::sdk::bundle::write_to_dir(&bundle, &dir).expect("materialize TS SDK");
+    gnr8_engine::sdk::bundle::write_to_dir(&bundle, &dir).expect("materialize TS SDK");
 
     let (ok, out, err) = run(&prettier, &["--check", "."], &dir, &[]);
     assert!(
@@ -261,15 +261,16 @@ fn typescript_sdk_is_prettier_clean() {
     // including the per-operation params types it takes from client.ts. That header is invisible to
     // the compact check above, and a specifier list is exactly the shape whose width rule decides
     // between the one-line and the one-per-line form. Lint that layout too (twin of the Python gate).
-    let split_bundle = gnr8::tssdk::generate_with_layout(
+    let split_bundle = gnr8_engine::tssdk::generate_with_layout(
         &graph,
         "bookstore",
         &graph.base_path,
-        &gnr8::sdk::layout::SdkFileLayout::split().operations_per_endpoint(),
+        &gnr8_engine::sdk::layout::SdkFileLayout::split().operations_per_endpoint(),
     )
     .expect("tssdk::generate_with_layout must succeed");
     let split_dir = unique_temp_dir("ts-split");
-    gnr8::sdk::bundle::write_to_dir(&split_bundle, &split_dir).expect("materialize split TS SDK");
+    gnr8_engine::sdk::bundle::write_to_dir(&split_bundle, &split_dir)
+        .expect("materialize split TS SDK");
 
     let (split_ok, split_out, split_err) = run(&prettier, &["--check", "."], &split_dir, &[]);
     assert!(

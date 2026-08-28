@@ -76,7 +76,7 @@ fn unique_temp_dir(label: &str) -> PathBuf {
 /// panic — the harness uses NO `unwrap`/`expect` on the subprocess `Result`, threat T-03-03-05). A spawn
 /// failure (missing toolchain) maps to `CoreError::PythonToolchainMissing`. Discrete args + `current_dir`
 /// only — NEVER a shell string (threat T-03-03-01 / V13).
-fn run_python(args: &[&str], dir: &Path) -> Result<String, gnr8::CoreError> {
+fn run_python(args: &[&str], dir: &Path) -> Result<String, gnr8_engine::CoreError> {
     let output = Command::new("python3")
         .args(args)
         .current_dir(dir)
@@ -86,11 +86,11 @@ fn run_python(args: &[&str], dir: &Path) -> Result<String, gnr8::CoreError> {
         .env("PYTHONNOUSERSITE", "1")
         .output()
         // Spawn failure (e.g. python3 absent) → the dedicated toolchain-missing variant (error.rs:45).
-        .map_err(|source| gnr8::CoreError::PythonToolchainMissing { source })?;
+        .map_err(|source| gnr8_engine::CoreError::PythonToolchainMissing { source })?;
     if !output.status.success() {
         // Reuse the generic captured-stderr carrier (no new error variant added — the plan's interfaces
         // note: GoBuild is the generic exit-code+stderr carrier the harness reuses, T-03-03-05).
-        return Err(gnr8::CoreError::GoBuild {
+        return Err(gnr8_engine::CoreError::GoBuild {
             code: output.status.code(),
             stderr: String::from_utf8_lossy(&output.stderr).into_owned(),
         });
@@ -187,29 +187,29 @@ class BaseModel:
 /// Client`) resolve and `python3 -c "import bookstore"` works with `<dir>` as the current dir.
 fn materialize_sdk_from_graph(
     label: &str,
-    graph: &gnr8::graph::ApiGraph,
+    graph: &gnr8_engine::graph::ApiGraph,
     base_path: &str,
 ) -> PathBuf {
-    let bundle =
-        gnr8::pysdk::generate(graph, PACKAGE, base_path).expect("pysdk::generate must succeed");
+    let bundle = gnr8_engine::pysdk::generate(graph, PACKAGE, base_path)
+        .expect("pysdk::generate must succeed");
     let dir = unique_temp_dir(label);
     let pkg_dir = dir.join(PACKAGE);
     std::fs::create_dir_all(&pkg_dir).expect("create package subdir");
-    gnr8::sdk::bundle::write_to_dir(&bundle, &pkg_dir)
+    gnr8_engine::sdk::bundle::write_to_dir(&bundle, &pkg_dir)
         .expect("write_to_dir must materialize the SDK");
     write_pydantic_stub(&dir);
     dir
 }
 
 fn materialize_sdk() -> PathBuf {
-    let graph = gnr8::analyze::build_graph(FIXTURE_DIR)
+    let graph = gnr8_engine::analyze::build_graph(FIXTURE_DIR)
         .expect("Phase 2 build_graph must succeed (requires python3 for the pyextract sidecar)");
     // `base_path` is the graph's single source of truth (the FastAPI fixture's is "/"); pass it through
     // exactly as a Pipeline would (CLAUDE.md rules 3 & 4).
     materialize_sdk_from_graph("ok", &graph, &graph.base_path)
 }
 
-fn auth_graph() -> gnr8::graph::ApiGraph {
+fn auth_graph() -> gnr8_engine::graph::ApiGraph {
     serde_json::from_str(
         r#"{
           "module": "app",
@@ -288,7 +288,7 @@ fn auth_graph() -> gnr8::graph::ApiGraph {
     clippy::too_many_lines,
     reason = "the media graph is an explicit JSON fixture covering four content types"
 )]
-fn media_graph() -> gnr8::graph::ApiGraph {
+fn media_graph() -> gnr8_engine::graph::ApiGraph {
     serde_json::from_str(
         r#"{
           "module": "app",
@@ -425,8 +425,8 @@ fn media_graph() -> gnr8::graph::ApiGraph {
     .expect("media graph json")
 }
 
-fn runtime_graph() -> gnr8::graph::ApiGraph {
-    let mut graph: gnr8::graph::ApiGraph = serde_json::from_str(
+fn runtime_graph() -> gnr8_engine::graph::ApiGraph {
+    let mut graph: gnr8_engine::graph::ApiGraph = serde_json::from_str(
         r#"{
           "module": "app",
           "operations": [
@@ -472,14 +472,14 @@ fn runtime_graph() -> gnr8::graph::ApiGraph {
         }"#,
     )
     .expect("runtime graph json");
-    graph.runtime = gnr8::graph::RuntimePolicy {
+    graph.runtime = gnr8_engine::graph::RuntimePolicy {
         default_timeout_ms: Some(5_000),
         max_retries: 0,
         retry_statuses: Vec::new(),
         retry_unsafe_methods: false,
         hooks: Vec::new(),
     };
-    graph.operation_runtime = vec![gnr8::graph::OperationRuntimePolicy {
+    graph.operation_runtime = vec![gnr8_engine::graph::OperationRuntimePolicy {
         operation_id: "createIdempotent".to_string(),
         idempotent: true,
         idempotency_key_header: Some("Idempotency-Key".to_string()),
@@ -599,12 +599,12 @@ const NULLABLE_RESPONSE_FACTS: &str = r#"{
           "security": []
         }"#;
 
-fn nullable_response_graph() -> gnr8::graph::ApiGraph {
+fn nullable_response_graph() -> gnr8_engine::graph::ApiGraph {
     serde_json::from_str(NULLABLE_RESPONSE_FACTS).expect("nullable response graph json")
 }
 
-fn pagination_graph() -> gnr8::graph::ApiGraph {
-    let mut graph: gnr8::graph::ApiGraph = serde_json::from_str(
+fn pagination_graph() -> gnr8_engine::graph::ApiGraph {
+    let mut graph: gnr8_engine::graph::ApiGraph = serde_json::from_str(
         r#"{
           "module": "app",
           "operations": [
@@ -674,9 +674,9 @@ fn pagination_graph() -> gnr8::graph::ApiGraph {
         }"#,
     )
     .expect("pagination graph json");
-    graph.pagination = vec![gnr8::graph::PaginationPolicy {
+    graph.pagination = vec![gnr8_engine::graph::PaginationPolicy {
         operation_id: "listItems".to_string(),
-        mode: gnr8::graph::PaginationMode::Cursor,
+        mode: gnr8_engine::graph::PaginationMode::Cursor,
         items_field: "items".to_string(),
         cursor_param: Some("cursor".to_string()),
         next_cursor_field: Some("next_cursor".to_string()),
@@ -684,7 +684,7 @@ fn pagination_graph() -> gnr8::graph::ApiGraph {
         page_size_param: None,
         offset_param: None,
         limit_param: None,
-        termination: gnr8::graph::PaginationTermination::NoNextCursor,
+        termination: gnr8_engine::graph::PaginationTermination::NoNextCursor,
     }];
     graph
 }
@@ -783,7 +783,7 @@ fn invalid_python_compile_maps_to_captured_error_not_panic() {
         &dir,
     );
     match result {
-        Err(gnr8::CoreError::GoBuild { code, stderr }) => {
+        Err(gnr8_engine::CoreError::GoBuild { code, stderr }) => {
             assert!(
                 code != Some(0),
                 "a failed compile must not report exit code 0"

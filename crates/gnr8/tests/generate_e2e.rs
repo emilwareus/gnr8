@@ -2,12 +2,12 @@
 //!
 //! This is the ONE test that exercises the WHOLE real path: it scaffolds a `.gnr8/` generation crate
 //! (`gnr8 init`), then runs the installed `gnr8` host binary, which compiles + runs that crate as a
-//! child process (`cargo run --manifest-path`), receives the artifact bundle, and writes the files
+//! worker (one `cargo build`, then the produced binary over a framed protocol), and writes the files
 //! (ownership manifest, no-op skip). It asserts the OpenAPI doc + Go SDK land on disk and that a SECOND
 //! `gnr8 generate` is a true no-op (every output unchanged). The pure write machinery + the truth table
 //! are covered fast/synthetically in `gnr8-core/tests/lifecycle.rs`; THIS proves the orchestration.
 //!
-//! Cost + environment: it cargo-compiles the child crate (which builds `gnr8-core` once in the child's
+//! Cost + environment: it cargo-compiles the worker crate (which builds the thin `gnr8` SDK once in its
 //! own target dir) and runs the Go toolchain (the `GoGin` source shells out to goextract; the `GoSdk`
 //! target pipes Go through gofmt). It SKIPS gracefully (early return) when Go or cargo is unavailable,
 //! mirroring the Go-dependent contract tests. The staging dir lives under `CARGO_TARGET_TMPDIR`
@@ -221,7 +221,8 @@ fn assert_cache_recovery(root: &Path, openapi: &Path) {
         openapi_mtime,
         "adoption must not rewrite byte-identical output"
     );
-    let manifest = gnr8::manifest::load(&root.join(".gnr8")).expect("load reconstructed manifest");
+    let manifest =
+        gnr8_engine::manifest::load(&root.join(".gnr8")).expect("load reconstructed manifest");
     assert!(
         manifest.files.len() >= 5,
         "generate must reconstruct ownership for every emitted artifact"
@@ -293,13 +294,13 @@ fn generate_e2e_scaffolds_compiles_runs_and_is_idempotent() {
         "init must scaffold .gnr8/Cargo.toml + src/main.rs"
     );
 
-    // 2. generate: the host compiles + runs the child crate, then writes the outputs. The default
+    // 2. generate: the host compiles + runs the worker crate, then writes the outputs. The default
     //    scaffolded pipeline writes openapi.yaml + sdk/ at the project root. This may take tens of
     //    seconds on the cold child build.
     let (ok, out, err) = run_gnr8(&root, &["generate"]);
     assert!(
         ok,
-        "gnr8 generate must succeed (host→child→write).\nstdout:\n{out}\nstderr:\n{err}"
+        "gnr8 generate must succeed (host→worker→write).\nstdout:\n{out}\nstderr:\n{err}"
     );
 
     // The OpenAPI doc + the Go SDK files must have landed on disk.

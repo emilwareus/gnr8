@@ -25,6 +25,18 @@ pub(crate) struct Cli {
     #[arg(short, long, global = true, action = clap::ArgAction::Count)]
     pub(crate) verbose: u8,
 
+    /// Never invoke cargo; require an already-built, matching .gnr8 worker.
+    ///
+    /// Building .gnr8/ compiles and runs Rust from the repository (build scripts, proc macros).
+    #[arg(long, global = true)]
+    pub(crate) no_build: bool,
+
+    /// Never build and never run the .gnr8 worker.
+    ///
+    /// Pipeline commands fail; `gnr8 inspect <path>` still analyzes source directly.
+    #[arg(long, global = true)]
+    pub(crate) no_execute: bool,
+
     /// The command to run.
     #[command(subcommand)]
     pub(crate) command: Commands,
@@ -42,6 +54,12 @@ pub(crate) enum Commands {
         /// SDK target to scaffold in .gnr8/src/main.rs.
         #[arg(long, value_enum)]
         sdk: Option<SdkPreset>,
+
+        /// Repoint an existing .gnr8/Cargo.toml at this gnr8's SDK and drop its stale lockfile.
+        ///
+        /// Never edits src/main.rs — it prints exactly what to change there instead.
+        #[arg(long)]
+        upgrade: bool,
     },
     /// Print an agent-oriented usage guide.
     Guide {
@@ -146,7 +164,8 @@ mod tests {
             Cli::try_parse_from(["gnr8", "init"]).unwrap().command,
             Commands::Init {
                 source: None,
-                sdk: None
+                sdk: None,
+                upgrade: false
             }
         ));
         assert!(matches!(
@@ -155,7 +174,8 @@ mod tests {
                 .command,
             Commands::Init {
                 source: Some(SourcePreset::Fastapi),
-                sdk: Some(SdkPreset::Python)
+                sdk: Some(SdkPreset::Python),
+                upgrade: false
             }
         ));
         // `generate` defaults `--force` to false.
@@ -243,6 +263,28 @@ mod tests {
             panic!("expected inspect schemas");
         };
         assert_eq!(path.as_deref(), Some("/some/dir"));
+    }
+
+    #[test]
+    fn cli_parses_the_trust_flags() {
+        let cli = Cli::try_parse_from(["gnr8", "--no-build", "generate"]).unwrap();
+        assert!(cli.no_build);
+        assert!(!cli.no_execute);
+        let cli = Cli::try_parse_from(["gnr8", "--no-execute", "check"]).unwrap();
+        assert!(cli.no_execute);
+        let cli = Cli::try_parse_from(["gnr8", "check"]).unwrap();
+        assert!(!cli.no_build);
+        assert!(!cli.no_execute);
+    }
+
+    #[test]
+    fn cli_parses_init_upgrade() {
+        assert!(matches!(
+            Cli::try_parse_from(["gnr8", "init", "--upgrade"])
+                .unwrap()
+                .command,
+            Commands::Init { upgrade: true, .. }
+        ));
     }
 
     #[test]

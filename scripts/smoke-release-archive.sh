@@ -28,7 +28,7 @@ if [[ ! -x "$binary" ]]; then
 fi
 for required in \
   "$install_root/share/gnr8/Cargo.toml" \
-  "$install_root/share/gnr8/crates/gnr8-core/Cargo.toml" \
+  "$install_root/share/gnr8/crates/gnr8-sdk/Cargo.toml" \
   "$install_root/share/gnr8/crates/gnr8/Cargo.toml" \
   "$install_root/share/gnr8/goextract/go.mod" \
   "$install_root/share/gnr8/tsextract/index.js" \
@@ -64,7 +64,7 @@ PY
   gnr8 --version
   gnr8 init --source fastapi --sdk python
 
-  python3 - "$install_root/share/gnr8/crates/gnr8-core" .gnr8/Cargo.toml <<'PY'
+  python3 - "$install_root/share/gnr8/crates/gnr8-sdk" .gnr8/Cargo.toml <<'PY'
 from pathlib import Path
 import re
 import sys
