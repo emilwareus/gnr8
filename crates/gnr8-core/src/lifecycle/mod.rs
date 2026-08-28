@@ -540,7 +540,7 @@ fn validate_write_plan(
         },
     )?;
     for ((file, actual_hash), identity) in plan.files.iter().zip(&actual_hashes).zip(identities) {
-        safe_paths.push(paths.prove(&file.path)?);
+        safe_paths.push(paths.name(&file.path)?);
         if let Some(previous) = seen.insert(identity, file.path.as_str()) {
             return Err(crate::CoreError::ArtifactOwnership {
                 code: "artifact.path_collision".to_string(),
@@ -561,6 +561,7 @@ fn validate_write_plan(
             });
         }
     }
+    paths.settle()?;
     Ok(safe_paths)
 }
 
@@ -877,9 +878,17 @@ fn safe_output_path(
 /// built for. That is a pre-flight check, not the enforcement: the writes themselves reach every
 /// component through `open_dir_nofollow` (see [`open_output_dir`]), which refuses a symlink at the
 /// moment of use rather than at the moment of checking.
+///
+/// The inspection is also the only part of the check that touches the filesystem, and on that same
+/// SDK it was 20ms of the 25ms a pass spent proving paths — one `symlink_metadata` per output, one
+/// after the other. So a pass names the paths it is inspecting ([`OutputPathGuard::name`]) and
+/// settles all of them at once ([`OutputPathGuard::settle`]): each name is still refused for a `..`,
+/// a root, or a non-canonical spelling exactly where it was, in order, and only the syscalls move.
 struct OutputPathGuard {
     root: std::path::PathBuf,
     proven: std::collections::BTreeSet<String>,
+    /// Absolute paths named but not yet inspected, in the order they were named.
+    pending: Vec<std::path::PathBuf>,
 }
 
 impl OutputPathGuard {
@@ -888,6 +897,7 @@ impl OutputPathGuard {
             root: std::fs::canonicalize(project_root)
                 .unwrap_or_else(|_| project_root.to_path_buf()),
             proven: std::collections::BTreeSet::new(),
+            pending: Vec::new(),
         }
     }
 
@@ -911,8 +921,46 @@ impl OutputPathGuard {
     }
 
     /// Everything [`Self::resolve_with_identity`] proves except the portable identity, for the
-    /// caller that already computed that fold.
+    /// caller that names one path on its own.
     fn prove(&mut self, rel: &str) -> Result<std::path::PathBuf, crate::CoreError> {
+        let safe = self.name(rel)?;
+        self.settle()?;
+        Ok(safe)
+    }
+
+    /// Inspect every path named since the last settle, across the cores.
+    ///
+    /// The names were recorded in the order they were made, and [`crate::parallel::map_ordered`]
+    /// reports the lowest-index failure, so the path this refuses is the one a walk that inspected
+    /// each name as it was made would have refused.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`crate::CoreError::Io`] for the first named path that is a symlink or cannot be
+    /// inspected.
+    fn settle(&mut self) -> Result<(), crate::CoreError> {
+        if self.pending.is_empty() {
+            return Ok(());
+        }
+        let pending = std::mem::take(&mut self.pending);
+        crate::parallel::map_ordered(&pending, |safe| match std::fs::symlink_metadata(safe) {
+            Ok(metadata) if metadata.file_type().is_symlink() => Err(crate::CoreError::Io {
+                message: format!(
+                    "refusing to follow symlink in output path {}",
+                    safe.display()
+                ),
+            }),
+            Ok(_) => Ok(()),
+            Err(err) if err.kind() == std::io::ErrorKind::NotFound => Ok(()),
+            Err(err) => Err(crate::CoreError::Io {
+                message: format!("failed to inspect output path {}: {err}", safe.display()),
+            }),
+        })?;
+        Ok(())
+    }
+
+    /// The absolute path `rel` resolves to, with its components named for the next [`Self::settle`].
+    fn name(&mut self, rel: &str) -> Result<std::path::PathBuf, crate::CoreError> {
         let candidate = Path::new(rel);
         let mut segments = Vec::new();
         for component in candidate.components() {
@@ -953,23 +1001,7 @@ impl OutputPathGuard {
             if index < last && !self.proven.insert(prefix.clone()) {
                 continue;
             }
-            match std::fs::symlink_metadata(&safe) {
-                Ok(metadata) if metadata.file_type().is_symlink() => {
-                    return Err(crate::CoreError::Io {
-                        message: format!(
-                            "refusing to follow symlink in output path {}",
-                            safe.display()
-                        ),
-                    });
-                }
-                Ok(_) => {}
-                Err(err) if err.kind() == std::io::ErrorKind::NotFound => {}
-                Err(err) => {
-                    return Err(crate::CoreError::Io {
-                        message: format!("failed to inspect output path {}: {err}", safe.display()),
-                    });
-                }
-            }
+            self.pending.push(safe.clone());
         }
         Ok(safe)
     }
@@ -2377,7 +2409,7 @@ fn validate_output_paths(
         })
     })?;
     for (artifact, collision_key) in artifacts.iter().zip(identities) {
-        let _ = paths.prove(&artifact.path)?;
+        let _ = paths.name(&artifact.path)?;
         if let Some(previous) = seen.insert(collision_key, artifact.path.as_str()) {
             return Err(crate::CoreError::ArtifactOwnership {
                 code: "artifact.path_collision".to_string(),
@@ -2390,7 +2422,7 @@ fn validate_output_paths(
             });
         }
     }
-    Ok(())
+    paths.settle()
 }
 
 /// Operation/type name remaps applied to the graph by [`apply_naming`].
@@ -3020,6 +3052,35 @@ mod tests {
         let mut manifest = Manifest::default();
 
         assert!(apply_writes(&root, &plan, &mut manifest, false).is_err());
+        assert!(!outside.join("client.go").exists());
+        let _ = std::fs::remove_dir_all(root);
+        let _ = std::fs::remove_dir_all(outside);
+    }
+
+    /// A symlinked component is refused however many outputs were named alongside it: the
+    /// inspection runs across the cores once the whole set has been named, and the failure it
+    /// reports is the first named path, not the first one a thread happened to reach.
+    #[cfg(unix)]
+    #[test]
+    fn a_symlinked_component_is_refused_among_thousands_of_outputs() {
+        use std::os::unix::fs::symlink;
+
+        let root = temp_root("symlink-among-many");
+        let outside = temp_root("symlink-among-many-outside");
+        symlink(&outside, root.join("sdk")).unwrap();
+        let mut files: Vec<super::PlannedFile> = (0..2_000)
+            .map(|index| planned_file(&format!("generated/file{index:04}.ts"), b"export {};\n"))
+            .collect();
+        files.push(planned_file("sdk/client.go", b"package sdk\n"));
+        files.sort_by(|left, right| left.path.cmp(&right.path));
+        let plan = super::WritePlan { files };
+        let mut manifest = Manifest::default();
+
+        let err = apply_writes(&root, &plan, &mut manifest, false).unwrap_err();
+        assert!(
+            err.to_string().contains("refusing to follow symlink"),
+            "{err}"
+        );
         assert!(!outside.join("client.go").exists());
         let _ = std::fs::remove_dir_all(root);
         let _ = std::fs::remove_dir_all(outside);
