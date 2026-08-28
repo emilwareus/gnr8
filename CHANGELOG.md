@@ -9,6 +9,8 @@ must move the minor version.
 
 ## Unreleased
 
+## 0.10.0 — 2026-08-28
+
 ### Breaking
 
 - **A project's `.gnr8/` crate no longer links the gnr8 engine.** The published `gnr8` crate is now a
