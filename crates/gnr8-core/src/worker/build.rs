@@ -25,7 +25,7 @@
 use std::path::{Path, PathBuf};
 use std::process::Command;
 
-use crate::manifest::blake3_hex;
+use crate::manifest::{blake3_file, blake3_hex};
 use crate::CoreError;
 
 /// The env var that overrides the cargo binary used to build the worker (checked before `CARGO`).
@@ -446,10 +446,10 @@ fn host_executable_hash() -> Result<String, CoreError> {
     let exe = std::env::current_exe().map_err(|err| CoreError::WorkerBuild {
         message: format!("failed to resolve the gnr8 executable: {err}"),
     })?;
-    let bytes = std::fs::read(&exe).map_err(|err| CoreError::WorkerBuild {
+    let (_, hash) = blake3_file(&exe).map_err(|err| CoreError::WorkerBuild {
         message: format!("failed to read {}: {err}", exe.display()),
     })?;
-    Ok(blake3_hex(&bytes))
+    Ok(hash)
 }
 
 /// The two fingerprints of a `.gnr8/` workspace.
@@ -490,9 +490,7 @@ fn read_stamp(workspace: &Workspace) -> Option<WorkerStamp> {
 }
 
 fn binary_identity(path: &Path) -> Option<(u64, String)> {
-    let bytes = std::fs::read(path).ok()?;
-    let len = u64::try_from(bytes.len()).ok()?;
-    Some((len, blake3_hex(&bytes)))
+    blake3_file(path).ok()
 }
 
 /// Whether a recorded stamp still describes the binary on disk.

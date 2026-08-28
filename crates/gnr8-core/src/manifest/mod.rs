@@ -162,6 +162,64 @@ pub fn blake3_hex(bytes: &[u8]) -> String {
     blake3::hash(bytes).to_hex().to_string()
 }
 
+/// How much of a file one worker reads and hashes before the next block is handed out.
+const FILE_BLOCK_BYTES: u64 = 256 * 1024;
+
+/// The length and content digest of a file, read and hashed across the machine's cores.
+///
+/// Before a warm run can decide that it has nothing to do, it has to identify three large files it
+/// did not write this run — the running `gnr8` executable, the worker built from `.gnr8/`, and the
+/// compiled extractor — and on a real project that is thirty megabytes. Read and hashed one
+/// byte-stream at a time it was 22ms of a 290ms run that produced no change at all, so the file is
+/// cut into blocks and the machine reads and hashes them at once.
+///
+/// The digest is a two-level tree: each block is hashed on its own and the block digests are then
+/// folded, IN BLOCK ORDER, into one digest with the file's length. Same file ⇒ same digest at any
+/// thread count, which is the only property the callers need. It is deliberately NOT
+/// [`blake3_hex`] of the same bytes: these are gnr8's own build-stamp and cache keys, never
+/// compared against a manifest hash, and a digest that has to be computable in one pass would give
+/// the parallelism back.
+///
+/// # Errors
+///
+/// Returns the underlying [`std::io::Error`] if the file cannot be read, including the case where
+/// it changes length while being read.
+pub fn blake3_file(path: &Path) -> Result<(u64, String), std::io::Error> {
+    use std::io::{Read, Seek, SeekFrom};
+
+    let len = std::fs::metadata(path)?.len();
+    let blocks: Vec<(u64, usize)> = (0..len.div_ceil(FILE_BLOCK_BYTES))
+        .map(|block| {
+            let offset = block * FILE_BLOCK_BYTES;
+            let length = FILE_BLOCK_BYTES.min(len - offset);
+            (offset, usize::try_from(length).unwrap_or(usize::MAX))
+        })
+        .collect();
+    let digests = crate::parallel::map_ordered_blocks(&blocks, |(offset, length)| {
+        let mut file = std::fs::File::open(path).map_err(io_error(path))?;
+        file.seek(SeekFrom::Start(*offset))
+            .map_err(io_error(path))?;
+        let mut block = vec![0u8; *length];
+        file.read_exact(&mut block).map_err(io_error(path))?;
+        Ok(blake3::hash(&block))
+    })
+    .map_err(|err| std::io::Error::other(err.to_string()))?;
+
+    let mut hasher = blake3::Hasher::new();
+    hasher.update(b"gnr8-file-blocks-v1\n");
+    hasher.update(&len.to_le_bytes());
+    for digest in &digests {
+        hasher.update(digest.as_bytes());
+    }
+    Ok((len, hasher.finalize().to_hex().to_string()))
+}
+
+fn io_error(path: &Path) -> impl Fn(std::io::Error) -> crate::CoreError + '_ {
+    move |source| crate::CoreError::Io {
+        message: format!("failed to read {} to identify it: {source}", path.display()),
+    }
+}
+
 /// One generated file's ownership record: its project-relative path, the blake3 content hash gnr8
 /// last wrote there, and a `source` provenance tag (currently always `"generated"`).
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
@@ -343,7 +401,7 @@ mod tests {
     // so the workspace-wide RUST-04 deny stays intact for production code.
     #![allow(clippy::unwrap_used, clippy::expect_used)]
 
-    use super::{blake3_hex, Manifest};
+    use super::{blake3_file, blake3_hex, Manifest, FILE_BLOCK_BYTES};
 
     fn temp_root(name: &str) -> std::path::PathBuf {
         let sequence =
@@ -373,6 +431,59 @@ mod tests {
     #[test]
     fn blake3_hex_matches_the_underlying_digest() {
         assert_eq!(blake3_hex(b"x"), blake3::hash(b"x").to_hex().to_string());
+    }
+
+    /// The block digest has to answer the same for a file whether it fits in one block or spans
+    /// many, and it has to answer differently for a file that changed by one byte — that is the
+    /// whole of what the build stamp and the extractor cache key ask of it.
+    #[test]
+    fn a_files_digest_is_stable_across_sizes_and_moves_with_its_bytes() {
+        let root = temp_root("file-digest");
+        let block = usize::try_from(FILE_BLOCK_BYTES).unwrap();
+        for size in [0usize, 1, block - 1, block, block + 1, block * 5 + 7] {
+            let path = root.join(format!("f{size}"));
+            let bytes: Vec<u8> = (0..size)
+                .map(|byte| u8::try_from(byte % 251).unwrap())
+                .collect();
+            std::fs::write(&path, &bytes).unwrap();
+
+            let (len, digest) = blake3_file(&path).unwrap();
+            assert_eq!(usize::try_from(len).unwrap(), size, "reported length");
+            assert_eq!(
+                blake3_file(&path).unwrap(),
+                (len, digest.clone()),
+                "the same file must digest the same twice"
+            );
+
+            let same = root.join(format!("f{size}-copy"));
+            std::fs::write(&same, &bytes).unwrap();
+            assert_eq!(
+                blake3_file(&same).unwrap().1,
+                digest,
+                "identical bytes must digest identically"
+            );
+
+            if size > 0 {
+                let mut flipped = bytes.clone();
+                let last = flipped.len() - 1;
+                flipped[last] ^= 0xff;
+                let changed = root.join(format!("f{size}-changed"));
+                std::fs::write(&changed, &flipped).unwrap();
+                assert_ne!(
+                    blake3_file(&changed).unwrap().1,
+                    digest,
+                    "a one-byte change must change the digest"
+                );
+            }
+        }
+        std::fs::remove_dir_all(&root).unwrap();
+    }
+
+    #[test]
+    fn a_missing_file_has_no_digest() {
+        let root = temp_root("file-digest-missing");
+        assert!(blake3_file(&root.join("absent")).is_err());
+        std::fs::remove_dir_all(&root).unwrap();
     }
 
     #[test]

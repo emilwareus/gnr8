@@ -19,7 +19,7 @@ use std::path::PathBuf;
 use std::process::Command;
 
 use crate::analyze::facts;
-use crate::manifest::blake3_hex;
+use crate::manifest::{blake3_file, blake3_hex};
 use crate::CoreError;
 
 /// The directory of the `goextract` Go module, resolved relative to this crate's
@@ -150,13 +150,12 @@ impl ExtractorIdentity {
 pub(crate) fn goextract_identity(target_dir: &str) -> Result<ExtractorIdentity, CoreError> {
     let toolchain = go_toolchain("go", target_dir)?;
     let binary = goextract_binary("go", &toolchain)?;
-    let bytes = std::fs::read(&binary).map_err(|source| CoreError::Io {
+    let (_, binary_hash) = blake3_file(&binary).map_err(|source| CoreError::Io {
         message: format!(
             "failed to read the compiled goextract helper {} for the extraction identity: {source}",
             binary.display()
         ),
     })?;
-    let binary_hash = blake3_hex(&bytes);
     Ok(ExtractorIdentity {
         toolchain,
         binary,

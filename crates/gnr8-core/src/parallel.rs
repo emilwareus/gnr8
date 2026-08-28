@@ -21,9 +21,16 @@ use crate::CoreError;
 /// Below this many items the work is smaller than the cost of handing it out.
 const MIN_PARALLEL_ITEMS: usize = 64;
 
+/// The same threshold for callers whose items are each already worth a thread.
+///
+/// [`map_ordered`]'s items are one rendered file or one file read; it takes a lot of them to beat
+/// the cost of spawning. A quarter-megabyte of bytes to hash is not that kind of item — two of them
+/// is already more work than the spawn — so the same mapper is offered at a threshold that matches.
+const MIN_PARALLEL_BLOCKS: usize = 2;
+
 /// Workers to use for `len` items: never more than there is work, or the machine has cores.
-fn worker_count(len: usize) -> usize {
-    if len < MIN_PARALLEL_ITEMS {
+fn worker_count(len: usize, minimum: usize) -> usize {
+    if len < minimum {
         return 1;
     }
     std::thread::available_parallelism()
@@ -43,7 +50,34 @@ where
     R: Send,
     F: Fn(&T) -> Result<R, CoreError> + Sync,
 {
-    let workers = worker_count(items.len());
+    map_ordered_from(MIN_PARALLEL_ITEMS, items, render)
+}
+
+/// Map `items` through `render` across the cores, for items each big enough to be worth a thread.
+///
+/// Identical to [`map_ordered`] in ordering and in which failure it reports; only the "is this worth
+/// handing out" threshold differs, and that threshold is a property of the item, not of the mapper.
+///
+/// # Errors
+///
+/// Returns `render`'s failure for the LOWEST-index item that failed, or [`CoreError::SdkGen`] if a
+/// worker panicked.
+pub(crate) fn map_ordered_blocks<T, R, F>(items: &[T], render: F) -> Result<Vec<R>, CoreError>
+where
+    T: Sync,
+    R: Send,
+    F: Fn(&T) -> Result<R, CoreError> + Sync,
+{
+    map_ordered_from(MIN_PARALLEL_BLOCKS, items, render)
+}
+
+fn map_ordered_from<T, R, F>(minimum: usize, items: &[T], render: F) -> Result<Vec<R>, CoreError>
+where
+    T: Sync,
+    R: Send,
+    F: Fn(&T) -> Result<R, CoreError> + Sync,
+{
+    let workers = worker_count(items.len(), minimum);
     if workers <= 1 {
         return items.iter().map(render).collect();
     }
