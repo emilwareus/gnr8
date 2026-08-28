@@ -90,7 +90,6 @@ fn build_graph_is_byte_identical_across_two_runs() {
 /// round-tripped graph must equal the one lowered from the original.
 #[test]
 fn a_graph_survives_the_worker_frame_without_losing_a_field() {
-    use gnr8::protocol::{read_frame, write_frame, HostMessage};
     use gnr8_engine::sdk::builtins;
     use gnr8_engine::sdk::BuiltinTransform;
 
@@ -147,12 +146,50 @@ fn a_graph_survives_the_worker_frame_without_losing_a_field() {
         );
     }
 
+    // A graph crosses as the difference from the one the peer holds, so BOTH extremes must
+    // reconstruct it exactly: a peer holding nothing (every element rides along) and a peer already
+    // holding this very graph (no element does).
+    for held in [
+        gnr8::protocol::HeldGraph::default(),
+        gnr8::protocol::HeldGraph::of(&graph),
+    ] {
+        let round_tripped = through_a_frame(&graph, &held);
+        assert_eq!(
+            snapshot,
+            serde_json::to_string(&round_tripped).expect("serialize the round-tripped graph"),
+            "a field that does not survive the frame is a fact every custom stage stops seeing"
+        );
+
+        let security = fixture_security();
+        assert_eq!(
+            gnr8_engine::lower::to_openapi(&graph, "goalservice", "/goal", &security)
+                .expect("lowering the original graph must succeed"),
+            gnr8_engine::lower::to_openapi(&round_tripped, "goalservice", "/goal", &security)
+                .expect("lowering the round-tripped graph must succeed"),
+            "the artifact lowered from a round-tripped graph must be byte-identical"
+        );
+    }
+}
+
+/// Write `graph` as a transform request measured against `held`, read it back, and rebuild it.
+fn through_a_frame(
+    graph: &gnr8_engine::graph::ApiGraph,
+    held: &gnr8::protocol::HeldGraph,
+) -> gnr8_engine::graph::ApiGraph {
+    use gnr8::protocol::{read_frame, write_frame, GraphPatch, HostMessage};
+
+    let mut sent = graph.clone();
+    let patch = GraphPatch::of(&mut sent, held);
+    assert_eq!(
+        &sent, graph,
+        "describing a graph must leave the graph it described untouched"
+    );
     let mut frame = Vec::new();
     write_frame(
         &mut frame,
         &HostMessage::ApplyTransforms {
             indices: vec![0],
-            graph: graph.clone(),
+            graph: patch,
         },
     )
     .expect("the graph must fit in one frame");
@@ -163,21 +200,9 @@ fn a_graph_survives_the_worker_frame_without_losing_a_field() {
     else {
         panic!("the frame must decode as the request it was written from");
     };
-
-    assert_eq!(
-        snapshot,
-        serde_json::to_string(&round_tripped).expect("serialize the round-tripped graph"),
-        "a field that does not survive the frame is a fact every custom stage stops seeing"
-    );
-
-    let security = fixture_security();
-    assert_eq!(
-        gnr8_engine::lower::to_openapi(&graph, "goalservice", "/goal", &security)
-            .expect("lowering the original graph must succeed"),
-        gnr8_engine::lower::to_openapi(&round_tripped, "goalservice", "/goal", &security)
-            .expect("lowering the round-tripped graph must succeed"),
-        "the artifact lowered from a round-tripped graph must be byte-identical"
-    );
+    round_tripped
+        .resolve(held)
+        .expect("a patch measured against what the peer holds must resolve against it")
 }
 
 #[test]

@@ -27,8 +27,8 @@ use std::io::{Read, Write};
 use std::process::ExitCode;
 
 use crate::protocol::{
-    capability_digest, read_frame, sdk_version, write_frame, HostMessage, WorkerMessage,
-    PROTOCOL_VERSION,
+    capability_digest, read_frame, sdk_version, write_frame, GraphPatch, HeldGraph, HostMessage,
+    WorkerMessage, PROTOCOL_VERSION,
 };
 use crate::sdk::{Artifacts, Cx, Pipeline};
 use crate::Error;
@@ -86,6 +86,9 @@ pub(crate) fn serve<R: Read, W: Write>(
     let cx = handshake(pipeline, input, output)?;
     // The frozen graph the target phase runs against, once the host has handed it over.
     let mut frozen: Option<crate::graph::ApiGraph> = None;
+    // What the HOST holds, which is what every patch in either direction is measured against. Both
+    // sides advance these on the same frame, so they name the same vectors at every point.
+    let mut session = Held::default();
     loop {
         let request: HostMessage = read_frame(input).map_err(Session::Run)?;
         match request {
@@ -99,10 +102,23 @@ pub(crate) fn serve<R: Read, W: Write>(
                 return Ok(());
             }
             HostMessage::FreezeGraph { graph } => {
-                frozen = Some(graph);
+                match graph.resolve(&session.graph) {
+                    Ok(graph) => {
+                        // The frozen graph ends the transform phase: the host sends no further
+                        // graph, so both sides drop what they held rather than keep a copy alive for
+                        // a frame that never comes. They drop it on the SAME frame, so a later graph
+                        // would still be measured against a vector both agree on — an empty one.
+                        session.graph = HeldGraph::default();
+                        frozen = Some(graph);
+                    }
+                    Err(err) => {
+                        report(output, &err);
+                        return Err(Session::Run(err));
+                    }
+                }
                 write_frame(output, &WorkerMessage::Done).map_err(Session::Run)?;
             }
-            other => match dispatch(pipeline, &cx, frozen.as_ref(), other) {
+            other => match dispatch(pipeline, &cx, frozen.as_ref(), &mut session, other) {
                 Ok(reply) => write_frame(output, &reply).map_err(Session::Run)?,
                 Err(err) => {
                     report(output, &err);
@@ -111,6 +127,15 @@ pub(crate) fn serve<R: Read, W: Write>(
             },
         }
     }
+}
+
+/// The vectors the host holds, which every patch in either direction is measured against.
+#[derive(Default)]
+struct Held {
+    /// The operations and schemas of the graph the host holds.
+    graph: HeldGraph,
+    /// The artifact set the host holds.
+    artifacts: Vec<crate::sdk::Artifact>,
 }
 
 /// Read the host's `Hello`, validate it, and answer with the plan.
@@ -180,6 +205,7 @@ fn dispatch(
     pipeline: &Pipeline,
     cx: &Cx,
     frozen: Option<&crate::graph::ApiGraph>,
+    session: &mut Held,
     request: HostMessage,
 ) -> Result<WorkerMessage, Error> {
     match request {
@@ -187,18 +213,25 @@ fn dispatch(
             let source = pipeline
                 .custom_source(index)
                 .ok_or_else(|| unknown_stage("source", index))?;
-            Ok(WorkerMessage::Graph {
-                graph: source.load(cx)?,
-            })
+            let mut graph = source.load(cx)?;
+            let patch = GraphPatch::of(&mut graph, &session.graph);
+            session.graph = HeldGraph::taken_from(graph);
+            Ok(WorkerMessage::Graph { graph: patch })
         }
-        HostMessage::ApplyTransforms { indices, mut graph } => {
+        HostMessage::ApplyTransforms { indices, graph } => {
+            let mut graph = graph.resolve(&session.graph)?;
+            // What the host holds is what it just described, which is this graph before the run
+            // touches it. Recording it here is what lets the reply be the difference.
+            session.graph = HeldGraph::of(&graph);
             for index in indices {
                 let transform = pipeline
                     .custom_transform(index)
                     .ok_or_else(|| unknown_stage("transform", index))?;
                 transform.apply(&mut graph, cx)?;
             }
-            Ok(WorkerMessage::Graph { graph })
+            let patch = GraphPatch::of(&mut graph, &session.graph);
+            session.graph = HeldGraph::taken_from(graph);
+            Ok(WorkerMessage::Graph { graph: patch })
         }
         HostMessage::GenerateTargets { indices, artifacts } => {
             let graph = frozen.ok_or_else(|| {
@@ -206,8 +239,9 @@ fn dispatch(
                     "the host asked for a custom target before handing over the frozen graph",
                 )
             })?;
-            let received = artifacts.clone();
-            let mut out = Artifacts::from_files(artifacts);
+            let received = artifacts.resolve(&session.artifacts)?;
+            session.artifacts.clone_from(&received);
+            let mut out = Artifacts::from_files(received);
             for index in indices {
                 let target = pipeline
                     .custom_target(index)
@@ -215,13 +249,12 @@ fn dispatch(
                 out.begin_stage(format!("target[{index}]:{}", target.producer()));
                 target.generate(graph, &mut out, cx)?;
             }
-            Ok(WorkerMessage::ArtifactChanges {
-                changed: artifact_changes(&received, out.into_files()),
-            })
+            Ok(answer_with_changes(session, out.into_files()))
         }
         HostMessage::RunPosts { indices, artifacts } => {
-            let received = artifacts.clone();
-            let mut out = Artifacts::from_files(artifacts);
+            let received = artifacts.resolve(&session.artifacts)?;
+            session.artifacts.clone_from(&received);
+            let mut out = Artifacts::from_files(received);
             for index in indices {
                 let post = pipeline
                     .custom_post(index)
@@ -229,9 +262,7 @@ fn dispatch(
                 out.begin_stage(format!("post[{index}]:{}", post.producer()));
                 post.run(&mut out, cx)?;
             }
-            Ok(WorkerMessage::ArtifactChanges {
-                changed: artifact_changes(&received, out.into_files()),
-            })
+            Ok(answer_with_changes(session, out.into_files()))
         }
         HostMessage::Hello { .. } | HostMessage::Shutdown | HostMessage::FreezeGraph { .. } => {
             Err(Error::protocol(
@@ -241,13 +272,20 @@ fn dispatch(
     }
 }
 
+/// Answer a run with what it changed, and record the set the host will hold once it merges them.
+fn answer_with_changes(session: &mut Held, after: Vec<crate::sdk::Artifact>) -> WorkerMessage {
+    let changed = artifact_changes(&session.artifacts, &after);
+    session.artifacts = after;
+    WorkerMessage::ArtifactChanges { changed }
+}
+
 /// The artifacts in `after` that `before` did not already hold identically.
 ///
 /// Both are sorted by path and `after` is a superset of `before` by path — a stage can create,
 /// overlay or rewrite, never drop — so one merge walk answers it.
 fn artifact_changes(
     before: &[crate::sdk::Artifact],
-    after: Vec<crate::sdk::Artifact>,
+    after: &[crate::sdk::Artifact],
 ) -> Vec<crate::sdk::Artifact> {
     let mut kept = before.iter().peekable();
     let mut changed = Vec::new();
@@ -257,9 +295,9 @@ fn artifact_changes(
         }
         let held = kept
             .next_if(|held| held.path == artifact.path)
-            .is_some_and(|held| *held == artifact);
+            .is_some_and(|held| held == artifact);
         if !held {
-            changed.push(artifact);
+            changed.push(artifact.clone());
         }
     }
     changed
@@ -290,8 +328,8 @@ mod tests {
     use super::{serve, Session};
     use crate::graph::ApiGraph;
     use crate::protocol::{
-        capability_digest, read_frame, sdk_version, write_frame, HostMessage, WorkerMessage,
-        PROTOCOL_VERSION,
+        capability_digest, read_frame, sdk_version, write_frame, GraphPatch, HeldGraph,
+        HostMessage, Patched, WorkerMessage, PROTOCOL_VERSION,
     };
     use crate::sdk::{Artifacts, Custom, Cx, Pipeline, Target, Transform};
     use crate::Error;
@@ -320,6 +358,21 @@ mod tests {
         fn output_anchors(&self) -> Vec<String> {
             vec!["generated/API.md".to_string()]
         }
+    }
+
+    /// A graph as a patch against a peer that holds nothing — every element rides along.
+    fn whole_graph(mut graph: ApiGraph) -> GraphPatch {
+        GraphPatch::of(&mut graph, &HeldGraph::default())
+    }
+
+    /// An artifact set as a patch against a peer that holds nothing.
+    fn whole_artifacts(artifacts: &[crate::sdk::Artifact]) -> Patched<crate::sdk::Artifact> {
+        Patched::of(artifacts, &[], |artifact| artifact.path.as_str())
+    }
+
+    /// The graph a reply describes, resolved against what the sending side was told to hold.
+    fn resolved(patch: &GraphPatch, held: &HeldGraph) -> ApiGraph {
+        patch.clone().resolve(held).unwrap()
     }
 
     fn hello() -> HostMessage {
@@ -360,23 +413,25 @@ mod tests {
             title: "Base".to_string(),
             ..ApiGraph::default()
         };
+        // What the worker holds after the transform request is exactly the graph the host sent.
+        let graph_before = graph.clone();
         let (result, output) = drive(
             &pipeline,
             &[
                 hello(),
                 HostMessage::ApplyTransforms {
                     indices: vec![0],
-                    graph: graph.clone(),
+                    graph: whole_graph(graph.clone()),
                 },
                 HostMessage::FreezeGraph {
-                    graph: ApiGraph {
+                    graph: whole_graph(ApiGraph {
                         title: "Base::marked".to_string(),
                         ..ApiGraph::default()
-                    },
+                    }),
                 },
                 HostMessage::GenerateTargets {
                     indices: vec![0],
-                    artifacts: Vec::new(),
+                    artifacts: whole_artifacts(&[]),
                 },
                 HostMessage::Shutdown,
             ],
@@ -387,7 +442,10 @@ mod tests {
         let WorkerMessage::Graph { graph } = &messages[1] else {
             panic!("expected a graph reply, got {:?}", messages[1]);
         };
-        assert_eq!(graph.title, "Base::marked");
+        assert_eq!(
+            resolved(graph, &HeldGraph::of(&graph_before)).title,
+            "Base::marked"
+        );
         assert!(matches!(messages[2], WorkerMessage::Done));
         let WorkerMessage::ArtifactChanges { changed: artifacts } = &messages[3] else {
             panic!("expected artifact changes, got {:?}", messages[3]);
@@ -409,7 +467,7 @@ mod tests {
                 hello(),
                 HostMessage::GenerateTargets {
                     indices: vec![0],
-                    artifacts: Vec::new(),
+                    artifacts: whole_artifacts(&[]),
                 },
             ],
         );
@@ -449,7 +507,7 @@ mod tests {
                 HostMessage::LoadSource { index: 0 },
                 HostMessage::RunPosts {
                     indices: vec![0],
-                    artifacts: vec![crate::sdk::Artifact::new("a.txt", "body\n")],
+                    artifacts: whole_artifacts(&[crate::sdk::Artifact::new("a.txt", "body\n")]),
                 },
                 HostMessage::Shutdown,
             ],
@@ -460,7 +518,7 @@ mod tests {
             panic!("expected a graph, got {:?}", messages[1]);
         };
         // The worker's `Cx` is the project root the host declared in its handshake.
-        assert_eq!(graph.title, "/repo");
+        assert_eq!(resolved(graph, &HeldGraph::default()).title, "/repo");
         let WorkerMessage::ArtifactChanges { changed: artifacts } = &messages[2] else {
             panic!("expected artifact changes, got {:?}", messages[2]);
         };
@@ -485,10 +543,10 @@ mod tests {
                 hello(),
                 HostMessage::RunPosts {
                     indices: vec![0],
-                    artifacts: vec![
+                    artifacts: whole_artifacts(&[
                         crate::sdk::Artifact::new("a.txt", "untouched"),
                         crate::sdk::Artifact::new("b.txt", "body"),
-                    ],
+                    ]),
                 },
                 HostMessage::Shutdown,
             ],
@@ -511,7 +569,7 @@ mod tests {
                 hello(),
                 HostMessage::ApplyTransforms {
                     indices: vec![0],
-                    graph: ApiGraph::default(),
+                    graph: whole_graph(ApiGraph::default()),
                 },
             ],
         );
@@ -594,7 +652,7 @@ mod tests {
                 hello(),
                 HostMessage::ApplyTransforms {
                     indices: vec![0],
-                    graph: ApiGraph::default(),
+                    graph: whole_graph(ApiGraph::default()),
                 },
             ],
         );

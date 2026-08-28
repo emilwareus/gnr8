@@ -39,10 +39,14 @@ pub trait StageRunner {
 
     /// Hand over the frozen graph every target runs against, before the first target run.
     ///
+    /// Taken by unique reference because a runner that ships it across a process boundary describes
+    /// it against what the worker already holds, and lifting its two large vectors out of the way to
+    /// do that is cheaper than copying them. The graph is left exactly as it was found.
+    ///
     /// # Errors
     ///
     /// Returns the worker's typed failure.
-    fn freeze_graph(&mut self, graph: &ApiGraph) -> Result<(), CoreError>;
+    fn freeze_graph(&mut self, graph: &mut ApiGraph) -> Result<(), CoreError>;
 
     /// Run the custom targets at `indices`, in order, given the artifacts produced so far.
     ///
@@ -114,7 +118,7 @@ impl StageRunner for NoCustomStages {
         Err(no_custom_span("transform", indices))
     }
 
-    fn freeze_graph(&mut self, _graph: &ApiGraph) -> Result<(), CoreError> {
+    fn freeze_graph(&mut self, _graph: &mut ApiGraph) -> Result<(), CoreError> {
         Err(no_custom_span("target", &[]))
     }
 
@@ -285,7 +289,7 @@ pub fn run(
         // Every target, including a user-defined one, receives the same canonical directional
         // graph. `build_ir` and `inspect` intentionally retain the unsplit source facts; the
         // projection belongs at the artifact boundary.
-        let generation_ir = crate::graph::projection::for_generation(&ir)?;
+        let mut generation_ir = crate::graph::projection::into_generation(ir)?;
         let spans = stage_spans(&plan.targets);
         // The frozen graph is the same for every target, so it crosses to the worker once rather
         // than riding along with each run.
@@ -293,7 +297,7 @@ pub fn run(
             .iter()
             .any(|span| matches!(span, StageSpan::Custom(_)))
         {
-            runner.freeze_graph(&generation_ir)?;
+            runner.freeze_graph(&mut generation_ir)?;
         }
         for span in spans {
             match span {
@@ -454,7 +458,7 @@ impl StageRunner for InProcessRunner<'_> {
         Ok(graph)
     }
 
-    fn freeze_graph(&mut self, graph: &ApiGraph) -> Result<(), CoreError> {
+    fn freeze_graph(&mut self, graph: &mut ApiGraph) -> Result<(), CoreError> {
         self.frozen = Some(graph.clone());
         Ok(())
     }
@@ -563,7 +567,7 @@ mod tests {
             Ok(graph)
         }
 
-        fn freeze_graph(&mut self, graph: &ApiGraph) -> Result<(), CoreError> {
+        fn freeze_graph(&mut self, graph: &mut ApiGraph) -> Result<(), CoreError> {
             self.calls.push("freeze".to_string());
             self.frozen = Some(graph.clone());
             Ok(())
@@ -714,7 +718,7 @@ mod tests {
             ) -> Result<ApiGraph, CoreError> {
                 Ok(graph)
             }
-            fn freeze_graph(&mut self, _graph: &ApiGraph) -> Result<(), CoreError> {
+            fn freeze_graph(&mut self, _graph: &mut ApiGraph) -> Result<(), CoreError> {
                 Ok(())
             }
             fn generate_targets(
@@ -758,7 +762,7 @@ mod tests {
             ) -> Result<ApiGraph, CoreError> {
                 Ok(graph)
             }
-            fn freeze_graph(&mut self, _graph: &ApiGraph) -> Result<(), CoreError> {
+            fn freeze_graph(&mut self, _graph: &mut ApiGraph) -> Result<(), CoreError> {
                 Ok(())
             }
             fn generate_targets(
@@ -804,7 +808,7 @@ mod tests {
             ) -> Result<ApiGraph, CoreError> {
                 Ok(graph)
             }
-            fn freeze_graph(&mut self, _graph: &ApiGraph) -> Result<(), CoreError> {
+            fn freeze_graph(&mut self, _graph: &mut ApiGraph) -> Result<(), CoreError> {
                 Ok(())
             }
             fn generate_targets(

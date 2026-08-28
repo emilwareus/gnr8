@@ -27,8 +27,8 @@ use std::sync::{Arc, Condvar, Mutex};
 use std::time::Duration;
 
 use gnr8::protocol::{
-    capability_digest, read_frame, sdk_version, write_frame, HostMessage, WorkerMessage,
-    PROTOCOL_VERSION,
+    capability_digest, read_frame, sdk_version, write_frame, GraphPatch, HeldGraph, HostMessage,
+    Patched, WorkerMessage, PROTOCOL_VERSION,
 };
 
 use crate::graph::ApiGraph;
@@ -164,6 +164,10 @@ pub struct WorkerSession {
     plan: StagePlan,
     finished: bool,
     built: bool,
+    /// The graph vectors the worker holds — what every graph patch is measured against.
+    held_graph: HeldGraph,
+    /// The artifact set the worker holds — what every artifact patch is measured against.
+    held_artifacts: Vec<Artifact>,
 }
 
 impl WorkerSession {
@@ -240,6 +244,8 @@ impl WorkerSession {
             plan: StagePlan::default(),
             finished: false,
             built: false,
+            held_graph: HeldGraph::default(),
+            held_artifacts: Vec::new(),
         };
         session.plan = session.handshake(&workspace.project_root)?;
         Ok(session)
@@ -399,10 +405,20 @@ impl WorkerSession {
         }
     }
 
+    /// Send a request whose answer is a graph, and rebuild that graph from what the worker changed.
+    ///
+    /// The reply is measured against the graph the worker holds, which is the one this session last
+    /// recorded, so resolving it here is what keeps the two sides naming the same vectors.
     fn expect_graph(&mut self, request: &HostMessage) -> Result<ApiGraph, CoreError> {
         self.send(request)?;
         match self.receive()? {
-            WorkerMessage::Graph { graph } => Ok(graph),
+            WorkerMessage::Graph { graph } => {
+                let graph = graph
+                    .resolve(&self.held_graph)
+                    .map_err(|err| Self::protocol_error(err.to_string()))?;
+                self.held_graph = HeldGraph::of(&graph);
+                Ok(graph)
+            }
             WorkerMessage::Failed { message } => Err(self.worker_error(&message)),
             other => Err(Self::protocol_error(format!(
                 "expected a graph from the .gnr8 worker, got {}",
@@ -413,23 +429,29 @@ impl WorkerSession {
 
     /// Send a work request that carries an artifact set, and merge the worker's changes back into it.
     ///
-    /// The set is handed to `request` by value and taken back out of it after the frame is written,
-    /// so the host neither clones it to keep a copy nor ships it back to itself: the worker answers
-    /// with what it changed, and those changes are merged into the set the host still holds.
-    fn expect_artifacts(&mut self, request: HostMessage) -> Result<Vec<Artifact>, CoreError> {
-        self.send(&request)?;
-        let sent = match request {
-            HostMessage::GenerateTargets { artifacts, .. }
-            | HostMessage::RunPosts { artifacts, .. } => artifacts,
-            other => {
-                return Err(Self::protocol_error(format!(
-                    "{} does not carry an artifact set",
-                    host_message_name(&other)
-                )))
-            }
-        };
+    /// Neither side ships the whole set. The request describes it against the one the worker already
+    /// holds, and the worker answers with what its run changed; the host merges those changes into
+    /// the set it kept. `make_request` builds the frame from the patch so the two artifact-carrying
+    /// requests share one path.
+    fn expect_artifacts(
+        &mut self,
+        artifacts: Vec<Artifact>,
+        make_request: impl FnOnce(Patched<Artifact>) -> HostMessage,
+    ) -> Result<Vec<Artifact>, CoreError> {
+        let patch = Patched::of(&artifacts, &self.held_artifacts, |artifact| {
+            artifact.path.as_str()
+        });
+        // The worker holds what this frame describes the moment it is written, so record it before
+        // the reply is read: the reply's changes are merged into exactly this set.
+        self.held_artifacts = artifacts;
+        self.send(&make_request(patch))?;
         match self.receive()? {
-            WorkerMessage::ArtifactChanges { changed } => Ok(merge_artifact_changes(sent, changed)),
+            WorkerMessage::ArtifactChanges { changed } => {
+                let merged =
+                    merge_artifact_changes(std::mem::take(&mut self.held_artifacts), changed);
+                self.held_artifacts.clone_from(&merged);
+                Ok(merged)
+            }
             WorkerMessage::Failed { message } => Err(self.worker_error(&message)),
             other => Err(Self::protocol_error(format!(
                 "expected artifact changes from the .gnr8 worker, got {}",
@@ -464,19 +486,6 @@ fn merge_artifact_changes(sent: Vec<Artifact>, changed: Vec<Artifact>) -> Vec<Ar
     merged
 }
 
-/// The name of a host message, for a protocol diagnostic.
-fn host_message_name(message: &HostMessage) -> &'static str {
-    match message {
-        HostMessage::Hello { .. } => "a handshake",
-        HostMessage::LoadSource { .. } => "a source request",
-        HostMessage::ApplyTransforms { .. } => "a transform request",
-        HostMessage::FreezeGraph { .. } => "a frozen graph",
-        HostMessage::GenerateTargets { .. } => "a target request",
-        HostMessage::RunPosts { .. } => "a post-process request",
-        HostMessage::Shutdown => "a shutdown",
-    }
-}
-
 impl Drop for WorkerSession {
     fn drop(&mut self) {
         if !self.finished {
@@ -493,18 +502,26 @@ impl StageRunner for WorkerSession {
     fn apply_transforms(
         &mut self,
         indices: &[usize],
-        graph: ApiGraph,
+        mut graph: ApiGraph,
     ) -> Result<ApiGraph, CoreError> {
+        let patch = GraphPatch::of(&mut graph, &self.held_graph);
+        // The worker holds this graph the moment the frame is written, and the caller is done with
+        // it, so its vectors are moved into the record rather than copied into one.
+        self.held_graph = HeldGraph::taken_from(graph);
         self.expect_graph(&HostMessage::ApplyTransforms {
             indices: indices.to_vec(),
-            graph,
+            graph: patch,
         })
     }
 
-    fn freeze_graph(&mut self, graph: &ApiGraph) -> Result<(), CoreError> {
-        self.send(&HostMessage::FreezeGraph {
-            graph: graph.clone(),
-        })?;
+    fn freeze_graph(&mut self, graph: &mut ApiGraph) -> Result<(), CoreError> {
+        let patch = GraphPatch::of(graph, &self.held_graph);
+        // The frozen graph ends the transform phase: no further graph crosses, so both sides drop
+        // what they held on this same frame instead of keeping a copy alive for a frame that never
+        // comes. Dropping it in step is what keeps a later patch — were one ever added — measured
+        // against a vector both sides agree on.
+        self.held_graph = HeldGraph::default();
+        self.send(&HostMessage::FreezeGraph { graph: patch })?;
         match self.receive()? {
             WorkerMessage::Done => Ok(()),
             WorkerMessage::Failed { message } => Err(self.worker_error(&message)),
@@ -520,8 +537,9 @@ impl StageRunner for WorkerSession {
         indices: &[usize],
         artifacts: Vec<Artifact>,
     ) -> Result<Vec<Artifact>, CoreError> {
-        self.expect_artifacts(HostMessage::GenerateTargets {
-            indices: indices.to_vec(),
+        let indices = indices.to_vec();
+        self.expect_artifacts(artifacts, |artifacts| HostMessage::GenerateTargets {
+            indices,
             artifacts,
         })
     }
@@ -531,8 +549,9 @@ impl StageRunner for WorkerSession {
         indices: &[usize],
         artifacts: Vec<Artifact>,
     ) -> Result<Vec<Artifact>, CoreError> {
-        self.expect_artifacts(HostMessage::RunPosts {
-            indices: indices.to_vec(),
+        let indices = indices.to_vec();
+        self.expect_artifacts(artifacts, |artifacts| HostMessage::RunPosts {
+            indices,
             artifacts,
         })
     }
