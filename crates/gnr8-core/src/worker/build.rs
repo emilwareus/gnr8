@@ -37,6 +37,31 @@ const DEFAULT_CARGO: &str = "cargo";
 /// Set to `1` to pass `--offline` to every cargo invocation.
 pub const GNR8_CARGO_OFFLINE_ENV: &str = "GNR8_CARGO_OFFLINE";
 
+/// The cargo profile gnr8 compiles a project's worker under.
+///
+/// `.gnr8/target` is gnr8's own build directory, so a named profile keeps the worker's compilation
+/// settings gnr8's decision and keeps them out of the way of a `cargo build` the user runs there
+/// themselves. It inherits `dev`, so a project that tunes `[profile.dev]` still tunes this.
+const WORKER_PROFILE: &str = "gnr8";
+
+/// The profile definition passed to every worker build, one `--config` value per line.
+///
+/// The worker's hot path is the SDK's own work on a graph frame — `serde_json` over the graph and
+/// the frame's blake3 digest — not the user's stage code. On a 4,836-artifact project one graph
+/// round trip cost 408ms of encode + decode with those compiled unoptimized against 27ms with them
+/// optimized, and 17 round trips of that IS the pipeline. Compiling the user's own crate optimized
+/// as well changed nothing measurable, so it is deliberately left alone: their code stays fast to
+/// rebuild and keeps its debug info, which is what a panic in a stage they wrote needs.
+///
+/// `opt-level = 1` is the whole of that win at the least compile time — the same pipeline measured
+/// 4.22s at both `1` and `2` — and dependency debug info is dropped because it is 10x of the built
+/// binary that gnr8 re-hashes on every run and nothing reads it.
+const WORKER_PROFILE_CONFIG: [&str; 3] = [
+    r#"profile.gnr8.inherits="dev""#,
+    r#"profile.gnr8.package."*".opt-level=1"#,
+    r#"profile.gnr8.package."*".debug=false"#,
+];
+
 /// The first gnr8 version whose `.gnr8/` crate links the thin SDK instead of the whole engine.
 ///
 /// A `gnr8` dependency pinned below this is the previous contract, and it cannot work: that crate
@@ -107,12 +132,15 @@ impl Workspace {
         self.dir.join("target")
     }
 
+    /// The profile directory the worker binary lands in.
+    fn profile_dir(&self) -> PathBuf {
+        self.target_dir().join(WORKER_PROFILE)
+    }
+
     /// Where the built worker binary lands.
     #[must_use]
     pub fn binary_path(&self) -> PathBuf {
-        self.target_dir()
-            .join("debug")
-            .join(binary_file_name(&self.package))
+        self.profile_dir().join(binary_file_name(&self.package))
     }
 
     /// The build stamp path.
@@ -475,7 +503,7 @@ fn project_relative(root: &Path, path: &Path) -> String {
 /// The path is composed from the manifest's package name, which is already restricted to Cargo's
 /// name charset, so it cannot contain a traversal. What this adds is the symlink case: `.gnr8/target`
 /// is deliberately excluded from the build fingerprint — it is gnr8's own output — so a symlinked
-/// `target/`, `target/debug/`, or binary would otherwise redirect execution without ever appearing
+/// `target/`, the profile directory under it, or the binary would otherwise redirect execution without ever appearing
 /// as a changed input. Canonicalizing would not catch it, because both sides resolve through the
 /// same link; each level is therefore checked with `symlink_metadata`.
 ///
@@ -489,9 +517,8 @@ fn confirm_binary_is_inside_the_workspace(
     workspace: &Workspace,
     binary: &Path,
 ) -> Result<(), CoreError> {
-    let target_dir = workspace.target_dir();
-    require_real_worker_path(&target_dir, EntryKind::Directory)?;
-    require_real_worker_path(&target_dir.join("debug"), EntryKind::Directory)?;
+    require_real_worker_path(&workspace.target_dir(), EntryKind::Directory)?;
+    require_real_worker_path(&workspace.profile_dir(), EntryKind::Directory)?;
     require_real_worker_path(binary, EntryKind::File)
 }
 
@@ -657,9 +684,13 @@ fn ensure_lockfile(workspace: &Workspace) -> Result<(), CoreError> {
 
 fn cargo_build(workspace: &Workspace) -> Result<(), CoreError> {
     let mut command = cargo_command();
+    command.arg("build").arg("--quiet");
+    for setting in WORKER_PROFILE_CONFIG {
+        command.arg("--config").arg(setting);
+    }
     command
-        .arg("build")
-        .arg("--quiet")
+        .arg("--profile")
+        .arg(WORKER_PROFILE)
         .arg("--manifest-path")
         .arg(&workspace.manifest)
         .arg("--target-dir")

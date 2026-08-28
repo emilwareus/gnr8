@@ -25,6 +25,31 @@ use std::process::{Command, Output};
 /// The installed `gnr8` host binary cargo built for this integration test.
 const GNR8_BIN: &str = env!("CARGO_BIN_EXE_gnr8");
 
+/// The worker binary gnr8 built for `root`, resolved through the engine's own definition of that
+/// path so the test cannot drift from the profile the host compiles under.
+fn worker_binary(root: &Path, package: &str) -> PathBuf {
+    gnr8_engine::worker::validate_workspace(root)
+        .expect("the scaffolded .gnr8 workspace must validate")
+        .binary_path()
+        .tap_assert_package(package)
+}
+
+/// Assert the resolved binary is the one this test scaffolded, then hand it back.
+trait AssertPackage {
+    fn tap_assert_package(self, package: &str) -> PathBuf;
+}
+
+impl AssertPackage for PathBuf {
+    fn tap_assert_package(self, package: &str) -> PathBuf {
+        assert!(
+            self.file_name().is_some_and(|name| name == package),
+            "unexpected worker binary {}",
+            self.display()
+        );
+        self
+    }
+}
+
 /// The in-repo thin SDK a scaffolded worker depends on.
 fn sdk_path() -> PathBuf {
     PathBuf::from(env!("CARGO_MANIFEST_DIR"))
@@ -358,7 +383,7 @@ fn cargo_runs_once_and_only_when_the_worker_inputs_change() {
     );
 
     // 6. A tampered worker binary is rebuilt rather than trusted.
-    let binary = root.join(".gnr8/target/debug/contract-gnr8-gen");
+    let binary = worker_binary(&root, "contract-gnr8-gen");
     let mut bytes = std::fs::read(&binary).unwrap();
     bytes.extend_from_slice(b"tamper");
     std::fs::write(&binary, bytes).unwrap();
@@ -514,7 +539,7 @@ fn a_worker_run_by_hand_reports_that_it_is_not_a_standalone_program() {
     );
     assert!(gnr8(&root, &["generate"], None).status.success());
 
-    let binary = root.join(".gnr8/target/debug/contract-gnr8-gen");
+    let binary = worker_binary(&root, "contract-gnr8-gen");
     let output = Command::new(&binary)
         .current_dir(&root)
         .stdin(std::process::Stdio::null())
