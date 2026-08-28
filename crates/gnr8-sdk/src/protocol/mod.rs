@@ -10,12 +10,12 @@
 //! encode, pipe, decode, on both sides — is what a large graph costs.
 //!
 //! What crosses on a run is what CHANGED, in both directions. Each side remembers the vectors the
-//! other holds — the graph's operations and schemas, and the artifact set — so an element the peer
-//! still holds is named by its position there rather than serialized, piped and parsed a second
-//! time ([`Patched`]). A transform that renames one operation ships that one operation; a
-//! post-processor that rewrites two files of five thousand is answered with two files. On a
-//! 332-artifact project that is 1.3 MB of graph across a warm run instead of 5.2 MB, and 2.2 MB of
-//! artifacts instead of 7.5 MB.
+//! other holds — the graph's operations, schemas and diagnostics, and the artifact set — so an
+//! element the peer still holds is named by its position there rather than serialized, piped and
+//! parsed a second time ([`Patched`]). A transform that renames one operation ships that one
+//! operation; a post-processor that rewrites two files of five thousand is answered with two files.
+//! On a 332-artifact project that is 1.3 MB of graph across a warm run instead of 5.2 MB, and 2.2 MB
+//! of artifacts instead of 7.5 MB.
 //!
 //! Every message is one self-delimiting, digest-checked frame:
 //!
@@ -45,7 +45,7 @@ use std::io::{Read, Write};
 
 use std::collections::BTreeMap;
 
-use crate::graph::{ApiGraph, Operation, Schema};
+use crate::graph::{ApiGraph, Diagnostic, Operation, Schema};
 use crate::sdk::{Artifact, StagePlan};
 use crate::Error;
 
@@ -54,7 +54,7 @@ use crate::Error;
 /// Bumped on any breaking change to the frame or message shape. Both sides refuse to proceed on a
 /// mismatch, so a `.gnr8/` crate built against a skewed SDK fails with an actionable error rather
 /// than a confusing parse failure or silently-wrong output.
-pub const PROTOCOL_VERSION: u32 = 4;
+pub const PROTOCOL_VERSION: u32 = 5;
 
 /// The frame magic. A stream that does not start with it is not this protocol.
 pub const FRAME_MAGIC: [u8; 4] = *b"GN8F";
@@ -111,24 +111,36 @@ pub struct Patched<T> {
 impl<T: Clone + PartialEq> Patched<T> {
     /// Describe `next` against the `held` vector the peer holds, matching elements by `identity`.
     ///
-    /// An element is reused only when the peer's element of the same identity is EQUAL to it, so a
-    /// stage that rewrote a value in place still ships that value. Identity only narrows the search;
-    /// equality decides, so duplicate or reordered identities cost bytes, never correctness.
+    /// An element is reused only when a peer element of the same identity is EQUAL to it, so a
+    /// stage that rewrote a value in place still ships that value. Identity only narrows the search
+    /// — it names the peer positions worth comparing — and equality decides, so a duplicate or
+    /// reordered identity costs comparisons, never correctness.
+    ///
+    /// It narrows to every such position rather than the first, because a vector whose identity is
+    /// not unique is exactly where the first one is usually the wrong one: a graph's diagnostics are
+    /// keyed by their message, and a rule that fires on seventy routes writes seventy diagnostics
+    /// that differ only in where they point. Comparing against one candidate would re-send
+    /// sixty-nine of them on every crossing.
     pub fn of<F>(next: &[T], held: &[T], identity: F) -> Self
     where
         F: for<'element> Fn(&'element T) -> &'element str,
     {
-        let mut positions: BTreeMap<&str, usize> = BTreeMap::new();
+        let mut positions: BTreeMap<&str, Vec<usize>> = BTreeMap::new();
         for (position, element) in held.iter().enumerate() {
-            positions.entry(identity(element)).or_insert(position);
+            positions
+                .entry(identity(element))
+                .or_default()
+                .push(position);
         }
         let mut slots = Vec::with_capacity(next.len());
         let mut fresh = Vec::new();
         for element in next {
-            let reused = positions
-                .get(identity(element))
-                .copied()
-                .filter(|position| held.get(*position).is_some_and(|peer| peer == element));
+            let reused = positions.get(identity(element)).and_then(|candidates| {
+                candidates
+                    .iter()
+                    .copied()
+                    .find(|position| held.get(*position).is_some_and(|peer| peer == element))
+            });
             if reused.is_none() {
                 fresh.push(element.clone());
             }
@@ -173,14 +185,19 @@ impl<T: Clone + PartialEq> Patched<T> {
 
 /// The graph vectors one side of the boundary holds — what a [`GraphPatch`] is measured against.
 ///
-/// Only the operations and schemas are tracked: they are the megabytes, and the rest of a graph is
-/// kilobytes of metadata that always travels whole.
+/// The three that grow with the analyzed project are tracked; the rest of a graph is its configured
+/// policy, which is kilobytes and travels whole. Diagnostics belong here with the operations and
+/// schemas because an extractor writes one per lossy pattern it meets: on a 251-file service that is
+/// 951 of them, 406 KB of JSON, and a warm run crossed the boundary ten times carrying every one of
+/// them unchanged.
 #[derive(Debug, Clone, Default)]
 pub struct HeldGraph {
     /// The operations, in the order the holder has them.
     pub operations: Vec<Operation>,
     /// The schemas, in the order the holder has them.
     pub schemas: Vec<Schema>,
+    /// The diagnostics, in the order the holder has them.
+    pub diagnostics: Vec<Diagnostic>,
 }
 
 impl HeldGraph {
@@ -190,6 +207,7 @@ impl HeldGraph {
         Self {
             operations: graph.operations.clone(),
             schemas: graph.schemas.clone(),
+            diagnostics: graph.diagnostics.clone(),
         }
     }
 
@@ -199,6 +217,7 @@ impl HeldGraph {
         Self {
             operations: graph.operations,
             schemas: graph.schemas,
+            diagnostics: graph.diagnostics,
         }
     }
 }
@@ -206,35 +225,47 @@ impl HeldGraph {
 /// A graph handed across the boundary as the difference from the one the peer already holds.
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 pub struct GraphPatch {
-    /// The graph's own metadata, with the operation and schema vectors left empty.
+    /// The graph's own metadata, with the operation, schema and diagnostic vectors left empty.
     pub metadata: ApiGraph,
     /// The operations, against the ones the peer holds.
     pub operations: Patched<Operation>,
     /// The schemas, against the ones the peer holds.
     pub schemas: Patched<Schema>,
+    /// The diagnostics, against the ones the peer holds.
+    pub diagnostics: Patched<Diagnostic>,
 }
 
 impl GraphPatch {
     /// Describe `next` against the graph the peer holds.
     ///
-    /// `next` is borrowed mutably only to lift its two large vectors out of the way while the
+    /// `next` is borrowed mutably only to lift its three growing vectors out of the way while the
     /// metadata is copied — copying the graph and then clearing them would copy the megabytes this
     /// exists to avoid. It is left exactly as it was found.
+    ///
+    /// A diagnostic is matched on its message, which is the rule and the subject it fired on; the
+    /// file and line that distinguish two firings of one rule are then settled by the equality
+    /// [`Patched::of`] requires of every candidate.
     #[must_use]
     pub fn of(next: &mut ApiGraph, held: &HeldGraph) -> Self {
         let operations = Patched::of(&next.operations, &held.operations, |operation| {
             operation.id.as_str()
         });
         let schemas = Patched::of(&next.schemas, &held.schemas, |schema| schema.id.as_str());
+        let diagnostics = Patched::of(&next.diagnostics, &held.diagnostics, |diagnostic| {
+            diagnostic.message.as_str()
+        });
         let lifted_operations = std::mem::take(&mut next.operations);
         let lifted_schemas = std::mem::take(&mut next.schemas);
+        let lifted_diagnostics = std::mem::take(&mut next.diagnostics);
         let metadata = next.clone();
         next.operations = lifted_operations;
         next.schemas = lifted_schemas;
+        next.diagnostics = lifted_diagnostics;
         Self {
             metadata,
             operations,
             schemas,
+            diagnostics,
         }
     }
 
@@ -248,9 +279,11 @@ impl GraphPatch {
             mut metadata,
             operations,
             schemas,
+            diagnostics,
         } = self;
         metadata.operations = operations.resolve(&held.operations)?;
         metadata.schemas = schemas.resolve(&held.schemas)?;
+        metadata.diagnostics = diagnostics.resolve(&held.diagnostics)?;
         Ok(metadata)
     }
 }
