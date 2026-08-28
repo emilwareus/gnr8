@@ -214,6 +214,11 @@ pub(crate) fn generate_files_with_options(
         // One walk for the whole bundle: the positions a schema is reached from are a property of the
         // graph, not of the file it lands in.
         let directions = schema_directions(graph);
+        // `python_relative_module` reads its `from` argument only as a directory, so the map from
+        // model name to import module is a property of the DIRECTORY a model file lands in, not of
+        // the model. Building it per schema made a 1,576-model SDK construct the same 1,576-entry
+        // map 1,576 times — 2.5M string clones for one directory's worth of answers.
+        let mut dep_modules_by_dir: BTreeMap<String, BTreeMap<String, String>> = BTreeMap::new();
         for schema in &graph.schemas {
             let name = schema_file_names
                 .get(&schema.name)
@@ -224,17 +229,20 @@ pub(crate) fn generate_files_with_options(
                     ),
                 })?
                 .clone();
-            let dep_modules: BTreeMap<String, String> = schema_file_names
-                .iter()
-                .map(|(model, file)| (model.clone(), python_relative_module(&name, file)))
-                .collect();
+            let from_dir = name.rsplit_once('/').map_or("", |(dir, _)| dir).to_string();
+            let dep_modules = dep_modules_by_dir.entry(from_dir).or_insert_with(|| {
+                schema_file_names
+                    .iter()
+                    .map(|(model, file)| (model.clone(), python_relative_module(&name, file)))
+                    .collect()
+            });
             files.push(SdkFile {
                 name,
                 contents: emit::emit_model_schema(
                     graph,
                     schema,
                     model_style,
-                    &dep_modules,
+                    dep_modules,
                     directions_of(&directions, &schema.id),
                 )?,
             });
