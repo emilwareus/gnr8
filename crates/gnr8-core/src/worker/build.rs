@@ -27,7 +27,9 @@
 //! That fingerprint names inputs, not a location: two worktrees holding byte-identical `.gnr8/`
 //! sources compute the same one. So a build that has already happened on this machine does not have
 //! to happen again in the next checkout — [`crate::store`] keeps the binary under that fingerprint,
-//! and a stamp miss looks there before it reaches `cargo`.
+//! and a stamp miss looks there instead of reaching `cargo`. It looks there on the same terms as the
+//! build it replaces: a restore puts a worker binary in this checkout, so a [`WorkerPolicy`] that
+//! forbids building forbids that too.
 //!
 //! A restored binary is verified the same way the recorded one is: the store's entry records the
 //! length and content hash of the bytes it published, and the copy is re-hashed and compared BEFORE
