@@ -15,6 +15,7 @@ use crate::sdk::{
     builtins, validate_artifact_paths, Artifact, Artifacts, BuiltinTarget, Cx, ReadinessTarget,
     StagePlan,
 };
+use crate::store::Store;
 use crate::CoreError;
 
 /// The worker-side half of a pipeline run: whatever executes the user's own stages.
@@ -26,35 +27,77 @@ pub trait StageRunner {
     /// Returns the worker's typed failure.
     fn load_source(&mut self, index: usize) -> Result<ApiGraph, CoreError>;
 
-    /// Run the custom transform at `index` over `graph`.
+    /// Run the custom transforms at `indices`, in order, over `graph`.
     ///
     /// # Errors
     ///
     /// Returns the worker's typed failure.
-    fn apply_transform(&mut self, index: usize, graph: ApiGraph) -> Result<ApiGraph, CoreError>;
-
-    /// Run the custom target at `index` against `graph`, given the artifacts produced so far.
-    ///
-    /// # Errors
-    ///
-    /// Returns the worker's typed failure.
-    fn generate_target(
+    fn apply_transforms(
         &mut self,
-        index: usize,
-        graph: &ApiGraph,
+        indices: &[usize],
+        graph: ApiGraph,
+    ) -> Result<ApiGraph, CoreError>;
+
+    /// Hand over the frozen graph every target runs against, before the first target run.
+    ///
+    /// Taken by unique reference because a runner that ships it across a process boundary describes
+    /// it against what the worker already holds, and lifting its two large vectors out of the way to
+    /// do that is cheaper than copying them. The graph is left exactly as it was found.
+    ///
+    /// # Errors
+    ///
+    /// Returns the worker's typed failure.
+    fn freeze_graph(&mut self, graph: &mut ApiGraph) -> Result<(), CoreError>;
+
+    /// Run the custom targets at `indices`, in order, given the artifacts produced so far.
+    ///
+    /// # Errors
+    ///
+    /// Returns the worker's typed failure.
+    fn generate_targets(
+        &mut self,
+        indices: &[usize],
         artifacts: Vec<Artifact>,
     ) -> Result<Vec<Artifact>, CoreError>;
 
-    /// Run the custom post-processor at `index` over `artifacts`.
+    /// Run the custom post-processors at `indices`, in order, over `artifacts`.
     ///
     /// # Errors
     ///
     /// Returns the worker's typed failure.
-    fn run_post(
+    fn run_posts(
         &mut self,
-        index: usize,
+        indices: &[usize],
         artifacts: Vec<Artifact>,
     ) -> Result<Vec<Artifact>, CoreError>;
+}
+
+/// One contiguous span of a plan's stages that runs in one place.
+///
+/// The host runs built-ins itself and asks the worker for the user's own stages, so a plan reads as
+/// alternating spans. Grouping them is what makes the graph — or the whole artifact set — cross the
+/// process boundary once per SPAN rather than once per stage.
+#[derive(Debug)]
+enum StageSpan<'a, B> {
+    /// One built-in stage, with its position in the plan's stage vector.
+    Builtin(usize, &'a B),
+    /// A run of consecutive custom stages, by their position in the pipeline's custom vector.
+    Custom(Vec<usize>),
+}
+
+/// Split `stages` into the spans [`StageSpan`] describes, preserving composition order.
+fn stage_spans<B>(stages: &[PlanStage<B>]) -> Vec<StageSpan<'_, B>> {
+    let mut spans: Vec<StageSpan<'_, B>> = Vec::new();
+    for (position, stage) in stages.iter().enumerate() {
+        match stage {
+            PlanStage::Builtin(spec) => spans.push(StageSpan::Builtin(position, spec)),
+            PlanStage::Custom { index, .. } => match spans.last_mut() {
+                Some(StageSpan::Custom(indices)) => indices.push(*index),
+                _ => spans.push(StageSpan::Custom(vec![*index])),
+            },
+        }
+    }
+    spans
 }
 
 /// A [`StageRunner`] for a plan that declares no custom stages.
@@ -68,25 +111,32 @@ impl StageRunner for NoCustomStages {
         Err(no_custom_stage("source", index))
     }
 
-    fn apply_transform(&mut self, index: usize, _graph: ApiGraph) -> Result<ApiGraph, CoreError> {
-        Err(no_custom_stage("transform", index))
+    fn apply_transforms(
+        &mut self,
+        indices: &[usize],
+        _graph: ApiGraph,
+    ) -> Result<ApiGraph, CoreError> {
+        Err(no_custom_span("transform", indices))
     }
 
-    fn generate_target(
-        &mut self,
-        index: usize,
-        _graph: &ApiGraph,
-        _artifacts: Vec<Artifact>,
-    ) -> Result<Vec<Artifact>, CoreError> {
-        Err(no_custom_stage("target", index))
+    fn freeze_graph(&mut self, _graph: &mut ApiGraph) -> Result<(), CoreError> {
+        Err(no_custom_span("target", &[]))
     }
 
-    fn run_post(
+    fn generate_targets(
         &mut self,
-        index: usize,
+        indices: &[usize],
         _artifacts: Vec<Artifact>,
     ) -> Result<Vec<Artifact>, CoreError> {
-        Err(no_custom_stage("post-process", index))
+        Err(no_custom_span("target", indices))
+    }
+
+    fn run_posts(
+        &mut self,
+        indices: &[usize],
+        _artifacts: Vec<Artifact>,
+    ) -> Result<Vec<Artifact>, CoreError> {
+        Err(no_custom_span("post-process", indices))
     }
 }
 
@@ -96,6 +146,10 @@ fn no_custom_stage(kind: &str, index: usize) -> CoreError {
             "the plan declares no custom {kind} at position {index}, but the host tried to run one"
         ),
     }
+}
+
+fn no_custom_span(kind: &str, indices: &[usize]) -> CoreError {
+    no_custom_stage(kind, indices.first().copied().unwrap_or_default())
 }
 
 /// Everything one pipeline run produced.
@@ -173,6 +227,7 @@ pub fn build_ir(
     plan: &StagePlan,
     cx: &Cx,
     runner: &mut dyn StageRunner,
+    store: Option<&Store>,
 ) -> Result<ApiGraph, CoreError> {
     let source = match plan.sources.as_slice() {
         [single] => single,
@@ -195,7 +250,7 @@ pub fn build_ir(
     };
 
     let mut ir = match source {
-        PlanStage::Builtin(spec) => builtins::load_source(spec, cx)?,
+        PlanStage::Builtin(spec) => builtins::load_source(spec, cx, store)?,
         PlanStage::Custom { index, .. } => runner.load_source(*index)?,
     };
 
@@ -207,10 +262,10 @@ pub fn build_ir(
     let anchor_refs: Vec<&str> = anchors.iter().map(String::as_str).collect();
     crate::lifecycle::exclude_output_anchors(&mut ir, &anchor_refs);
 
-    for stage in &plan.transforms {
-        match stage {
-            PlanStage::Builtin(spec) => builtins::apply_transform(spec, &mut ir, cx)?,
-            PlanStage::Custom { index, .. } => ir = runner.apply_transform(*index, ir)?,
+    for span in stage_spans(&plan.transforms) {
+        match span {
+            StageSpan::Builtin(_, spec) => builtins::apply_transform(spec, &mut ir, cx)?,
+            StageSpan::Custom(indices) => ir = runner.apply_transforms(&indices, ir)?,
         }
     }
     Ok(ir)
@@ -226,50 +281,83 @@ pub fn run(
     plan: &StagePlan,
     cx: &Cx,
     runner: &mut dyn StageRunner,
+    store: Option<&Store>,
 ) -> Result<PipelineOutcome, CoreError> {
-    let ir = build_ir(plan, cx, runner)?;
+    let ir = build_ir(plan, cx, runner, store)?;
     let diagnostics: Vec<Diagnostic> = ir.diagnostics.clone();
     let source_files = distinct_source_files(&ir);
 
-    let mut artifacts = Artifacts::new();
+    let mut files: Vec<Artifact> = Vec::new();
     if !plan.targets.is_empty() {
         // Every target, including a user-defined one, receives the same canonical directional
         // graph. `build_ir` and `inspect` intentionally retain the unsplit source facts; the
         // projection belongs at the artifact boundary.
-        let generation_ir = crate::graph::projection::for_generation(&ir)?;
-        for (index, stage) in plan.targets.iter().enumerate() {
-            match stage {
-                PlanStage::Builtin(spec) => {
-                    artifacts.begin_stage(builtin_target_producer(index, spec));
-                    builtins::generate_target(spec, &generation_ir, &mut artifacts, cx)?;
-                }
-                PlanStage::Custom {
-                    index: custom_index,
-                    ..
-                } => {
-                    let sent = artifacts.into_files();
-                    let produced =
-                        runner.generate_target(*custom_index, &generation_ir, sent.clone())?;
-                    require_no_dropped_artifacts("target", *custom_index, &sent, &produced)?;
-                    artifacts = Artifacts::from_files(produced);
+        let mut generation_ir = crate::graph::projection::into_generation(ir)?;
+        let spans = stage_spans(&plan.targets);
+        // The frozen graph is the same for every target, so it crosses to the worker once rather
+        // than riding along with each run.
+        if spans
+            .iter()
+            .any(|span| matches!(span, StageSpan::Custom(_)))
+        {
+            runner.freeze_graph(&mut generation_ir)?;
+        }
+        // A BUILT-IN target is a pure function of the frozen graph: every one of them only creates
+        // files, and not one reads the set it writes into. WHEN it runs is therefore not observable
+        // — only WHERE its files land in the accumulated set is. So they ALL run ahead of the loop
+        // that places them, and the loop takes each one's files back at the position the plan gives
+        // it. A run that spends a tenth of a second inside one worker stage emits its whole Go SDK
+        // during that wait instead of after it, and a plan with no worker stage at all is bounded by
+        // its slowest target rather than by the sum of them.
+        let graph = &generation_ir;
+        std::thread::scope(|scope| -> Result<(), CoreError> {
+            let mut produced = crate::parallel::run_ahead(
+                scope,
+                spans
+                    .iter()
+                    .filter_map(|span| match span {
+                        StageSpan::Builtin(position, spec) => Some((*position, *spec)),
+                        StageSpan::Custom(_) => None,
+                    })
+                    .map(|(position, spec)| {
+                        move || {
+                            let mut out = Artifacts::new();
+                            out.begin_stage(builtin_target_producer(position, spec));
+                            builtins::generate_target(spec, graph, &mut out, cx)?;
+                            Ok(out.into_files())
+                        }
+                    })
+                    .collect(),
+            );
+            for span in spans {
+                match span {
+                    StageSpan::Builtin(_, _) => adopt_produced(&mut files, produced.next()?)?,
+                    StageSpan::Custom(indices) => {
+                        let paths = artifact_paths(&files);
+                        let produced =
+                            runner.generate_targets(&indices, std::mem::take(&mut files))?;
+                        require_no_dropped_artifacts("target", &indices, &paths, &produced)?;
+                        files = produced;
+                        files.sort_by(|left, right| left.path.cmp(&right.path));
+                    }
                 }
             }
-        }
+            Ok(())
+        })?;
     }
+    let mut artifacts = Artifacts::from_files(files);
 
-    for (index, stage) in plan.posts.iter().enumerate() {
-        match stage {
-            PlanStage::Builtin(spec) => {
-                artifacts.begin_stage(format!("post[{index}]:{}", spec.label()));
+    for span in stage_spans(&plan.posts) {
+        match span {
+            StageSpan::Builtin(position, spec) => {
+                artifacts.begin_stage(format!("post[{position}]:{}", spec.label()));
                 builtins::run_post(spec, &mut artifacts, cx)?;
             }
-            PlanStage::Custom {
-                index: custom_index,
-                ..
-            } => {
+            StageSpan::Custom(indices) => {
                 let sent = artifacts.into_files();
-                let produced = runner.run_post(*custom_index, sent.clone())?;
-                require_no_dropped_artifacts("post-process", *custom_index, &sent, &produced)?;
+                let paths = artifact_paths(&sent);
+                let produced = runner.run_posts(&indices, sent)?;
+                require_no_dropped_artifacts("post-process", &indices, &paths, &produced)?;
                 artifacts = Artifacts::from_files(produced);
             }
         }
@@ -286,31 +374,81 @@ pub fn run(
     })
 }
 
+/// Fold a built-in target's finished files into the accumulated set, keeping it sorted by path.
+///
+/// The built-in produced them into an accumulator of its own, so its own path collisions were
+/// already refused there. What is left to check is the one thing only the accumulated set knows: a
+/// path an earlier stage already owns. Both sides are sorted, so one merge walk answers it — and the
+/// artifacts are carried across whole, so a file records the same producer and ownership it would
+/// have had if the built-in had written straight into the set.
+fn adopt_produced(into: &mut Vec<Artifact>, produced: Vec<Artifact>) -> Result<(), CoreError> {
+    if into.is_empty() {
+        *into = produced;
+        return Ok(());
+    }
+    let mut merged = Vec::with_capacity(into.len() + produced.len());
+    let mut held = std::mem::take(into).into_iter().peekable();
+    for artifact in produced {
+        while held.peek().is_some_and(|owned| owned.path < artifact.path) {
+            if let Some(owned) = held.next() {
+                merged.push(owned);
+            }
+        }
+        if let Some(owned) = held.peek() {
+            if owned.path == artifact.path {
+                return Err(CoreError::ArtifactOwnership {
+                    code: "artifact.path_collision".to_string(),
+                    path: artifact.path,
+                    producer: artifact.producer,
+                    message: format!(
+                        "path is already owned by {}; use overlay or rewrite explicitly",
+                        owned.producer
+                    ),
+                });
+            }
+        }
+        merged.push(artifact);
+    }
+    merged.extend(held);
+    *into = merged;
+    Ok(())
+}
+
 /// A stage may create, overlay or rewrite an artifact. It may not make one disappear.
 ///
-/// In this process that is guaranteed by construction — [`Artifacts`] has no removal API. Across the
-/// wire it is not: a reply is just a list, and a stage that returned the wrong one would have the
-/// host treat another target's output as stale and delete it from disk. So the host checks.
+/// Inside either process that is guaranteed by construction — [`Artifacts`] has no removal API, and
+/// a run of stages shares one accumulator. Across the wire it is not: a reply is just a list, and a
+/// worker that returned the wrong one would have the host treat another target's output as stale and
+/// delete it from disk. So the host checks what came back against what it sent.
+/// The paths of an artifact set, kept while the set itself is handed to the worker.
+///
+/// Only the paths are needed to police the reply, so the set is MOVED into the request rather than
+/// cloned: on a large SDK a clone here duplicated every generated file in memory for a membership
+/// check.
+fn artifact_paths(artifacts: &[Artifact]) -> Vec<String> {
+    artifacts
+        .iter()
+        .map(|artifact| artifact.path.clone())
+        .collect()
+}
+
 fn require_no_dropped_artifacts(
     kind: &str,
-    index: usize,
-    sent: &[Artifact],
+    indices: &[usize],
+    sent: &[String],
     produced: &[Artifact],
 ) -> Result<(), CoreError> {
     let kept: std::collections::BTreeSet<&str> = produced
         .iter()
         .map(|artifact| artifact.path.as_str())
         .collect();
-    if let Some(dropped) = sent
-        .iter()
-        .find(|artifact| !kept.contains(artifact.path.as_str()))
-    {
+    if let Some(dropped) = sent.iter().find(|path| !kept.contains(path.as_str())) {
+        let index = indices.first().copied().unwrap_or_default();
         return Err(CoreError::Protocol {
             message: format!(
                 "custom {kind} #{index} returned an artifact set that no longer contains \
-                 {:?}, which an earlier stage produced; a stage may create, overlay or rewrite an \
-                 artifact but never drop one",
-                dropped.path
+                 {dropped:?}, which an earlier stage produced; a stage may create, overlay or \
+                 rewrite an artifact but never drop one"
             ),
         });
     }
@@ -352,13 +490,18 @@ fn distinct_source_files(ir: &ApiGraph) -> usize {
 pub struct InProcessRunner<'a> {
     pipeline: &'a crate::sdk::Pipeline,
     cx: &'a Cx,
+    frozen: Option<ApiGraph>,
 }
 
 impl<'a> InProcessRunner<'a> {
     /// Run `pipeline`'s custom stages in this process, resolving relative paths against `cx`.
     #[must_use]
     pub const fn new(pipeline: &'a crate::sdk::Pipeline, cx: &'a Cx) -> Self {
-        Self { pipeline, cx }
+        Self {
+            pipeline,
+            cx,
+            frozen: None,
+        }
     }
 }
 
@@ -371,47 +514,60 @@ impl StageRunner for InProcessRunner<'_> {
         Ok(source.load(self.cx)?)
     }
 
-    fn apply_transform(
+    fn apply_transforms(
         &mut self,
-        index: usize,
+        indices: &[usize],
         mut graph: ApiGraph,
     ) -> Result<ApiGraph, CoreError> {
-        let transform = self
-            .pipeline
-            .custom_transform(index)
-            .ok_or_else(|| no_custom_stage("transform", index))?;
-        transform.apply(&mut graph, self.cx)?;
+        for &index in indices {
+            let transform = self
+                .pipeline
+                .custom_transform(index)
+                .ok_or_else(|| no_custom_stage("transform", index))?;
+            transform.apply(&mut graph, self.cx)?;
+        }
         Ok(graph)
     }
 
-    fn generate_target(
+    fn freeze_graph(&mut self, graph: &mut ApiGraph) -> Result<(), CoreError> {
+        self.frozen = Some(graph.clone());
+        Ok(())
+    }
+
+    fn generate_targets(
         &mut self,
-        index: usize,
-        graph: &ApiGraph,
+        indices: &[usize],
         artifacts: Vec<Artifact>,
     ) -> Result<Vec<Artifact>, CoreError> {
-        let target = self
-            .pipeline
-            .custom_target(index)
-            .ok_or_else(|| no_custom_stage("target", index))?;
+        let graph = self.frozen.as_ref().ok_or_else(|| CoreError::Protocol {
+            message: "a custom target ran before the frozen graph was handed over".to_string(),
+        })?;
         let mut out = Artifacts::from_files(artifacts);
-        out.begin_stage(format!("target[{index}]:{}", target.producer()));
-        target.generate(graph, &mut out, self.cx)?;
+        for &index in indices {
+            let target = self
+                .pipeline
+                .custom_target(index)
+                .ok_or_else(|| no_custom_stage("target", index))?;
+            out.begin_stage(format!("target[{index}]:{}", target.producer()));
+            target.generate(graph, &mut out, self.cx)?;
+        }
         Ok(out.into_files())
     }
 
-    fn run_post(
+    fn run_posts(
         &mut self,
-        index: usize,
+        indices: &[usize],
         artifacts: Vec<Artifact>,
     ) -> Result<Vec<Artifact>, CoreError> {
-        let post = self
-            .pipeline
-            .custom_post(index)
-            .ok_or_else(|| no_custom_stage("post-process", index))?;
         let mut out = Artifacts::from_files(artifacts);
-        out.begin_stage(format!("post[{index}]:{}", post.producer()));
-        post.run(&mut out, self.cx)?;
+        for &index in indices {
+            let post = self
+                .pipeline
+                .custom_post(index)
+                .ok_or_else(|| no_custom_stage("post-process", index))?;
+            out.begin_stage(format!("post[{index}]:{}", post.producer()));
+            post.run(&mut out, self.cx)?;
+        }
         Ok(out.into_files())
     }
 }
@@ -424,10 +580,11 @@ impl StageRunner for InProcessRunner<'_> {
 pub fn run_in_process(
     pipeline: &crate::sdk::Pipeline,
     cx: &Cx,
+    store: Option<&Store>,
 ) -> Result<PipelineOutcome, CoreError> {
     let plan = pipeline.plan();
     let mut runner = InProcessRunner::new(pipeline, cx);
-    run(&plan, cx, &mut runner)
+    run(&plan, cx, &mut runner, store)
 }
 
 /// Build `pipeline`'s post-transform graph in this process.
@@ -438,10 +595,11 @@ pub fn run_in_process(
 pub fn build_ir_in_process(
     pipeline: &crate::sdk::Pipeline,
     cx: &Cx,
+    store: Option<&Store>,
 ) -> Result<ApiGraph, CoreError> {
     let plan = pipeline.plan();
     let mut runner = InProcessRunner::new(pipeline, cx);
-    build_ir(&plan, cx, &mut runner)
+    build_ir(&plan, cx, &mut runner, store)
 }
 
 #[cfg(test)]
@@ -458,6 +616,7 @@ mod tests {
     #[derive(Default)]
     struct RecordingRunner {
         calls: Vec<String>,
+        frozen: Option<ApiGraph>,
     }
 
     impl StageRunner for RecordingRunner {
@@ -469,39 +628,54 @@ mod tests {
             })
         }
 
-        fn apply_transform(
+        fn apply_transforms(
             &mut self,
-            index: usize,
+            indices: &[usize],
             mut graph: ApiGraph,
         ) -> Result<ApiGraph, CoreError> {
-            self.calls.push(format!("transform[{index}]"));
-            graph.title = format!("{}+t{index}", graph.title);
+            self.calls.push(format!("transforms{indices:?}"));
+            for index in indices {
+                graph.title = format!("{}+t{index}", graph.title);
+            }
             Ok(graph)
         }
 
-        fn generate_target(
+        fn freeze_graph(&mut self, graph: &mut ApiGraph) -> Result<(), CoreError> {
+            self.calls.push("freeze".to_string());
+            self.frozen = Some(graph.clone());
+            Ok(())
+        }
+
+        fn generate_targets(
             &mut self,
-            index: usize,
-            graph: &ApiGraph,
+            indices: &[usize],
             mut artifacts: Vec<Artifact>,
         ) -> Result<Vec<Artifact>, CoreError> {
-            self.calls.push(format!("target[{index}]"));
-            artifacts.push(Artifact::new(
-                format!("generated/custom-{index}.md"),
-                format!("# {}\n", graph.title),
-            ));
+            self.calls.push(format!("targets{indices:?}"));
+            let title = self
+                .frozen
+                .as_ref()
+                .map_or("", |graph| graph.title.as_str());
+            for index in indices {
+                artifacts.push(Artifact::new(
+                    format!("generated/custom-{index}.md"),
+                    format!("# {title}\n"),
+                ));
+            }
             artifacts.sort_by(|a, b| a.path.cmp(&b.path));
             Ok(artifacts)
         }
 
-        fn run_post(
+        fn run_posts(
             &mut self,
-            index: usize,
+            indices: &[usize],
             mut artifacts: Vec<Artifact>,
         ) -> Result<Vec<Artifact>, CoreError> {
-            self.calls.push(format!("post[{index}]"));
-            for artifact in &mut artifacts {
-                artifact.text = format!("//post\n{}", artifact.text);
+            self.calls.push(format!("posts{indices:?}"));
+            for _ in indices {
+                for artifact in &mut artifacts {
+                    artifact.text = format!("//post\n{}", artifact.text);
+                }
             }
             Ok(artifacts)
         }
@@ -543,7 +717,7 @@ mod tests {
 
     #[test]
     fn a_plan_with_no_source_is_a_config_error() {
-        let err = build_ir(&StagePlan::default(), &cx(), &mut NoCustomStages).unwrap_err();
+        let err = build_ir(&StagePlan::default(), &cx(), &mut NoCustomStages, None).unwrap_err();
         assert!(matches!(err, CoreError::Config { .. }), "{err:?}");
     }
 
@@ -553,7 +727,7 @@ mod tests {
             .source(Custom(CustomSource))
             .source(Custom(CustomSource))
             .plan();
-        let err = build_ir(&plan, &cx(), &mut RecordingRunner::default()).unwrap_err();
+        let err = build_ir(&plan, &cx(), &mut RecordingRunner::default(), None).unwrap_err();
         assert!(err.to_string().contains("2 sources"), "{err}");
     }
 
@@ -567,11 +741,19 @@ mod tests {
             .target(Custom(CustomTarget))
             .plan();
         let mut runner = RecordingRunner::default();
-        let outcome = run(&plan, &cx(), &mut runner).unwrap();
+        let outcome = run(&plan, &cx(), &mut runner, None).unwrap();
 
+        // The two custom transforms are separated by a built-in, so they are two runs; a run of
+        // adjacent customs would have been one request.
         assert_eq!(
             runner.calls,
-            vec!["source[0]", "transform[0]", "transform[2]", "target[0]"]
+            vec![
+                "source[0]",
+                "transforms[0]",
+                "transforms[2]",
+                "freeze",
+                "targets[0]"
+            ]
         );
         assert_eq!(outcome.artifacts.len(), 1);
         assert_eq!(outcome.artifacts[0].path, "generated/custom-0.md");
@@ -583,6 +765,124 @@ mod tests {
         );
     }
 
+    /// Built-in targets are produced ahead of the loop that places them, so the set they land in
+    /// still has to refuse a path another stage already owns — and name that stage.
+    #[test]
+    fn a_builtin_target_that_lands_on_an_owned_path_is_refused_naming_its_owner() {
+        let plan = Pipeline::new()
+            .source(Custom(CustomSource))
+            .target(decl::OpenApi31::new().to("generated/openapi.yaml"))
+            .target(decl::OpenApi31::new().to("generated/openapi.yaml"))
+            .plan();
+        let err = run(&plan, &cx(), &mut RecordingRunner::default(), None).unwrap_err();
+        let CoreError::ArtifactOwnership {
+            code,
+            path,
+            producer,
+            message,
+        } = &err
+        else {
+            panic!("expected an ownership error, got {err:?}");
+        };
+        assert_eq!(code, "artifact.path_collision");
+        assert_eq!(path, "generated/openapi.yaml");
+        assert_eq!(producer, "target[1]:OpenApi31");
+        assert!(message.contains("target[0]:OpenApi31"), "{message}");
+    }
+
+    /// The same refusal when the path was claimed by a WORKER stage the host cannot see inside.
+    #[test]
+    fn a_builtin_target_that_lands_on_a_custom_targets_path_is_refused() {
+        struct ClaimsOpenApi;
+        impl Target for ClaimsOpenApi {
+            fn generate(
+                &self,
+                _ir: &ApiGraph,
+                _out: &mut Artifacts,
+                _cx: &Cx,
+            ) -> Result<(), gnr8::Error> {
+                Ok(())
+            }
+        }
+        struct ClaimingRunner;
+        impl StageRunner for ClaimingRunner {
+            fn load_source(&mut self, _index: usize) -> Result<ApiGraph, CoreError> {
+                Ok(ApiGraph::default())
+            }
+            fn apply_transforms(
+                &mut self,
+                _indices: &[usize],
+                graph: ApiGraph,
+            ) -> Result<ApiGraph, CoreError> {
+                Ok(graph)
+            }
+            fn freeze_graph(&mut self, _graph: &mut ApiGraph) -> Result<(), CoreError> {
+                Ok(())
+            }
+            fn generate_targets(
+                &mut self,
+                _indices: &[usize],
+                mut artifacts: Vec<Artifact>,
+            ) -> Result<Vec<Artifact>, CoreError> {
+                artifacts.push(Artifact::new("generated/openapi.yaml", "claimed"));
+                Ok(artifacts)
+            }
+            fn run_posts(
+                &mut self,
+                _indices: &[usize],
+                artifacts: Vec<Artifact>,
+            ) -> Result<Vec<Artifact>, CoreError> {
+                Ok(artifacts)
+            }
+        }
+        let plan = Pipeline::new()
+            .source(Custom(CustomSource))
+            .target(Custom(ClaimsOpenApi))
+            .target(decl::OpenApi31::new().to("generated/openapi.yaml"))
+            .plan();
+        let err = run(&plan, &cx(), &mut ClaimingRunner, None).unwrap_err();
+        assert!(
+            err.to_string().contains("already owned"),
+            "a built-in must not silently take a path a custom target claimed: {err}"
+        );
+    }
+
+    /// Built-in targets all start at once, so the one thing that must not move is where their files
+    /// land relative to the custom stages between them.
+    #[test]
+    fn builtin_target_files_land_in_plan_order_around_the_custom_ones() {
+        let plan = Pipeline::new()
+            .source(Custom(CustomSource))
+            .target(decl::OpenApi31::new().to("generated/a-openapi.yaml"))
+            .target(Custom(CustomTarget))
+            .target(decl::OpenApi31Json::new().to("generated/z-openapi.json"))
+            .plan();
+        let mut runner = RecordingRunner::default();
+        let outcome = run(&plan, &cx(), &mut runner, None).unwrap();
+        let paths: Vec<&str> = outcome
+            .artifacts
+            .iter()
+            .map(|artifact| artifact.path.as_str())
+            .collect();
+        assert_eq!(
+            paths,
+            vec![
+                "generated/a-openapi.yaml",
+                "generated/custom-1.md",
+                "generated/z-openapi.json"
+            ]
+        );
+        // The custom run saw the first built-in's file and none of the second's.
+        assert_eq!(runner.calls, vec!["source[0]", "freeze", "targets[1]"]);
+        let producers: Vec<&str> = outcome
+            .artifacts
+            .iter()
+            .map(|artifact| artifact.producer.as_str())
+            .collect();
+        assert_eq!(producers[0], "target[0]:OpenApi31");
+        assert_eq!(producers[2], "target[2]:OpenApi31Json");
+    }
+
     #[test]
     fn a_plan_without_custom_stages_never_calls_the_runner() {
         let plan = Pipeline::new()
@@ -591,7 +891,7 @@ mod tests {
             .plan();
         // The source is the only custom stage; nothing else may reach the runner.
         let mut runner = RecordingRunner::default();
-        run(&plan, &cx(), &mut runner).unwrap();
+        run(&plan, &cx(), &mut runner, None).unwrap();
         assert_eq!(runner.calls, vec!["source[0]"]);
     }
 
@@ -602,24 +902,26 @@ mod tests {
             fn load_source(&mut self, _index: usize) -> Result<ApiGraph, CoreError> {
                 Ok(ApiGraph::default())
             }
-            fn apply_transform(
+            fn apply_transforms(
                 &mut self,
-                _index: usize,
+                _indices: &[usize],
                 graph: ApiGraph,
             ) -> Result<ApiGraph, CoreError> {
                 Ok(graph)
             }
-            fn generate_target(
+            fn freeze_graph(&mut self, _graph: &mut ApiGraph) -> Result<(), CoreError> {
+                Ok(())
+            }
+            fn generate_targets(
                 &mut self,
-                _index: usize,
-                _graph: &ApiGraph,
+                _indices: &[usize],
                 _artifacts: Vec<Artifact>,
             ) -> Result<Vec<Artifact>, CoreError> {
                 Ok(vec![Artifact::new("../escape.txt", "x")])
             }
-            fn run_post(
+            fn run_posts(
                 &mut self,
-                _index: usize,
+                _indices: &[usize],
                 artifacts: Vec<Artifact>,
             ) -> Result<Vec<Artifact>, CoreError> {
                 Ok(artifacts)
@@ -630,7 +932,7 @@ mod tests {
             .source(Custom(CustomSource))
             .target(Custom(CustomTarget))
             .plan();
-        let err = run(&plan, &cx(), &mut EscapingRunner).unwrap_err();
+        let err = run(&plan, &cx(), &mut EscapingRunner, None).unwrap_err();
         assert!(
             matches!(err, CoreError::ArtifactOwnership { ref code, .. } if code == "artifact.path_invalid"),
             "{err:?}"
@@ -644,25 +946,27 @@ mod tests {
             fn load_source(&mut self, _index: usize) -> Result<ApiGraph, CoreError> {
                 Ok(ApiGraph::default())
             }
-            fn apply_transform(
+            fn apply_transforms(
                 &mut self,
-                _index: usize,
+                _indices: &[usize],
                 graph: ApiGraph,
             ) -> Result<ApiGraph, CoreError> {
                 Ok(graph)
             }
-            fn generate_target(
+            fn freeze_graph(&mut self, _graph: &mut ApiGraph) -> Result<(), CoreError> {
+                Ok(())
+            }
+            fn generate_targets(
                 &mut self,
-                _index: usize,
-                _graph: &ApiGraph,
+                _indices: &[usize],
                 _artifacts: Vec<Artifact>,
             ) -> Result<Vec<Artifact>, CoreError> {
                 // Answers with only its own file, discarding whatever the OpenAPI target produced.
                 Ok(vec![Artifact::new("generated/only-mine.md", "x")])
             }
-            fn run_post(
+            fn run_posts(
                 &mut self,
-                _index: usize,
+                _indices: &[usize],
                 artifacts: Vec<Artifact>,
             ) -> Result<Vec<Artifact>, CoreError> {
                 Ok(artifacts)
@@ -674,7 +978,7 @@ mod tests {
             .target(decl::OpenApi31::new().to("generated/openapi.yaml"))
             .target(Custom(CustomTarget))
             .plan();
-        let err = run(&plan, &cx(), &mut DroppingRunner).unwrap_err();
+        let err = run(&plan, &cx(), &mut DroppingRunner, None).unwrap_err();
         assert!(
             err.to_string().contains("never drop one"),
             "a dropped artifact would be deleted from disk as stale: {err}"
@@ -688,33 +992,37 @@ mod tests {
             fn load_source(&mut self, _index: usize) -> Result<ApiGraph, CoreError> {
                 Ok(ApiGraph::default())
             }
-            fn apply_transform(
+            fn apply_transforms(
                 &mut self,
-                _index: usize,
+                _indices: &[usize],
                 graph: ApiGraph,
             ) -> Result<ApiGraph, CoreError> {
                 Ok(graph)
             }
-            fn generate_target(
+            fn freeze_graph(&mut self, _graph: &mut ApiGraph) -> Result<(), CoreError> {
+                Ok(())
+            }
+            fn generate_targets(
                 &mut self,
-                _index: usize,
-                _graph: &ApiGraph,
+                indices: &[usize],
                 mut artifacts: Vec<Artifact>,
             ) -> Result<Vec<Artifact>, CoreError> {
-                self.0 += 1;
-                artifacts.push(Artifact::new(
-                    if self.0 == 1 {
-                        "out/File.txt"
-                    } else {
-                        "out/file.txt"
-                    },
-                    "x",
-                ));
+                for _ in indices {
+                    self.0 += 1;
+                    artifacts.push(Artifact::new(
+                        if self.0 == 1 {
+                            "out/File.txt"
+                        } else {
+                            "out/file.txt"
+                        },
+                        "x",
+                    ));
+                }
                 Ok(artifacts)
             }
-            fn run_post(
+            fn run_posts(
                 &mut self,
-                _index: usize,
+                _indices: &[usize],
                 artifacts: Vec<Artifact>,
             ) -> Result<Vec<Artifact>, CoreError> {
                 Ok(artifacts)
@@ -726,7 +1034,7 @@ mod tests {
             .target(Custom(CustomTarget))
             .target(Custom(CustomTarget))
             .plan();
-        let err = run(&plan, &cx(), &mut AliasRunner(0)).unwrap_err();
+        let err = run(&plan, &cx(), &mut AliasRunner(0), None).unwrap_err();
         assert!(
             matches!(err, CoreError::ArtifactOwnership { ref code, .. } if code == "artifact.path_collision"),
             "{err:?}"

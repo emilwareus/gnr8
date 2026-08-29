@@ -27,21 +27,30 @@ use std::sync::{Arc, Condvar, Mutex};
 use std::time::Duration;
 
 use gnr8::protocol::{
-    capability_digest, read_frame, sdk_version, write_frame, HostMessage, WorkerMessage,
-    PROTOCOL_VERSION,
+    capability_digest, read_frame, sdk_version, write_frame, Frame, GraphPatch, HeldGraph,
+    HostMessage, Patched, WorkerMessage, PROTOCOL_VERSION,
 };
 
 use crate::graph::ApiGraph;
 use crate::pipeline::StageRunner;
 use crate::sdk::{Artifact, Cx, StagePlan};
+use crate::store::Store;
 use crate::CoreError;
 
 pub use build::{
-    ensure_worker, stamp_path, validate_workspace, WorkerBinary, WorkerPolicy, Workspace,
+    ensure_worker, stamp_path, validate_workspace, WorkerBinary, WorkerOrigin, WorkerPolicy,
+    Workspace,
 };
 
 /// How much worker stderr is retained for an error message before truncation.
 pub const STDERR_CAPTURE_BYTES: usize = 1024 * 1024;
+
+/// How much of a frame the host asks the kernel to buffer in each session pipe.
+///
+/// One megabyte is the ceiling an unprivileged process gets on a stock Linux (`fs.pipe-max-size`),
+/// and it is comfortably above every frame a real pipeline sends.
+#[cfg(target_os = "linux")]
+const PIPE_BYTES: usize = 1024 * 1024;
 
 /// Default wall-clock budget for one worker session.
 pub const DEFAULT_TIMEOUT_SECS: u64 = 300;
@@ -163,7 +172,11 @@ pub struct WorkerSession {
     watchdog: Watchdog,
     plan: StagePlan,
     finished: bool,
-    built: bool,
+    origin: WorkerOrigin,
+    /// The graph vectors the worker holds — what every graph patch is measured against.
+    held_graph: HeldGraph,
+    /// The artifact set the worker holds — what every artifact patch is measured against.
+    held_artifacts: Vec<Artifact>,
 }
 
 impl WorkerSession {
@@ -173,7 +186,11 @@ impl WorkerSession {
     ///
     /// Returns [`CoreError::WorkerBuild`] for workspace/build failures and
     /// [`CoreError::WorkerRun`] for spawn, handshake, or protocol failures.
-    pub fn start(project_root: &std::path::Path, policy: WorkerPolicy) -> Result<Self, CoreError> {
+    pub fn start(
+        project_root: &std::path::Path,
+        policy: WorkerPolicy,
+        store: Option<&Store>,
+    ) -> Result<Self, CoreError> {
         let workspace = validate_workspace(project_root)?;
         if !policy.allow_execute {
             return Err(CoreError::WorkerRun {
@@ -185,9 +202,9 @@ impl WorkerSession {
                 ),
             });
         }
-        let binary = ensure_worker(&workspace, policy)?;
+        let binary = ensure_worker(&workspace, policy, store)?;
         let mut session = Self::start_binary(&workspace, &binary.path)?;
-        session.built = binary.built;
+        session.origin = binary.origin;
         Ok(session)
     }
 
@@ -222,6 +239,9 @@ impl WorkerSession {
             message: "the .gnr8 worker was started without a stderr pipe".to_string(),
         })?;
 
+        widen_pipe(&stdin);
+        widen_pipe(&stdout);
+
         let stderr = Arc::new(Mutex::new(StderrBuffer::default()));
         let drain = Arc::clone(&stderr);
         let stderr_thread = std::thread::spawn(move || drain_stderr(child_stderr, &drain));
@@ -239,7 +259,9 @@ impl WorkerSession {
             watchdog,
             plan: StagePlan::default(),
             finished: false,
-            built: false,
+            origin: WorkerOrigin::Reused,
+            held_graph: HeldGraph::default(),
+            held_artifacts: Vec::new(),
         };
         session.plan = session.handshake(&workspace.project_root)?;
         Ok(session)
@@ -252,7 +274,7 @@ impl WorkerSession {
             capability_digest: capability_digest(sdk_version()),
             project_root: project_root.to_string_lossy().into_owned(),
         };
-        self.send(&hello)?;
+        self.send(hello)?;
         match self.receive()? {
             WorkerMessage::Ready {
                 protocol,
@@ -296,10 +318,10 @@ impl WorkerSession {
         &self.plan
     }
 
-    /// Whether `cargo` was invoked to produce the binary this session is running.
+    /// How the binary this session is running was obtained.
     #[must_use]
-    pub const fn worker_built(&self) -> bool {
-        self.built
+    pub const fn worker_origin(&self) -> WorkerOrigin {
+        self.origin
     }
 
     /// Ask the worker to exit, then reap it.
@@ -314,7 +336,7 @@ impl WorkerSession {
     }
 
     fn shutdown_inner(&mut self) -> Result<(), CoreError> {
-        self.send(&HostMessage::Shutdown)?;
+        self.send(HostMessage::Shutdown)?;
         match self.receive()? {
             WorkerMessage::Done => Ok(()),
             WorkerMessage::Failed { message } => Err(self.worker_error(&message)),
@@ -339,18 +361,22 @@ impl WorkerSession {
         self.finished = true;
     }
 
-    fn send(&mut self, message: &HostMessage) -> Result<(), CoreError> {
+    /// Write one request, with the artifact text it carries lifted out of the JSON.
+    fn send(&mut self, message: HostMessage) -> Result<(), CoreError> {
+        let frame = message.into_frame();
         let stdin = self.stdin.as_mut().ok_or_else(|| CoreError::WorkerRun {
             message: "the .gnr8 worker session is already closed".to_string(),
         })?;
-        write_frame(stdin, message).map_err(|err| self.transport_error(&err.to_string()))
+        write_frame(stdin, &frame).map_err(|err| self.transport_error(&err.to_string()))
     }
 
+    /// Read one reply, putting the text the frame carried back on the artifacts that named it.
     fn receive(&mut self) -> Result<WorkerMessage, CoreError> {
         let stdout = self.stdout.as_mut().ok_or_else(|| CoreError::WorkerRun {
             message: "the .gnr8 worker session is already closed".to_string(),
         })?;
-        match read_frame::<_, WorkerMessage>(stdout) {
+        match read_frame::<_, WorkerMessage>(stdout).and_then(Frame::<WorkerMessage>::into_message)
+        {
             Ok(message) => Ok(message),
             Err(err) => Err(self.transport_error(&err.to_string())),
         }
@@ -399,10 +425,20 @@ impl WorkerSession {
         }
     }
 
-    fn expect_graph(&mut self, request: &HostMessage) -> Result<ApiGraph, CoreError> {
+    /// Send a request whose answer is a graph, and rebuild that graph from what the worker changed.
+    ///
+    /// The reply is measured against the graph the worker holds, which is the one this session last
+    /// recorded, so resolving it here is what keeps the two sides naming the same vectors.
+    fn expect_graph(&mut self, request: HostMessage) -> Result<ApiGraph, CoreError> {
         self.send(request)?;
         match self.receive()? {
-            WorkerMessage::Graph { graph } => Ok(graph),
+            WorkerMessage::Graph { graph } => {
+                let graph = graph
+                    .resolve(&self.held_graph)
+                    .map_err(|err| Self::protocol_error(err.to_string()))?;
+                self.held_graph = HeldGraph::of(&graph);
+                Ok(graph)
+            }
             WorkerMessage::Failed { message } => Err(self.worker_error(&message)),
             other => Err(Self::protocol_error(format!(
                 "expected a graph from the .gnr8 worker, got {}",
@@ -411,17 +447,63 @@ impl WorkerSession {
         }
     }
 
-    fn expect_artifacts(&mut self, request: &HostMessage) -> Result<Vec<Artifact>, CoreError> {
-        self.send(request)?;
+    /// Send a work request that carries an artifact set, and merge the worker's changes back into it.
+    ///
+    /// Neither side ships the whole set. The request describes it against the one the worker already
+    /// holds, and the worker answers with what its run changed; the host merges those changes into
+    /// the set it kept. `make_request` builds the frame from the patch so the two artifact-carrying
+    /// requests share one path.
+    fn expect_artifacts(
+        &mut self,
+        artifacts: Vec<Artifact>,
+        make_request: impl FnOnce(Patched<Artifact>) -> HostMessage,
+    ) -> Result<Vec<Artifact>, CoreError> {
+        let patch = Patched::of(&artifacts, &self.held_artifacts, |artifact| {
+            artifact.path.as_str()
+        });
+        // The worker holds what this frame describes the moment it is written, so record it before
+        // the reply is read: the reply's changes are merged into exactly this set.
+        self.held_artifacts = artifacts;
+        self.send(make_request(patch))?;
         match self.receive()? {
-            WorkerMessage::Artifacts { artifacts } => Ok(artifacts),
+            WorkerMessage::ArtifactChanges { changed } => {
+                let merged =
+                    merge_artifact_changes(std::mem::take(&mut self.held_artifacts), changed);
+                self.held_artifacts.clone_from(&merged);
+                Ok(merged)
+            }
             WorkerMessage::Failed { message } => Err(self.worker_error(&message)),
             other => Err(Self::protocol_error(format!(
-                "expected artifacts from the .gnr8 worker, got {}",
+                "expected artifact changes from the .gnr8 worker, got {}",
                 message_name(&other)
             ))),
         }
     }
+}
+
+/// Fold the worker's changes into the artifact set the host sent, keeping it sorted by path.
+///
+/// Both sides are sorted by path and a change is either a new path or a replacement for an existing
+/// one, so one merge walk rebuilds the finished set.
+fn merge_artifact_changes(sent: Vec<Artifact>, changed: Vec<Artifact>) -> Vec<Artifact> {
+    if changed.is_empty() {
+        return sent;
+    }
+    let mut merged = Vec::with_capacity(sent.len() + changed.len());
+    let mut sent = sent.into_iter().peekable();
+    for change in changed {
+        while sent.peek().is_some_and(|held| held.path < change.path) {
+            if let Some(held) = sent.next() {
+                merged.push(held);
+            }
+        }
+        if sent.peek().is_some_and(|held| held.path == change.path) {
+            sent.next();
+        }
+        merged.push(change);
+    }
+    merged.extend(sent);
+    merged
 }
 
 impl Drop for WorkerSession {
@@ -434,32 +516,64 @@ impl Drop for WorkerSession {
 
 impl StageRunner for WorkerSession {
     fn load_source(&mut self, index: usize) -> Result<ApiGraph, CoreError> {
-        self.expect_graph(&HostMessage::LoadSource { index })
+        self.expect_graph(HostMessage::LoadSource { index })
     }
 
-    fn apply_transform(&mut self, index: usize, graph: ApiGraph) -> Result<ApiGraph, CoreError> {
-        self.expect_graph(&HostMessage::ApplyTransform { index, graph })
-    }
-
-    fn generate_target(
+    fn apply_transforms(
         &mut self,
-        index: usize,
-        graph: &ApiGraph,
+        indices: &[usize],
+        mut graph: ApiGraph,
+    ) -> Result<ApiGraph, CoreError> {
+        let patch = GraphPatch::of(&mut graph, &self.held_graph);
+        // The worker holds this graph the moment the frame is written, and the caller is done with
+        // it, so its vectors are moved into the record rather than copied into one.
+        self.held_graph = HeldGraph::taken_from(graph);
+        self.expect_graph(HostMessage::ApplyTransforms {
+            indices: indices.to_vec(),
+            graph: patch,
+        })
+    }
+
+    fn freeze_graph(&mut self, graph: &mut ApiGraph) -> Result<(), CoreError> {
+        let patch = GraphPatch::of(graph, &self.held_graph);
+        // The frozen graph ends the transform phase: no further graph crosses, so both sides drop
+        // what they held on this same frame instead of keeping a copy alive for a frame that never
+        // comes. Dropping it in step is what keeps a later patch — were one ever added — measured
+        // against a vector both sides agree on.
+        self.held_graph = HeldGraph::default();
+        self.send(HostMessage::FreezeGraph { graph: patch })?;
+        match self.receive()? {
+            WorkerMessage::Done => Ok(()),
+            WorkerMessage::Failed { message } => Err(self.worker_error(&message)),
+            other => Err(Self::protocol_error(format!(
+                "the .gnr8 worker answered the frozen graph with {}",
+                message_name(&other)
+            ))),
+        }
+    }
+
+    fn generate_targets(
+        &mut self,
+        indices: &[usize],
         artifacts: Vec<Artifact>,
     ) -> Result<Vec<Artifact>, CoreError> {
-        self.expect_artifacts(&HostMessage::GenerateTarget {
-            index,
-            graph: graph.clone(),
+        let indices = indices.to_vec();
+        self.expect_artifacts(artifacts, |artifacts| HostMessage::GenerateTargets {
+            indices,
             artifacts,
         })
     }
 
-    fn run_post(
+    fn run_posts(
         &mut self,
-        index: usize,
+        indices: &[usize],
         artifacts: Vec<Artifact>,
     ) -> Result<Vec<Artifact>, CoreError> {
-        self.expect_artifacts(&HostMessage::RunPost { index, artifacts })
+        let indices = indices.to_vec();
+        self.expect_artifacts(artifacts, |artifacts| HostMessage::RunPosts {
+            indices,
+            artifacts,
+        })
     }
 }
 
@@ -467,11 +581,29 @@ fn message_name(message: &WorkerMessage) -> &'static str {
     match message {
         WorkerMessage::Ready { .. } => "a handshake",
         WorkerMessage::Graph { .. } => "a graph",
-        WorkerMessage::Artifacts { .. } => "artifacts",
+        WorkerMessage::ArtifactChanges { .. } => "artifact changes",
         WorkerMessage::Done => "a shutdown acknowledgement",
         WorkerMessage::Failed { .. } => "a failure",
     }
 }
+
+/// Ask the kernel to buffer up to [`PIPE_BYTES`] of one of the session's pipes.
+///
+/// A frame is a megabyte on a large project and a default pipe holds 64 KiB of it, so the two
+/// processes hand it over in sixteen fill-and-drain rounds, each one a wait on the other side. On
+/// the 332-artifact project that was 5.8ms of a warm run against 1.9ms with the whole frame in
+/// flight at once.
+///
+/// It is a hint, not a requirement: a kernel that refuses, a tightened `fs.pipe-max-size`, or a
+/// platform without the knob leaves the protocol exactly as correct and only as fast as the default
+/// buffer allows.
+#[cfg(target_os = "linux")]
+fn widen_pipe(pipe: &impl std::os::fd::AsFd) {
+    let _ = rustix::pipe::fcntl_setpipe_size(pipe, PIPE_BYTES);
+}
+
+#[cfg(not(target_os = "linux"))]
+fn widen_pipe<T>(_pipe: &T) {}
 
 /// Read the worker's stderr to EOF, keeping at most [`STDERR_CAPTURE_BYTES`].
 ///
@@ -506,8 +638,8 @@ fn drain_stderr(mut stream: std::process::ChildStderr, buffer: &Arc<Mutex<Stderr
 pub struct PipelineRun {
     /// What the pipeline produced.
     pub outcome: crate::pipeline::PipelineOutcome,
-    /// Whether `cargo` was invoked for this run.
-    pub worker_built: bool,
+    /// How this run obtained the worker binary it ran.
+    pub worker_origin: WorkerOrigin,
 }
 
 /// Run a complete generation for `project_root`: build/start the worker, run the plan, stop.
@@ -518,16 +650,17 @@ pub struct PipelineRun {
 pub fn run_pipeline(
     project_root: &std::path::Path,
     policy: WorkerPolicy,
+    store: Option<&Store>,
 ) -> Result<PipelineRun, CoreError> {
-    let mut session = WorkerSession::start(project_root, policy)?;
+    let mut session = WorkerSession::start(project_root, policy, store)?;
     let plan = session.plan().clone();
-    let worker_built = session.worker_built();
+    let worker_origin = session.worker_origin();
     let cx = Cx::new(project_root.to_path_buf());
-    let outcome = crate::pipeline::run(&plan, &cx, &mut session)?;
+    let outcome = crate::pipeline::run(&plan, &cx, &mut session, store)?;
     session.shutdown()?;
     Ok(PipelineRun {
         outcome,
-        worker_built,
+        worker_origin,
     })
 }
 
@@ -539,11 +672,12 @@ pub fn run_pipeline(
 pub fn inspect_pipeline(
     project_root: &std::path::Path,
     policy: WorkerPolicy,
+    store: Option<&Store>,
 ) -> Result<ApiGraph, CoreError> {
-    let mut session = WorkerSession::start(project_root, policy)?;
+    let mut session = WorkerSession::start(project_root, policy, store)?;
     let plan = session.plan().clone();
     let cx = Cx::new(project_root.to_path_buf());
-    let graph = crate::pipeline::build_ir(&plan, &cx, &mut session)?;
+    let graph = crate::pipeline::build_ir(&plan, &cx, &mut session, store)?;
     session.shutdown()?;
     Ok(graph)
 }
@@ -552,7 +686,48 @@ pub fn inspect_pipeline(
 mod tests {
     #![allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
 
-    use super::{StderrBuffer, STDERR_CAPTURE_BYTES};
+    use super::{merge_artifact_changes, StderrBuffer, STDERR_CAPTURE_BYTES};
+    use crate::sdk::Artifact;
+
+    fn artifact(path: &str, text: &str) -> Artifact {
+        Artifact::new(path, text)
+    }
+
+    /// Merging a reply must rebuild exactly the set the worker finished with.
+    #[test]
+    fn changes_replace_by_path_and_new_paths_land_in_order() {
+        let sent = vec![
+            artifact("a.txt", "a"),
+            artifact("c.txt", "c"),
+            artifact("e.txt", "e"),
+        ];
+        let changed = vec![
+            artifact("b.txt", "new-b"),
+            artifact("c.txt", "rewritten-c"),
+            artifact("f.txt", "new-f"),
+        ];
+        let merged = merge_artifact_changes(sent, changed);
+        let rendered: Vec<(&str, &str)> = merged
+            .iter()
+            .map(|item| (item.path.as_str(), item.text.as_str()))
+            .collect();
+        assert_eq!(
+            rendered,
+            vec![
+                ("a.txt", "a"),
+                ("b.txt", "new-b"),
+                ("c.txt", "rewritten-c"),
+                ("e.txt", "e"),
+                ("f.txt", "new-f"),
+            ]
+        );
+    }
+
+    #[test]
+    fn an_empty_reply_leaves_the_sent_set_alone() {
+        let sent = vec![artifact("a.txt", "a"), artifact("b.txt", "b")];
+        assert_eq!(merge_artifact_changes(sent.clone(), Vec::new()), sent);
+    }
 
     #[test]
     fn captured_stderr_is_bounded_and_says_so() {

@@ -9,6 +9,83 @@ must move the minor version.
 
 ## Unreleased
 
+### Added
+
+- **A machine-global cache, on by default, so a fresh checkout does not repeat work this machine has
+  already done.** A worker's build fingerprint and a Go source analysis's cache key both name their
+  complete input surface and no path, so two checkouts of one project ask the same question. gnr8 now
+  keeps those answers in one content-addressed store — `$XDG_CACHE_HOME/gnr8/store` (`~/.cache/...`),
+  `~/Library/Caches/gnr8/store` on macOS, `%LOCALAPPDATA%\gnr8\store` on Windows — and a checkout
+  with nothing of its own restores from it instead of compiling and extracting again.
+
+  Measured on an 8-core Linux machine against a 4,836-artifact / 251-source-file Go project, median
+  of repeated runs, every run reporting `0 written, 4836 unchanged` with a clean `git status`:
+
+  | first `generate` in a fresh worktree | before | now | |
+  |---|---:|---:|---:|
+  | sources this machine has already analyzed | 22.5 s | 0.86 s | **26x** |
+  | a different commit, same `.gnr8/` — worker restored, analysis recomputed | 22.5 s | 5.6 s | **4.0x** |
+  | nothing in the store yet | 22.5 s | 21.4 s | unchanged |
+  | `GNR8_CACHE_STORE=off` | 22.5 s | 21.5 s | unchanged |
+
+  A warm run never reaches the store — the checkout's own stamp and cache still answer first — and
+  measures the same as before (0.617 s → 0.611 s over eight interleaved samples each, noise).
+
+  `GNR8_CACHE_STORE` is the whole configuration surface: an absolute path names the store, `off`
+  (or `disabled`/`none`) turns sharing off and leaves each checkout with only its own `.gnr8/cache`,
+  and anything gnr8 cannot resolve as a location simply means no sharing for that run.
+
+  Sharing is safe for one reason: an entry is filed under the key the derivation already computes and
+  records that key inside itself, so it can only ever be returned for the exact question it answered —
+  a different gnr8 version, `.gnr8/Cargo.lock`, Go toolchain, or source byte is a different key and a
+  miss. A derivation whose key cannot name everything it read is never shared at all: a `.gnr8/` crate
+  that depends on a directory by a path written RELATIVE to it compiles bytes the fingerprint never
+  hashes, and different ones in every checkout, so it is built and stamped in that checkout exactly as
+  before and nothing is published.
+
+  A restored worker binary is additionally re-hashed against the length and digest its entry
+  recorded before it is moved into place; a mismatch deletes the entry and builds. Only those two
+  artifacts are shared: the ownership manifest and the `gofmt` memo describe one checkout rather than
+  an answer, and stay in `.gnr8/cache`.
+
+  The store is user-owned local state at the trust level of `~/.cargo/registry`, created private to
+  the invoking user (`0700` on Unix). Nothing about it can fail a run: a store that is missing,
+  unwritable, full, or holding an unreadable entry is a miss. Deleting it is always safe.
+
+- **`gnr8 generate -v` and `--json` report `worker: restored`** alongside `built` and `reused`, which
+  is the third and only other way a run can obtain a worker binary.
+
+### Changed
+
+- **`gnr8 generate` and `gnr8 check` are 10-35x faster on an unchanged project, and generation from
+  scratch is faster on a large one.** Nothing about what gets generated changed: every committed
+  example is byte-identical, and both benchmark projects report `0 written` with a clean working
+  tree after a warm run.
+
+  Measured on an 8-core machine (Linux, `GOTOOLCHAIN=go1.27.0`), median of repeated runs, against
+  the released 0.10.0 host:
+
+  | project | run | 0.10.0 | now | |
+  |---|---|---:|---:|---:|
+  | 332 artifacts, 77 source files | cold generate | 15.04 s | 18.44 s | 0.82x |
+  | | warm generate | 2.42 s | 0.22 s | **11.0x** |
+  | | warm check | 2.17 s | 0.21 s | **10.1x** |
+  | 4,836 artifacts, 251 source files | cold generate | 35.28 s | 19.96 s | **1.77x** |
+  | | warm generate | 20.94 s | 0.59 s | **35.5x** |
+  | | warm check | 9.40 s | 0.52 s | **18.3x** |
+
+  Where the time went, in order of what it was worth: the host now runs every built-in stage itself
+  and asks the worker only for the user's own stages, one request per consecutive run of them; the
+  graph and the artifact set cross that boundary as what CHANGED rather than whole, with a generated
+  file's text carried beside the JSON rather than escaped into it; SDK emission, input hashing,
+  artifact reads and output-path inspection are spread across the cores; a warm run answers with the
+  paths it touched and publishes a manifest only when one changed; and the built-in targets are
+  produced while the worker works.
+
+  The one regression is generation from scratch on a SMALL project, and it is a deliberate trade:
+  the worker and its dependencies are now compiled optimized, which costs 4.7 s of first build and
+  is worth 1.5-1.8x on every warm run after it.
+
 ## 0.10.0 — 2026-08-28
 
 ### Breaking

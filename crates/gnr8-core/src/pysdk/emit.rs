@@ -32,11 +32,10 @@ use crate::graph::{
     Prim, RuntimePolicy, Type,
 };
 use crate::sdk::emit_common::{
-    check_unique_schema_names, error_response_bodies_of, is_json_object_key, join_path,
-    operation_auth_alternatives, operation_prose, path_tokens, path_tokens_match,
-    quoted_string_literal, request_body_model_of, split_words, success_responses_of,
-    ApiKeyLocation, HttpAuthScheme, OperationApiKeyScheme, OperationAuthScheme,
-    RequestBodyEncoding,
+    error_response_bodies_of, is_json_object_key, join_path, operation_auth_alternatives,
+    operation_prose, path_tokens, path_tokens_match, quoted_string_literal, request_body_model_of,
+    split_words, success_responses_of, ApiKeyLocation, HttpAuthScheme, OperationApiKeyScheme,
+    OperationAuthScheme, RequestBodyEncoding, UniqueSchemaNames,
 };
 use crate::sdk::model_style::PyModelStyle;
 use crate::CoreError;
@@ -499,7 +498,7 @@ pub(crate) fn emit_models_with_style(
     _package: &str,
     model_style: PyModelStyle,
 ) -> Result<String, CoreError> {
-    check_unique_schema_names(graph, "Python SDK")?;
+    UniqueSchemaNames::check(graph, "Python SDK")?;
 
     let directions = schema_directions(graph);
     let schema_refs: Vec<(&crate::graph::Schema, SchemaDirections)> = graph

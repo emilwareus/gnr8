@@ -19,7 +19,7 @@ use std::path::PathBuf;
 use std::process::Command;
 
 use crate::analyze::facts;
-use crate::manifest::blake3_hex;
+use crate::manifest::{blake3_file, blake3_hex};
 use crate::CoreError;
 
 /// The directory of the `goextract` Go module, resolved relative to this crate's
@@ -97,7 +97,7 @@ pub(crate) fn resolve_target(target_dir: &str) -> Result<String, CoreError> {
 /// One value, resolved once, used for both the cache key and the extraction — so the key can
 /// never describe a different helper than the one that produced the facts (CLAUDE.md rule 3).
 pub(crate) struct ExtractorIdentity {
-    /// The analyzed module's `go env GOVERSION GOOS GOARCH GOFLAGS GOTOOLCHAIN` reading.
+    /// The analyzed module's `go env GOVERSION GOOS GOARCH GOFLAGS CGO_ENABLED GOTOOLCHAIN` reading.
     toolchain: GoToolchain,
     /// The resolved path of the compiled helper that will run.
     binary: PathBuf,
@@ -150,13 +150,12 @@ impl ExtractorIdentity {
 pub(crate) fn goextract_identity(target_dir: &str) -> Result<ExtractorIdentity, CoreError> {
     let toolchain = go_toolchain("go", target_dir)?;
     let binary = goextract_binary("go", &toolchain)?;
-    let bytes = std::fs::read(&binary).map_err(|source| CoreError::Io {
+    let (_, binary_hash) = blake3_file(&binary).map_err(|source| CoreError::Io {
         message: format!(
             "failed to read the compiled goextract helper {} for the extraction identity: {source}",
             binary.display()
         ),
     })?;
-    let binary_hash = blake3_hex(&bytes);
     Ok(ExtractorIdentity {
         toolchain,
         binary,
@@ -256,9 +255,12 @@ struct GoToolchain {
     version: String,
     /// The caller's effective `GOTOOLCHAIN` selection policy.
     selection: String,
-    /// The full `GOVERSION`/`GOOS`/`GOARCH`/`GOFLAGS`/`GOTOOLCHAIN` reading, which keys the binary
-    /// cache. The policy is part of the key so a binary built while downloads were allowed cannot
-    /// bypass a later `local` or `path` run.
+    /// The full `GOVERSION`/`GOOS`/`GOARCH`/`GOFLAGS`/`CGO_ENABLED`/`GOTOOLCHAIN` reading, which
+    /// keys the binary cache. The policy is part of the key so a binary built while downloads were
+    /// allowed cannot bypass a later `local` or `path` run. `CGO_ENABLED` is there because it is a
+    /// build constraint like `GOOS`: it decides whether the cgo-gated files of a package compile,
+    /// and therefore which types the analysis sees. `GOTOOLCHAIN` stays LAST because
+    /// [`GoToolchain::selection`] reads the final line.
     identity: String,
 }
 
@@ -270,6 +272,7 @@ fn go_toolchain(go_bin: &str, target_dir: &str) -> Result<GoToolchain, CoreError
             "GOOS",
             "GOARCH",
             "GOFLAGS",
+            "CGO_ENABLED",
             "GOTOOLCHAIN",
         ])
         .current_dir(target_dir)

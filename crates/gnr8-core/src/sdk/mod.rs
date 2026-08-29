@@ -29,9 +29,7 @@ pub use gnr8::sdk::{
 };
 pub use gnr8::sdk::{Target, Transform};
 
-use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
-use std::time::UNIX_EPOCH;
 use unicode_casefold::UnicodeCaseFold;
 use unicode_normalization::UnicodeNormalization;
 
@@ -65,7 +63,10 @@ pub(crate) fn portable_path_identity(path: &str) -> Result<String, String> {
     if path.is_empty() {
         return Err("path is empty".to_string());
     }
-    if path.nfc().collect::<String>() != path {
+    // ASCII is already NFC, so normalizing it is provably the identity. Skipping the walk matters:
+    // a generation asks this question tens of thousands of times, and essentially every real output
+    // path is ASCII.
+    if !path.is_ascii() && path.nfc().collect::<String>() != path {
         return Err("path must use Unicode NFC normalization".to_string());
     }
     if path.starts_with('/') || path.ends_with('/') || path.contains('\\') {
@@ -125,8 +126,14 @@ pub(crate) fn portable_path_identity(path: &str) -> Result<String, String> {
             ));
         }
 
-        let folded = component.case_fold().collect::<String>();
-        identity.push(folded.nfc().collect::<String>());
+        // Full case folding maps A-Z to a-z and leaves every other ASCII character alone — no ASCII
+        // character folds to a longer or non-ASCII one — and the result is again ASCII, hence again
+        // NFC. So for an ASCII component the two Unicode passes are exactly `to_ascii_lowercase`.
+        identity.push(if component.is_ascii() {
+            component.to_ascii_lowercase()
+        } else {
+            component.case_fold().collect::<String>().nfc().collect()
+        });
     }
     Ok(identity.join("/"))
 }
@@ -144,187 +151,62 @@ pub fn validate_openapi_artifact(text: &str, path: &Path) -> Result<(), CoreErro
     openapi_source::validate_openapi_artifact(text, path)
 }
 
-pub(crate) fn hash_files(files: &[PathBuf], root: &Path) -> String {
-    let mut hasher = blake3::Hasher::new();
+/// `base` joined with `path`, folding `.` and `..` textually rather than through the filesystem.
+///
+/// The question both callers ask is which directory a manifest NAMES — a Cargo `path` dependency, a
+/// `go.mod` replacement — so that they can tell a location inside the tree they hash from one
+/// outside it. Textual, because it must answer for a directory that does not exist yet and must not
+/// resolve symlinks (that would make two different declarations look like one). A `..` that walks
+/// off the root keeps the accumulated prefix and therefore fails the containment test it is asked
+/// for, which is the conservative answer.
+pub(crate) fn resolved_lexically(base: &Path, path: &Path) -> PathBuf {
+    let mut out = base.to_path_buf();
+    for part in path.components() {
+        match part {
+            std::path::Component::CurDir => {}
+            std::path::Component::ParentDir => {
+                out.pop();
+            }
+            other => out.push(other.as_os_str()),
+        }
+    }
+    out
+}
+
+/// The digest recorded for a path this run could not read.
+///
+/// A file that vanished between the walk and the read is a real change to the input surface, so it
+/// gets a distinct, stable value rather than being skipped.
+const UNREADABLE_FILE: &str = "<missing>";
+
+/// One digest over `files` and their contents, relative to `root`.
+///
+/// Every file is read and hashed: content is the truth about whether an input changed, and a
+/// metadata proxy would let a restored backup or a same-length rewrite pass as unchanged. The reads
+/// are spread across the machine's cores because on a large module this is thousands of them —
+/// 4,165 files was 70ms of every run — and [`crate::parallel::map_ordered`] keeps the sequence, and
+/// therefore the digest, independent of how many cores did the reading.
+///
+/// # Errors
+///
+/// Returns [`CoreError::SdkGen`] only if a reader thread stopped unexpectedly. The caller treats
+/// that as "no cache key for this run", which recomputes rather than trusting a partial answer.
+pub(crate) fn hash_files(files: &[PathBuf], root: &Path) -> Result<String, CoreError> {
     let mut sorted = files.to_vec();
     sorted.sort();
-    let mut cache = FileHashCacheState::load(root, FileHashCacheScope::Inputs);
-    for path in sorted {
-        let rel = path.strip_prefix(root).unwrap_or(&path);
+    let digests = crate::parallel::map_ordered(&sorted, |path| {
+        Ok(std::fs::read(path)
+            .map_or_else(|_| UNREADABLE_FILE.to_string(), |bytes| blake3_hex(&bytes)))
+    })?;
+    let mut hasher = blake3::Hasher::new();
+    for (path, digest) in sorted.iter().zip(&digests) {
+        let rel = path.strip_prefix(root).unwrap_or(path);
         hasher.update(rel.to_string_lossy().as_bytes());
         hasher.update(b"\0");
-        hasher.update(cache.hash_path(&path).as_bytes());
+        hasher.update(digest.as_bytes());
         hasher.update(b"\0");
     }
-    cache.save();
-    hasher.finalize().to_hex().to_string()
-}
-
-/// Build metadata-only stamps for project files.
-#[must_use]
-pub fn stamp_project_paths(root: &Path, paths: &[PathBuf]) -> Option<Vec<FileStamp>> {
-    stamp_project_paths_with_scope(root, paths, FileHashCacheScope::Inputs)
-}
-
-/// Build content-hashed stamps for generated output files.
-#[must_use]
-pub fn stamp_project_output_paths(root: &Path, paths: &[PathBuf]) -> Option<Vec<FileStamp>> {
-    stamp_project_paths_with_scope(root, paths, FileHashCacheScope::Outputs)
-}
-
-fn stamp_project_paths_with_scope(
-    root: &Path,
-    paths: &[PathBuf],
-    scope: FileHashCacheScope,
-) -> Option<Vec<FileStamp>> {
-    let mut stamps = Vec::with_capacity(paths.len());
-    let mut cache = FileHashCacheState::load(root, scope);
-    for path in paths {
-        let metadata = path.metadata().ok()?;
-        if !metadata.is_file() {
-            return None;
-        }
-        let hash = cache.hash_path(path);
-        stamps.push(FileStamp {
-            path: project_relative_path(root, path),
-            len: metadata.len(),
-            modified_ns: modified_ns(&metadata),
-            hash,
-        });
-    }
-    cache.save();
-    stamps.sort();
-    Some(stamps)
-}
-
-#[derive(Debug, Default, serde::Serialize, serde::Deserialize)]
-struct FileHashCache {
-    entries: BTreeMap<String, FileHashCacheEntry>,
-}
-
-#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
-struct FileHashCacheEntry {
-    len: u64,
-    modified_ns: u128,
-    hash: String,
-}
-
-struct FileHashCacheState {
-    path: Option<PathBuf>,
-    root: PathBuf,
-    cache: FileHashCache,
-    dirty: bool,
-}
-
-#[derive(Clone, Copy)]
-enum FileHashCacheScope {
-    Inputs,
-    Outputs,
-}
-
-impl FileHashCacheState {
-    fn load(root: &Path, scope: FileHashCacheScope) -> Self {
-        let path = file_hash_cache_path(root, scope);
-        let cache = path
-            .as_ref()
-            .and_then(|path| std::fs::read(path).ok())
-            .and_then(|bytes| serde_json::from_slice(&bytes).ok())
-            .unwrap_or_default();
-        Self {
-            path,
-            root: root.to_path_buf(),
-            cache,
-            dirty: false,
-        }
-    }
-
-    fn hash_path(&mut self, path: &Path) -> String {
-        let key = path
-            .strip_prefix(&self.root)
-            .unwrap_or(path)
-            .to_string_lossy()
-            .replace('\\', "/");
-        let Ok(metadata) = std::fs::metadata(path) else {
-            if self.cache.entries.remove(&key).is_some() {
-                self.dirty = true;
-            }
-            return "<missing>".to_string();
-        };
-        let fingerprint = FileHashFingerprint::from_metadata(&metadata);
-        let hash = match std::fs::read(path) {
-            Ok(bytes) => blake3_hex(&bytes),
-            Err(_) => "<missing>".to_string(),
-        };
-        self.cache.entries.insert(
-            key,
-            FileHashCacheEntry {
-                len: fingerprint.len,
-                modified_ns: fingerprint.modified_ns,
-                hash: hash.clone(),
-            },
-        );
-        self.dirty = true;
-        hash
-    }
-
-    fn save(&self) {
-        if !self.dirty {
-            return;
-        }
-        let Some(path) = &self.path else {
-            return;
-        };
-        let Some(parent) = path.parent() else {
-            return;
-        };
-        if std::fs::create_dir_all(parent).is_err() {
-            return;
-        }
-        let Ok(bytes) = serde_json::to_vec(&self.cache) else {
-            return;
-        };
-        let _ = std::fs::write(path, bytes);
-    }
-}
-
-struct FileHashFingerprint {
-    len: u64,
-    modified_ns: u128,
-}
-
-impl FileHashFingerprint {
-    fn from_metadata(metadata: &std::fs::Metadata) -> Self {
-        Self {
-            len: metadata.len(),
-            modified_ns: modified_ns(metadata),
-        }
-    }
-}
-
-fn modified_ns(metadata: &std::fs::Metadata) -> u128 {
-    metadata
-        .modified()
-        .ok()
-        .and_then(|modified| modified.duration_since(UNIX_EPOCH).ok())
-        .map_or(0, |duration| duration.as_nanos())
-}
-
-fn project_relative_path(root: &Path, path: &Path) -> String {
-    path.strip_prefix(root)
-        .unwrap_or(path)
-        .to_string_lossy()
-        .replace('\\', "/")
-}
-
-fn file_hash_cache_path(root: &Path, scope: FileHashCacheScope) -> Option<PathBuf> {
-    let gnr8_dir = root.join(crate::lifecycle::WORKSPACE_DIR);
-    let file_name = match scope {
-        FileHashCacheScope::Inputs => "input-file-hashes.json",
-        FileHashCacheScope::Outputs => "output-file-hashes.json",
-    };
-    gnr8_dir
-        .is_dir()
-        .then(|| gnr8_dir.join("cache").join(file_name))
+    Ok(hasher.finalize().to_hex().to_string())
 }
 
 /// Validate every artifact path in a completed set against the filesystems gnr8 supports.

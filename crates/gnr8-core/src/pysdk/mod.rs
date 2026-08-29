@@ -20,9 +20,9 @@ use crate::graph::direction::{directions_of, schema_directions};
 use crate::graph::{ApiGraph, Operation};
 use crate::sdk::bundle::{check_unique_file_names, SdkBundle, SdkFile};
 use crate::sdk::emit_common::{
-    api_key_credential_names, check_unique_model_file_names, check_unique_schema_names, file_stem,
-    http_auth_features, model_file_name, operation_file_name, operation_group_file_name,
-    operation_group_name, validate_sdk_base_path,
+    api_key_credential_names, check_unique_model_file_names, file_stem, http_auth_features,
+    model_file_name, operation_file_name, operation_group_file_name, operation_group_name,
+    validate_sdk_base_path, UniqueSchemaNames,
 };
 use crate::sdk::layout::{OperationFileSplit, SdkFileLayout};
 use crate::sdk::model_style::PyModelStyle;
@@ -105,7 +105,7 @@ pub(crate) fn generate_files_with_options(
     model_style: PyModelStyle,
 ) -> Result<Vec<SdkFile>, crate::CoreError> {
     validate_sdk_base_path(base_path)?;
-    check_unique_schema_names(graph, "Python SDK")?;
+    UniqueSchemaNames::check(graph, "Python SDK")?;
     check_unique_model_file_names(graph, "Python SDK", layout, |schema| {
         format!("{}.py", file_stem(&schema.name))
     })?;
@@ -214,7 +214,24 @@ pub(crate) fn generate_files_with_options(
         // One walk for the whole bundle: the positions a schema is reached from are a property of the
         // graph, not of the file it lands in.
         let directions = schema_directions(graph);
-        for schema in &graph.schemas {
+        // `python_relative_module` reads its `from` argument only as a directory, so the map from
+        // model name to import module is a property of the DIRECTORY a model file lands in, not of
+        // the model. Building it per schema made a 1,576-model SDK construct the same 1,576-entry
+        // map 1,576 times — 2.5M string clones for one directory's worth of answers.
+        let mut dep_modules_by_dir: BTreeMap<String, BTreeMap<String, String>> = BTreeMap::new();
+        for name in schema_file_names.values() {
+            let from_dir = name.rsplit_once('/').map_or("", |(dir, _)| dir).to_string();
+            dep_modules_by_dir.entry(from_dir).or_insert_with(|| {
+                schema_file_names
+                    .iter()
+                    .map(|(model, file)| (model.clone(), python_relative_module(name, file)))
+                    .collect()
+            });
+        }
+        // Each model file is a pure function of the frozen graph and its own schema, so they render
+        // across the machine's cores; `map_ordered` fills the result by index, leaving the emitted
+        // sequence — and the bytes — independent of how many cores rendered it.
+        files.extend(crate::parallel::map_ordered(&graph.schemas, |schema| {
             let name = schema_file_names
                 .get(&schema.name)
                 .ok_or_else(|| crate::CoreError::SdkGen {
@@ -224,21 +241,22 @@ pub(crate) fn generate_files_with_options(
                     ),
                 })?
                 .clone();
-            let dep_modules: BTreeMap<String, String> = schema_file_names
-                .iter()
-                .map(|(model, file)| (model.clone(), python_relative_module(&name, file)))
-                .collect();
-            files.push(SdkFile {
-                name,
-                contents: emit::emit_model_schema(
-                    graph,
-                    schema,
-                    model_style,
-                    &dep_modules,
-                    directions_of(&directions, &schema.id),
-                )?,
-            });
-        }
+            let from_dir = name.rsplit_once('/').map_or("", |(dir, _)| dir);
+            let dep_modules =
+                dep_modules_by_dir
+                    .get(from_dir)
+                    .ok_or_else(|| crate::CoreError::SdkGen {
+                        message: format!("schema {} did not have a module map", schema.name),
+                    })?;
+            let contents = emit::emit_model_schema(
+                graph,
+                schema,
+                model_style,
+                dep_modules,
+                directions_of(&directions, &schema.id),
+            )?;
+            Ok(SdkFile { name, contents })
+        })?);
     } else {
         files.push(SdkFile {
             name: "models.py".to_string(),

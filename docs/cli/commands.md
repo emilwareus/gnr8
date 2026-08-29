@@ -8,7 +8,8 @@ Run commands from the application repository root. Global options are:
 ```text
 --json          emit machine-readable output and suppress progress text
 -v, --verbose   show more detail; repeat for additional verbosity
---no-build      never invoke cargo; require an already-built, matching .gnr8 worker
+--no-build      never produce a worker binary here (no cargo, no shared-cache restore);
+                require a matching one this checkout already built
 --no-execute    never build and never run the .gnr8 worker
 -h, --help      print help for the selected command
 -V, --version   print the CLI version
@@ -86,8 +87,8 @@ protected. Any protected output makes the command exit non-zero after reporting 
   ownership manifest records. It never deletes unrelated files merely because they share an output
   directory.
 
-JSON includes changed-file groups, counts, timings, diagnostics, whether the worker was `built` or
-`reused` for this run, and input/output counts.
+JSON includes changed-file groups, counts, timings, diagnostics, how the worker was obtained for this
+run (`built`, `reused` from this checkout's stamp, or `restored` from the machine-global store), and input/output counts.
 
 ## `watch`
 

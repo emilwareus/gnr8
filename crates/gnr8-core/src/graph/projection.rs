@@ -23,6 +23,23 @@ const OUTPUT_ID_SUFFIX: &str = "::output";
 const INPUT_NAME_SUFFIX: &str = "Input";
 const OUTPUT_NAME_SUFFIX: &str = "Output";
 
+/// The generation-ready graph, taking `graph` itself when the projection changes nothing.
+///
+/// [`for_generation`] answers with a borrow when no schema needs splitting, which is the common
+/// case; a caller that needs to OWN the result would then copy a graph to learn it was already the
+/// answer. This hands the original back instead.
+///
+/// # Errors
+///
+/// Propagates [`for_generation`]'s identity-collision failure.
+pub(crate) fn into_generation(graph: ApiGraph) -> Result<ApiGraph, CoreError> {
+    let projected = match for_generation(&graph)? {
+        Cow::Borrowed(_) => None,
+        Cow::Owned(projected) => Some(projected),
+    };
+    Ok(projected.unwrap_or(graph))
+}
+
 /// The exact directional contract artifact generators consume.
 ///
 /// Borrows when nothing splits, which is both the common shape and what an ALREADY-projected graph

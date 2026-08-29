@@ -243,8 +243,55 @@ invoke cargo; `--no-execute` refuses to build *or* run. `gnr8 inspect routes <pa
 **Worker reuse.** `.gnr8/cache/worker.json` records a fingerprint over every file under `.gnr8/`
 (except `target/` and `cache/`), the host executable's own content hash, and the protocol constants,
 plus the built binary's hash. If all of that still matches, the recorded binary *is* the build output
-of those inputs and cargo is not invoked. `gnr8 generate -v` reports `worker: reused` or
-`worker: built`.
+of those inputs and cargo is not invoked. `gnr8 generate -v` reports `worker: reused`,
+`worker: restored`, or `worker: built`.
+
+**The shared cache.** That fingerprint names inputs, not a location, so a second checkout of the same
+project asks the same question. gnr8 keeps the answers in one machine-global store — by default
+`$XDG_CACHE_HOME/gnr8/store` (`~/.cache/gnr8/store`), `~/Library/Caches/gnr8/store` on macOS, or
+`%LOCALAPPDATA%\gnr8\store` on Windows — so a fresh worktree restores the worker the previous one
+built instead of compiling it again, and reuses a Go source analysis it has already performed. On a
+4,836-artifact project a fresh worktree's first `generate` went from 22.5 s to 0.9 s when this machine
+had already analyzed the same sources, and to 5.6 s when only the worker was shared.
+
+Two rules make sharing safe. Every entry is stored under the key the derivation already computes over
+its complete input surface, and records that key inside itself, so an entry can only ever be returned
+for the exact question it answered — a differing `.gnr8/Cargo.lock`, gnr8 version, Go toolchain, or
+source byte is a different key and a miss. And every restored binary is re-hashed against the length
+and digest the entry recorded before it is moved into place; a mismatch deletes the entry and builds.
+
+Commit `.gnr8/Cargo.lock`. It pins what the worker compiles, so it is part of the key: a checkout
+that arrives without one asks a different question and shares nothing until it has built its own.
+
+A derivation whose key cannot name its whole input surface is never shared at all. If `.gnr8/Cargo.toml`
+depends on a crate by a path written relative to it (`helpers = { path = "../helpers" }`), that names
+a directory the fingerprint never hashes — and a different one in every checkout — so the worker is
+built and stamped in this checkout exactly as before and nothing is published. Writing that
+dependency as an absolute path, or keeping it inside `.gnr8/`, keeps it shareable. (A Go `replace`
+that points at a local directory needs no such care: the source key hashes that directory too.)
+A cargo `[patch]`, `[replace]` or `paths` override does the same from outside every checkout —
+`.gnr8/` does not change by a byte, lockfile included, while the sources the build compiles do — so
+a config declaring one, in the project's `.cargo/`, any ancestor's, or `$CARGO_HOME`'s, disables
+sharing for that run. The check is deliberately conservative: it does not ask which package is
+redirected, and a config it cannot read, cannot parse, or that `include`s another file counts as one.
+
+The store is one user's state on one machine, at the trust level of `~/.cargo/registry`. gnr8 creates
+it private to you (`0700` on Unix), never shares it between users, machines, or over a network, and
+never fails a run over it: a missing, unwritable, full, or corrupt store is a miss. Deleting it is
+always safe, and nothing evicts entries — see
+[artifacts and CI](operations/artifacts-and-ci.md#the-machine-global-store) for the trust boundary a
+content hash cannot cross, and point `GNR8_CACHE_STORE` at local storage only you can write.
+
+| `GNR8_CACHE_STORE` | Effect |
+|---|---|
+| unset | share through the platform cache directory (the default) |
+| an absolute path | share through that directory |
+| `off`, `disabled`, `none` | do not share — each checkout uses only its own `.gnr8/cache` |
+| anything else | not a location gnr8 can resolve, so sharing is off for that run |
+
+Only the two provably portable artifacts are shared: the built worker binary and the Go source
+analysis. The ownership manifest, the generation lock and the `gofmt` memo stay in `.gnr8/cache`,
+because they describe *this* checkout rather than an answer to a content-addressed question.
 
 ## Supported source frontends (the honest envelope)
 gnr8 supports four source frontends across three languages. Each row states what is actually recognized

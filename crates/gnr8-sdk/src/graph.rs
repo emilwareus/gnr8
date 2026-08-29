@@ -54,7 +54,7 @@ pub fn split_local_component_ref(reference: &str) -> Option<(String, Option<&str
 /// plain metadata that a [`crate::sdk::Transform`] sets and a [`crate::sdk::Target`] reads, then passes
 /// to the existing lowering and SDK emitters. They default to a root-mounted, untitled, unsecured API
 /// with no runtime helpers, so a bare `build_graph` graph still lowers.
-#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+#[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize)]
 pub struct ApiGraph {
     /// The module/package path of the analyzed target (e.g. `github.com/acme/svc`).
     pub module: String,
@@ -463,7 +463,7 @@ fn is_zero_u8(value: &u8) -> bool {
 /// [`ApiGraph::security`], and the `OpenAPI` target reads them. This is the public, framework-facing
 /// home for the scheme shape (re-exported via [`crate::sdk::prelude`]); the lowering layer maps it
 /// into the emitted `components.securitySchemes` entry.
-#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct SecurityScheme {
     /// The `OpenAPI` scheme id (the key under `components.securitySchemes`, e.g. `"ApiKeyAuth"`).
     pub id: String,
@@ -489,7 +489,7 @@ pub struct SecurityScheme {
 /// `summary`/`description` are the ONE non-structural pair, and they are still a source fact: they are
 /// the routed handler's own doc comment read as plain prose via the language's native synopsis
 /// convention (CLAUDE.md rule 0.1 category 2). They carry no grammar and can state nothing structural.
-#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct Operation {
     /// Stable operation id, derived deterministically from the handler symbol (D-08).
     pub id: String,
@@ -543,7 +543,7 @@ pub struct Operation {
 /// One path or query parameter of an operation, derived purely from code. Path params are required;
 /// query params default to a string type and not required. There is no enum or description — those
 /// were annotation-only and have been removed (CLAUDE.md rules 1 & 3).
-#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct Param {
     /// The parameter name (e.g. `"uuid"`, `"cursor"`).
     pub name: String,
@@ -657,7 +657,7 @@ fn is_false(value: &bool) -> bool {
 /// [`Type::Object`], a string-enum becomes [`Type::Enum`]. There is no separate string discriminator —
 /// the [`Type`] variant *is* the discriminant, so a new kind of named type is a compile error in every
 /// consumer rather than a silently-mishandled magic string.
-#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct Schema {
     /// Stable, package-qualified id (e.g. `"internal/common/dto.CreateGoalInput"`).
     pub id: String,

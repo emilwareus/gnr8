@@ -25,9 +25,11 @@ pub(crate) struct Cli {
     #[arg(short, long, global = true, action = clap::ArgAction::Count)]
     pub(crate) verbose: u8,
 
-    /// Never invoke cargo; require an already-built, matching .gnr8 worker.
+    /// Never produce a worker binary here; require a matching one this checkout already built.
     ///
-    /// Building .gnr8/ compiles and runs Rust from the repository (build scripts, proc macros).
+    /// Building .gnr8/ compiles and runs Rust from the repository (build scripts, proc macros), so
+    /// this withholds consent for producing that binary at all — cargo and a shared-cache restore
+    /// alike, since both put one in this checkout.
     #[arg(long, global = true)]
     pub(crate) no_build: bool,
 

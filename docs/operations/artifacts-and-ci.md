@@ -41,7 +41,14 @@ refused before anything is compiled, with `gnr8 init --upgrade` as the one-shot 
 `.gnr8/cache/worker.json` records a fingerprint over every file under `.gnr8/` (excluding `target/`
 and `cache/`), the host executable's own content hash, and the protocol constants — plus the built
 binary's length and hash. When all of that matches, that binary **is** the build output of those
-inputs, so cargo is not invoked at all. `gnr8 generate -v` reports `worker: reused` or `worker: built`.
+inputs, so cargo is not invoked at all. `gnr8 generate -v` reports `worker: reused`,
+`worker: restored`, or `worker: built`.
+
+On a stamp miss the machine's shared store is consulted under the same fingerprint before cargo is
+(see [Caches](#caches)); `worker: restored` is that path. The restored bytes are re-hashed against the
+length and digest the store entry recorded before they are moved into place, so a corrupt entry is
+deleted and the worker is built instead. A `--no-build` run does not restore: refusing cargo refuses
+producing a worker binary in this checkout at all.
 
 ### Trust
 
@@ -119,15 +126,104 @@ an explicit script/program that performs discovery.
 | `.gnr8/target/` | compiled project-local generator | no |
 | `.gnr8/cache/manifest.json` | generated ownership hashes | no |
 | `.gnr8/cache/sources/` | source analysis cache | no |
+| `.gnr8/cache/gofmt.memo` | `gofmt` answers this checkout has already asked for | no |
 | `.gnr8/cache/artifacts/` | reserved; cross-run artifact reuse is disabled | no |
 | `.gnr8/cache/verified-noop.json` | reserved; ignored while pre-child skipping is disabled | no |
+
+### The machine-global store
+
+Everything above is per checkout, so every worktree of one repository recompiles the same worker and
+re-extracts the same tree. The two answers that do not depend on *where* the checkout is are shared
+through one machine-global, content-addressed store, on by default:
+
+| Platform | Default location |
+|---|---|
+| Linux / BSD | `$XDG_CACHE_HOME/gnr8/store`, else `~/.cache/gnr8/store` |
+| macOS | `~/Library/Caches/gnr8/store` |
+| Windows | `%LOCALAPPDATA%\gnr8\store` |
+
+| `GNR8_CACHE_STORE` | Effect |
+|---|---|
+| unset | share through the platform cache directory |
+| an absolute path | share through that directory |
+| `off`, `disabled`, `none` | do not share; each checkout uses only its own `.gnr8/cache` |
+| anything else | not a location gnr8 can resolve, so sharing is off for that run |
+
+What is shared, and nothing else:
+
+| Entry | Key | Why it is portable |
+|---|---|---|
+| the built `.gnr8/` worker binary | the build fingerprint above | the fingerprint covers every build input and no path |
+| a Go source analysis | the source cache key above | the key covers the module's build inputs, the extractor binary, the toolchain and the gnr8 version; the stored graph holds only project-relative paths |
+
+Each is shared only while its key provably names the same bytes read from any checkout, and a
+derivation that reaches outside the tree its key hashes is simply never shared. A `.gnr8/Cargo.toml`
+with a `path` dependency written RELATIVE to it — `helpers = { path = "../helpers" }` — compiles a
+directory the fingerprint never sees, and a different one in every checkout, so that worker is built
+and stamped locally exactly as before and never published. A path that stays inside `.gnr8/` is
+covered by content like every other input, and an absolute one names a single directory on this
+machine, so both stay shareable.
+
+A cargo config reaches the same build from outside every checkout. `[patch]`, `[replace]` and
+`paths` send a package's source somewhere neither the manifest nor the lockfile names, so `.gnr8/`
+is byte-identical either side of one while what cargo compiles is not — and a fingerprint over
+`.gnr8/` cannot move to record it. A config declaring one therefore disables sharing for that run,
+in either direction: gnr8 reads `config.toml` and its extensionless spelling in the project's
+`.cargo/`, in every ancestor's, and in `$CARGO_HOME` (else `~/.cargo`), and takes the build out of
+the store if any of them does. It never asks WHICH package is redirected — a patch of any crate in
+the worker's graph moves the same unhashed bytes a patch of the SDK does — and a config it cannot
+read, cannot parse, or that `include`s another file counts as a redirect too. A false yes costs one
+local build; a false no would share the wrong binary.
+
+The ownership manifest is deliberately **not** shared: it records what *this* checkout's outputs are,
+which is checkout state rather than an answer. Neither is the `gofmt` memo, which is rewritten with
+exactly the entries one run needed and would otherwise thrash between projects. The compiled
+`goextract` sidecar and the cargo and Go build caches were already machine-global and are untouched.
+
+A store hit is an entry proving it answers the same key, so it is equal to recomputing by the same
+determinism rule that makes gnr8's output byte-identical for identical input: a differing gnr8
+version, `.gnr8/Cargo.lock`, toolchain, or source byte is a different key and a miss. A restored
+worker binary is additionally re-hashed before it is moved into place; a mismatch deletes the entry.
+
+**Trust.** The store is one user's state on one machine, at the trust level of `~/.cargo/registry` or
+the `$TMPDIR/gnr8-goextract` directory the compiled extractor already lives in. gnr8 creates it private
+to the invoking user (`0700` on Unix) and never shares it between users, machines, or over a network.
+Content verification catches corruption; it cannot make a directory *other* users can write into safe,
+because whoever can rewrite an entry can rewrite the hash beside it. Point `GNR8_CACHE_STORE` at local
+storage only you can write — not at a share several machines mount. The build fingerprint covers the
+host `gnr8` executable's own content, so a different platform's gnr8 can never match one of these
+keys, but it says nothing about the system libraries the machine that built a worker linked against.
+The cargo-config check above reads files, so a redirect that reaches cargo some other way is outside
+it: a `CARGO_*` environment variable, a wrapper script named by `GNR8_CARGO`, or a file pulled in by
+an `include` (which is why an `include` is treated as unprovable rather than followed). Those remain
+what they have always been — the invoking user's own environment, at the same trust level as the
+store itself.
+
+**Failure is a miss.** A store that does not exist, cannot be created, is full, or holds an entry this
+gnr8 cannot read never fails a run — it costs the time the answer would have saved. Deleting the whole
+directory is always safe.
+
+**Growth.** Nothing evicts entries. The store is content-addressed, so it grows only with distinct
+inputs — one worker binary per distinct `.gnr8/` fingerprint, one graph per distinct source key — and
+a checkout's `.gnr8/target` remains far larger than everything the store keeps for it. Delete the
+directory whenever it is bigger than it is worth; the next run recomputes and republishes.
+`gnr8 --json doctor` reports the resolved location under `runtime.cache_store` (`null` when sharing
+is off).
+
+**On CI.** A runner starts with an empty store, so a job publishes rather than restores and pays one
+file copy for it. The gnr8 action already caches each project's `.gnr8/cache` and `.gnr8/target`
+between runs, which is the same acceleration reached through a shorter path — a restored `.gnr8/`
+build directory keeps cargo's incremental state as well as the binary — so there is deliberately no
+second cache entry for the store in this repository's own workflows.
 
 Source cache hits may skip extraction inside a normal child run after validating their bounded inputs.
 For the Go source that bound is the **enclosing module**, not just the configured input dir, because
 `go/packages` type-checks the input packages together with everything they import, using whatever `go`
 is on PATH, so the module's build inputs and the toolchain identity are both part of the key. A module
 rooted above the project root, a Go workspace that puts other modules in scope, or a tree that cannot
-be enumerated exactly, is not cached at all. Every entry
+be enumerated exactly, is not cached at all. A `go.mod` `replace` that compiles a local directory in
+place of a module makes that directory part of the same surface, so the key hashes it too and moves
+when it changes — one level, because `go` applies only the main module's replacements. Every entry
 records the key it was computed under and is discarded when that recording does not match the current
 run, so a cache restored from another commit can only cost time, never change a verdict.
 Deleting cache is safe; the next run recomputes it. Pre-child pipeline skipping is disabled:

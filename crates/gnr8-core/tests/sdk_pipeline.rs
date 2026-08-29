@@ -36,6 +36,11 @@ fn run_goalservice_pipeline() -> Option<gnr8_engine::pipeline::PipelineOutcome> 
         return None;
     }
     let cx = Cx::new(FIXTURE_DIR);
+    // A store of this test's own: the source analysis is shared through one, and a test must never
+    // read from or write to the store the developer running it keeps for their own projects.
+    let store = gnr8_engine::store::Store::at(
+        std::env::temp_dir().join(format!("gnr8-sdk-pipeline-store-{}", std::process::id())),
+    );
     let pipeline = Pipeline::new()
         .source(GoGin::new().inputs(["."]))
         .transform(SetBasePath::new("/goal"))
@@ -48,8 +53,9 @@ fn run_goalservice_pipeline() -> Option<gnr8_engine::pipeline::PipelineOutcome> 
                 .to("generated/sdk"),
         )
         .post(Header::generated());
-    let outcome = gnr8_engine::pipeline::run_in_process(&pipeline, &cx)
+    let outcome = gnr8_engine::pipeline::run_in_process(&pipeline, &cx, Some(&store))
         .expect("the goalservice pipeline must run (requires the Go toolchain)");
+    let _ = std::fs::remove_dir_all(store.root());
     Some(outcome)
 }
 

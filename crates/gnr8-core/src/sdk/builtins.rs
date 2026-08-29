@@ -36,6 +36,8 @@ use crate::sdk::emit_common::quoted_string_literal;
 use crate::sdk::hash_files;
 use crate::sdk::model::SdkModel;
 use crate::sdk::model_style::PyModelStyle;
+use crate::sdk::resolved_lexically;
+use crate::store::{Namespace, Store};
 use crate::CoreError;
 use std::collections::{BTreeMap, BTreeSet};
 use std::path::{Component, Path, PathBuf};
@@ -47,10 +49,14 @@ use std::time::{SystemTime, UNIX_EPOCH};
 pub trait SourceExec {
     /// Load the API graph this declaration describes.
     ///
+    /// `store` is the machine's shared cache when this run has one. A source that memoizes its
+    /// analysis publishes to it and reads from it under the key it already computes; a source with
+    /// nothing to memoize ignores it.
+    ///
     /// # Errors
     ///
     /// Returns the source's own typed failure (a missing toolchain, an unreadable tree, …).
-    fn load(&self, cx: &Cx) -> Result<ApiGraph, CoreError>;
+    fn load(&self, cx: &Cx, store: Option<&Store>) -> Result<ApiGraph, CoreError>;
 }
 
 /// Apply a declared transform.
@@ -120,7 +126,7 @@ trait FormatCommandRun {
 // ---------------------------------------------------------------------------------------------------
 
 impl SourceExec for GoGin {
-    fn load(&self, cx: &Cx) -> Result<ApiGraph, CoreError> {
+    fn load(&self, cx: &Cx, store: Option<&Store>) -> Result<ApiGraph, CoreError> {
         // Exactly one input dir for now (mirrors the lifecycle single-input PoC restriction): reject
         // zero or many with a clear typed error rather than silently analyzing the first (D-02).
         let input = match self.inputs.as_slice() {
@@ -153,17 +159,24 @@ impl SourceExec for GoGin {
         // reading — used for the cache key AND for the run. Resolving it twice, or predicting the
         // helper from `go env` rather than naming it, is what let a broken extraction be cached
         // and then reported as up to date (issue #67).
-        let extractor = crate::analyze::helper::goextract_identity(&target)?;
+        // Naming the extractor means a `go env` probe and hashing the compiled helper; keying the
+        // cache means walking and hashing the analyzed module. Neither needs the other's answer, so
+        // they are read at the same time.
+        let (extractor, scope_digest) = crate::parallel::join(
+            || crate::analyze::helper::goextract_identity(&target),
+            || Ok(go_gin_scope_digest(&resolved, cx)),
+        )?;
         let cache_key = go_gin_cache_key(
             &resolved,
             &self.route_package_patterns,
             &self.schema_package_patterns,
             &extractor,
             cx,
+            scope_digest,
         );
         if let Some(cached) = cache_key
             .as_deref()
-            .and_then(|key| load_go_gin_cache(cx, key))
+            .and_then(|key| load_go_gin_cache(cx, key, store))
         {
             return Ok(cached);
         }
@@ -174,7 +187,7 @@ impl SourceExec for GoGin {
             &self.schema_package_patterns,
         )?;
         if let Some(key) = cache_key.as_deref() {
-            save_go_gin_cache(cx, key, &graph);
+            save_go_gin_cache(cx, key, store, &graph);
         }
         Ok(graph)
     }
@@ -238,6 +251,60 @@ fn go_gin_cache_scope(project_root: &Path, input: &Path) -> Option<PathBuf> {
         }
         dir = dir.parent()?;
     }
+}
+
+/// Every directory this `go.mod` compiles in place of a module, in the order it declares them.
+///
+/// A `replace` whose right-hand side is a filesystem path makes `go` build THAT directory instead of
+/// the named module, so its sources are as much an input to the analysis as the module's own — and a
+/// path leaving the module sits outside the tree the scope walk covers. Hashing those directories
+/// too is what keeps the key a name for everything the extractor reads: a monorepo that points its
+/// service module at `../sdks/go` gets a key that moves when that SDK changes, and two checkouts
+/// share an entry only when both trees match.
+///
+/// One level is the whole of it: `go` applies only the MAIN module's replacements and ignores a
+/// dependency's, so there is nothing below these to follow.
+///
+/// A right-hand side that is a module path and version instead is left alone — `go.sum` already pins
+/// that by content. `None` when `go.mod` cannot be read, because an input surface that cannot be
+/// proven gets no cache key at all.
+///
+/// `go.mod` is the module manifest the Go toolchain itself consumes and `=>` is its own syntax;
+/// nothing here reads a convention another tool invented.
+fn local_replacement_dirs(scope: &Path) -> Option<Vec<PathBuf>> {
+    let text = std::fs::read_to_string(scope.join("go.mod")).ok()?;
+    let mut dirs = Vec::new();
+    for line in text.lines() {
+        let statement = line.split_once("//").map_or(line, |(code, _)| code);
+        let Some((_, replacement)) = statement.split_once("=>") else {
+            continue;
+        };
+        let Some(target) = replacement.split_whitespace().next() else {
+            continue;
+        };
+        if !is_local_module_path(target) {
+            continue;
+        }
+        let path = Path::new(target);
+        dirs.push(if path.is_absolute() {
+            path.to_path_buf()
+        } else {
+            resolved_lexically(scope, path)
+        });
+    }
+    Some(dirs)
+}
+
+/// Whether a `replace` target names a directory rather than a module version.
+///
+/// Go's own rule: the right-hand side is a local directory when it is absolute or begins with `./`
+/// or `../`. Everything else is a module path, which the module graph resolves and `go.sum` verifies.
+fn is_local_module_path(target: &str) -> bool {
+    Path::new(target).is_absolute()
+        || matches!(
+            target.split(['/', '\\']).next(),
+            Some("." | "..") if target.contains(['/', '\\'])
+        )
 }
 
 /// Whether a Go workspace governs `input`, which puts modules outside the enclosing one in scope.
@@ -342,15 +409,37 @@ fn go_gin_cache_scope_files(scope: &Path) -> Option<Vec<PathBuf>> {
 ///
 /// Pure with respect to the toolchain: the caller resolves [`ExtractorIdentity`] once and hands it
 /// in, so the key and the run can never describe two different helpers.
+/// The analyzed module's directory and one digest over every build input it and its replacements hold.
+///
+/// `None` whenever the input surface cannot be proven exactly — no enclosing module inside the
+/// project, a Go workspace, or a tree that cannot be enumerated — which means no cache key, which
+/// means the analysis is simply recomputed.
+fn go_gin_scope_digest(input: &Path, cx: &Cx) -> Option<(PathBuf, String)> {
+    let scope = go_gin_cache_scope(&cx.project_root, input)?;
+    let mut files = go_gin_cache_scope_files(&scope)?;
+    // What `go.mod` replaces a module with is compiled in that module's place, so it is part of the
+    // same input surface — a directory the walk above cannot reach when the replacement leaves the
+    // module. One that cannot be enumerated leaves the surface unprovable, which means no key.
+    for replacement in local_replacement_dirs(&scope)? {
+        files.extend(go_gin_cache_scope_files(&replacement)?);
+    }
+    // A replacement pointing back inside the module names files the walk already found; the digest
+    // is over a SET of inputs, so it must not depend on how many directives mentioned one.
+    files.sort();
+    files.dedup();
+    let digest = hash_files(&files, &cx.project_root).ok()?;
+    Some((scope, digest))
+}
+
 fn go_gin_cache_key(
     input: &Path,
     route_package_patterns: &[String],
     schema_package_patterns: &[String],
     extractor: &ExtractorIdentity,
     cx: &Cx,
+    scope_digest: Option<(PathBuf, String)>,
 ) -> Option<String> {
-    let scope = go_gin_cache_scope(&cx.project_root, input)?;
-    let files = go_gin_cache_scope_files(&scope)?;
+    let (scope, files_digest) = scope_digest?;
     let mut hasher = blake3::Hasher::new();
     hasher.update(b"gnr8-go-gin-source-cache-v6\n");
     hasher.update(env!("CARGO_PKG_VERSION").as_bytes());
@@ -379,7 +468,7 @@ fn go_gin_cache_key(
         hasher.update(pattern.as_bytes());
         hasher.update(b"\0");
     }
-    hasher.update(hash_files(&files, &cx.project_root).as_bytes());
+    hasher.update(files_digest.as_bytes());
     Some(hasher.finalize().to_hex().to_string())
 }
 
@@ -394,26 +483,39 @@ fn project_relative_key_path(project_root: &Path, path: &Path) -> String {
 ///
 /// A cache may only make a run faster. An entry whose recorded schema version or key does not match
 /// this run is untrusted input — it is deleted and the analysis is recomputed, never reported.
-fn load_go_gin_cache(cx: &Cx, key: &str) -> Option<ApiGraph> {
+///
+/// The project's own cache is read first and the machine's store second. That is one memo in two
+/// places, not two ways to derive a graph: both are read under the SAME key, both are checked by the
+/// SAME rule, and a hit in either is the answer this key already had. A store hit is written into the
+/// project's cache on the way through, so the checkout ends the run in exactly the state a local
+/// recompute would have left it in.
+fn load_go_gin_cache(cx: &Cx, key: &str, store: Option<&Store>) -> Option<ApiGraph> {
     let path = go_gin_cache_path(cx, key);
-    let bytes = std::fs::read(&path).ok()?;
-    let entry = serde_json::from_slice::<GoGinSourceCacheEntry>(&bytes)
-        .ok()
-        .filter(|entry| entry.version == GO_GIN_SOURCE_CACHE_VERSION && entry.key == key);
-    if entry.is_none() {
+    if let Ok(bytes) = std::fs::read(&path) {
+        if let Some(graph) = decode_go_gin_cache(&bytes, key) {
+            return Some(graph);
+        }
         let _ = std::fs::remove_file(&path);
     }
-    entry.map(|entry| entry.graph)
+    let store = store?;
+    let bytes = store.read(Namespace::GoGinSource, key)?;
+    let Some(graph) = decode_go_gin_cache(&bytes, key) else {
+        store.discard(Namespace::GoGinSource, key);
+        return None;
+    };
+    write_go_gin_cache_file(&path, &bytes);
+    Some(graph)
 }
 
-fn save_go_gin_cache(cx: &Cx, key: &str, graph: &ApiGraph) {
-    let path = go_gin_cache_path(cx, key);
-    let Some(parent) = path.parent() else {
-        return;
-    };
-    if std::fs::create_dir_all(parent).is_err() {
-        return;
-    }
+/// The graph an entry holds, if the entry proves it answers `key` under a schema this gnr8 reads.
+fn decode_go_gin_cache(bytes: &[u8], key: &str) -> Option<ApiGraph> {
+    serde_json::from_slice::<GoGinSourceCacheEntry>(bytes)
+        .ok()
+        .filter(|entry| entry.version == GO_GIN_SOURCE_CACHE_VERSION && entry.key == key)
+        .map(|entry| entry.graph)
+}
+
+fn save_go_gin_cache(cx: &Cx, key: &str, store: Option<&Store>, graph: &ApiGraph) {
     let record = GoGinSourceCacheRecord {
         version: GO_GIN_SOURCE_CACHE_VERSION,
         key,
@@ -422,20 +524,50 @@ fn save_go_gin_cache(cx: &Cx, key: &str, graph: &ApiGraph) {
     let Ok(bytes) = serde_json::to_vec(&record) else {
         return;
     };
-    let _ = std::fs::write(path, bytes);
+    write_go_gin_cache_file(&go_gin_cache_path(cx, key), &bytes);
+    if let Some(store) = store {
+        store.publish(Namespace::GoGinSource, key, &bytes);
+    }
+}
+
+/// Write one cache entry so a concurrent reader sees either the whole file or no file.
+///
+/// Two `gnr8` processes in one project can reach this at the same time. A torn entry would only cost
+/// a recompute — it does not parse, and the loader treats that as no entry — but write-then-rename
+/// removes the window entirely. The temporary is named for the entry AND the writer's pid, the same
+/// discipline the build stamp uses, so no two writers can ever be holding the same one.
+fn write_go_gin_cache_file(path: &Path, bytes: &[u8]) {
+    let Some(parent) = path.parent() else {
+        return;
+    };
+    let Some(name) = path.file_name().map(std::ffi::OsStr::to_string_lossy) else {
+        return;
+    };
+    if std::fs::create_dir_all(parent).is_err() {
+        return;
+    }
+    let temporary = parent.join(format!(".{name}.{}.tmp", std::process::id()));
+    if std::fs::write(&temporary, bytes).is_err() || std::fs::rename(&temporary, path).is_err() {
+        let _ = std::fs::remove_file(&temporary);
+    }
 }
 
 fn go_gin_cache_path(cx: &Cx, key: &str) -> std::path::PathBuf {
-    cx.project_root
-        .join(crate::lifecycle::WORKSPACE_DIR)
-        .join("cache")
+    cache_dir(cx)
         .join("sources")
         .join("go-gin")
         .join(format!("{key}.json"))
 }
 
+/// The project's gnr8 cache directory: where a run keeps everything it may recompute but need not.
+fn cache_dir(cx: &Cx) -> std::path::PathBuf {
+    cx.project_root
+        .join(crate::lifecycle::WORKSPACE_DIR)
+        .join("cache")
+}
+
 impl SourceExec for OpenApi {
-    fn load(&self, cx: &Cx) -> Result<ApiGraph, CoreError> {
+    fn load(&self, cx: &Cx, _store: Option<&Store>) -> Result<ApiGraph, CoreError> {
         if self.input.is_empty() {
             return Err(CoreError::Config {
                 message: "OpenApi source has no input — call .input(\"openapi.yaml\")".to_string(),
@@ -446,7 +578,7 @@ impl SourceExec for OpenApi {
 }
 
 impl SourceExec for FastApi {
-    fn load(&self, cx: &Cx) -> Result<ApiGraph, CoreError> {
+    fn load(&self, cx: &Cx, _store: Option<&Store>) -> Result<ApiGraph, CoreError> {
         // Exactly one input dir for now: reject zero or many with a clear typed error rather than
         // silently analyzing the first (mirrors GoGin).
         let input = match self.inputs.as_slice() {
@@ -479,7 +611,7 @@ impl SourceExec for FastApi {
 }
 
 impl SourceExec for Flask {
-    fn load(&self, cx: &Cx) -> Result<ApiGraph, CoreError> {
+    fn load(&self, cx: &Cx, _store: Option<&Store>) -> Result<ApiGraph, CoreError> {
         let input = match self.inputs.as_slice() {
             [single] => single,
             [] => {
@@ -508,7 +640,7 @@ impl SourceExec for Flask {
 }
 
 impl SourceExec for NestJs {
-    fn load(&self, cx: &Cx) -> Result<ApiGraph, CoreError> {
+    fn load(&self, cx: &Cx, _store: Option<&Store>) -> Result<ApiGraph, CoreError> {
         let input = match self.inputs.as_slice() {
             [single] => single,
             [] => {
@@ -2657,7 +2789,7 @@ impl StaticFilesSources for StaticFiles {
 }
 
 impl TargetExec for GoSdk {
-    fn generate(&self, ir: &ApiGraph, out: &mut Artifacts, _cx: &Cx) -> Result<(), CoreError> {
+    fn generate(&self, ir: &ApiGraph, out: &mut Artifacts, cx: &Cx) -> Result<(), CoreError> {
         if self.module.is_empty() {
             return Err(CoreError::Config {
                 message: "GoSdk target has no module — call .module(\"example.com/acme/sdk\")"
@@ -2686,6 +2818,7 @@ impl TargetExec for GoSdk {
             &model.package,
             &model.base_path,
             &self.layout,
+            Some(&cache_dir(cx)),
         )?;
         write_sdk_files(out, &self.dir, files)?;
         write_sdk_docs(out, &self.dir, "Go", &model.package, ir, &model, &self.docs)?;
@@ -3639,13 +3772,17 @@ fn rel_to_slash_string(path: &Path) -> Result<String, CoreError> {
 /// # Errors
 ///
 /// Propagates the source's own typed failure.
-pub fn load_source(spec: &BuiltinSource, cx: &Cx) -> Result<ApiGraph, CoreError> {
+pub fn load_source(
+    spec: &BuiltinSource,
+    cx: &Cx,
+    store: Option<&Store>,
+) -> Result<ApiGraph, CoreError> {
     match spec {
-        BuiltinSource::GoGin(s) => s.load(cx),
-        BuiltinSource::OpenApi(s) => s.load(cx),
-        BuiltinSource::FastApi(s) => s.load(cx),
-        BuiltinSource::Flask(s) => s.load(cx),
-        BuiltinSource::NestJs(s) => s.load(cx),
+        BuiltinSource::GoGin(s) => s.load(cx, store),
+        BuiltinSource::OpenApi(s) => s.load(cx, store),
+        BuiltinSource::FastApi(s) => s.load(cx, store),
+        BuiltinSource::Flask(s) => s.load(cx, store),
+        BuiltinSource::NestJs(s) => s.load(cx, store),
     }
 }
 
@@ -3767,15 +3904,15 @@ mod tests {
     #![allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
 
     use super::{
-        create_unique_postprocess_dir, go_gin_cache_key, go_gin_cache_path, load_go_gin_cache,
-        save_go_gin_cache, sdk_package, source_input_roots, ApiOverrides, ApplySecurity,
-        ConfigurePagination, ConfigureSdkRuntime, Cx, DiagnosticPolicy, EnumOrder,
-        ExtractorIdentity, FastApi, Flask, FormatCommand, GoGin, GoSdk, GroupOperations, Header,
-        MarkIdempotent, NestJs, OpenApi31, OpenApi31Json, OpenApiFieldPatch, OpenApiMetadata,
-        OpenApiSchemaPatch, OperationSelector, ParameterOverride, PostExec, PySdk, RenameType,
-        RequestParameter, ResponseOverride, SdkPackageMetadata, SecurityOverride, SetBasePath,
-        SetEnumOrder, SetOperationSuccessResponse, SetSchemaFieldType, SetTitle, SourceExec,
-        StaticFiles, StaticFilesSources, TargetExec, TransformExec, TsSdk,
+        create_unique_postprocess_dir, go_gin_cache_path, load_go_gin_cache, save_go_gin_cache,
+        sdk_package, source_input_roots, ApiOverrides, ApplySecurity, ConfigurePagination,
+        ConfigureSdkRuntime, Cx, DiagnosticPolicy, EnumOrder, ExtractorIdentity, FastApi, Flask,
+        FormatCommand, GoGin, GoSdk, GroupOperations, Header, MarkIdempotent, NestJs, OpenApi31,
+        OpenApi31Json, OpenApiFieldPatch, OpenApiMetadata, OpenApiSchemaPatch, OperationSelector,
+        ParameterOverride, PostExec, PySdk, RenameType, RequestParameter, ResponseOverride,
+        SdkPackageMetadata, SecurityOverride, SetBasePath, SetEnumOrder,
+        SetOperationSuccessResponse, SetSchemaFieldType, SetTitle, SourceExec, StaticFiles,
+        StaticFilesSources, TargetExec, TransformExec, TsSdk,
     };
     use crate::analyze::facts::{Constraints, FieldMeta, LiteralValue};
     use crate::graph::{
@@ -3791,6 +3928,24 @@ mod tests {
 
     fn cx() -> Cx {
         Cx::new(std::env::temp_dir())
+    }
+
+    /// The cache key for a real input tree, resolving the scope the way a run's `join` does.
+    fn go_gin_cache_key(
+        input: &std::path::Path,
+        routes: &[String],
+        schemas: &[String],
+        extractor: &ExtractorIdentity,
+        cx: &Cx,
+    ) -> Option<String> {
+        super::go_gin_cache_key(
+            input,
+            routes,
+            schemas,
+            extractor,
+            cx,
+            super::go_gin_scope_digest(input, cx),
+        )
     }
 
     /// A stand-in extractor identity for the cache-key tests.
@@ -3871,8 +4026,8 @@ mod tests {
     /// The toolchain the extractor runs under is still a key input in its own right.
     ///
     /// It decides which files the build constraints select and what stdlib type information comes
-    /// back, so a `GOOS`/`GOARCH`/`GOFLAGS`/`GOTOOLCHAIN` change must miss the cache even when the
-    /// same binary runs.
+    /// back, so a `GOOS`/`GOARCH`/`GOFLAGS`/`CGO_ENABLED`/`GOTOOLCHAIN` change must miss the cache
+    /// even when the same binary runs.
     #[test]
     fn go_gin_cache_key_changes_with_the_toolchain_the_extractor_runs_under() {
         let cx = go_module_cx("cache-key-run-toolchain");
@@ -4063,6 +4218,112 @@ mod tests {
         );
     }
 
+    /// A `replace` compiles a directory in place of a module, so it is part of the input surface.
+    ///
+    /// The scope walk stops at the module directory, so a replacement that leaves it names sources
+    /// no other part of the key covers: editing them would leave the key — and therefore the graph
+    /// gnr8 reports — exactly where it was, and the machine-global store would answer a second
+    /// checkout with the first one's analysis. The key hashes those directories too, so it moves
+    /// when they do, and a replacement gnr8 cannot enumerate produces no key at all.
+    #[test]
+    fn go_gin_cache_key_covers_the_directories_go_mod_replaces_a_module_with() {
+        let cx = go_module_cx("cache-key-replace");
+        let input = cx.project_root.clone();
+        let go_mod = input.join("go.mod");
+        let outside = cx.project_root.join("..").join(format!(
+            "gnr8-cache-key-replace-shared-{}",
+            std::process::id()
+        ));
+        std::fs::create_dir_all(&outside).expect("create the replaced module");
+        std::fs::write(outside.join("go.mod"), "module example.com/shared\n").expect("go.mod");
+        std::fs::write(outside.join("shared.go"), "package shared\n").expect("shared.go");
+        let routes = vec!["./...".to_string()];
+        let schemas = vec!["./...".to_string()];
+        let key = || go_gin_cache_key(&input, &routes, &schemas, &extractor("helper"), &cx);
+
+        // Nothing replaced: the module's own tree is the whole surface.
+        std::fs::write(&go_mod, "module example.com/app\n\ngo 1.22\n").expect("go.mod");
+        let plain = key();
+
+        // A module path and version on the right is not a directory — `go.sum` pins that by content.
+        std::fs::write(
+            &go_mod,
+            "module example.com/app\n\ngo 1.22\n\nreplace example.com/x => example.com/y v1.3.0\n",
+        )
+        .expect("go.mod");
+        assert!(key().is_some(), "a module replacement must still key");
+
+        // A directory outside the module is hashed, so editing it moves the key.
+        let directive = format!(
+            "module example.com/app\n\ngo 1.22\n\nreplace example.com/shared => {}\n",
+            outside.to_string_lossy().replace('\\', "/")
+        );
+        std::fs::write(&go_mod, &directive).expect("go.mod");
+        let with_replacement = key();
+        std::fs::write(
+            outside.join("shared.go"),
+            "package shared\n\ntype T struct{}\n",
+        )
+        .expect("shared.go");
+        let after_editing_it = key();
+
+        // A replacement gnr8 cannot enumerate leaves the surface unprovable.
+        std::fs::remove_dir_all(&outside).expect("remove the replaced module");
+        let missing = key();
+
+        let _ = std::fs::remove_dir_all(&cx.project_root);
+        let _ = std::fs::remove_dir_all(&outside);
+        assert!(plain.is_some(), "a module with no replacement must key");
+        assert!(with_replacement.is_some(), "a replaced directory must key");
+        assert_ne!(
+            plain, with_replacement,
+            "the replaced directory is part of the surface the key names"
+        );
+        assert_ne!(
+            with_replacement, after_editing_it,
+            "editing a replaced directory must move the key"
+        );
+        assert!(
+            missing.is_none(),
+            "a replacement that cannot be enumerated must produce no cache key"
+        );
+    }
+
+    /// A replacement pointing back inside the module still keys, over the tree the walk already found.
+    ///
+    /// This is the shape `fixtures/gin-contract-regression` uses (`replace … => ./ginstub`): the
+    /// replaced directory is part of the module, so hashing the replacements adds nothing to the
+    /// surface and must not cost the cache. The key still moves, because the directive itself is a
+    /// line of the `go.mod` the key already hashes.
+    #[test]
+    fn a_replacement_inside_the_module_still_keys() {
+        let cx = go_module_cx("cache-key-replace-inside");
+        let input = cx.project_root.clone();
+        std::fs::create_dir_all(input.join("ginstub")).expect("create the stub");
+        std::fs::write(input.join("ginstub/go.mod"), "module example.com/stub\n").expect("go.mod");
+        std::fs::write(input.join("ginstub/stub.go"), "package stub\n").expect("stub.go");
+        let routes = vec!["./...".to_string()];
+        let schemas = vec!["./...".to_string()];
+        let key = || go_gin_cache_key(&input, &routes, &schemas, &extractor("helper"), &cx);
+
+        std::fs::write(input.join("go.mod"), "module example.com/app\n\ngo 1.22\n")
+            .expect("go.mod");
+        let plain = key();
+        std::fs::write(
+            input.join("go.mod"),
+            "module example.com/app\n\ngo 1.22\n\nreplace example.com/stub => ./ginstub\n",
+        )
+        .expect("go.mod");
+        let replaced = key();
+
+        let _ = std::fs::remove_dir_all(&cx.project_root);
+        assert!(plain.is_some() && replaced.is_some());
+        assert_ne!(
+            plain, replaced,
+            "the directive itself lives in go.mod, which the key already hashes"
+        );
+    }
+
     /// A module rooted above the project has inputs gnr8 cannot enumerate ⇒ no cache at all.
     #[test]
     fn go_gin_cache_key_is_absent_without_an_enclosing_module_in_the_project() {
@@ -4089,11 +4350,11 @@ mod tests {
         let path = go_gin_cache_path(&cx, &key);
         std::fs::create_dir_all(path.parent().expect("cache parent")).expect("cache dir");
         let graph = ApiGraph::default();
-        save_go_gin_cache(&cx, &"b".repeat(64), &graph);
+        save_go_gin_cache(&cx, &"b".repeat(64), None, &graph);
         let foreign = go_gin_cache_path(&cx, &"b".repeat(64));
         std::fs::copy(&foreign, &path).expect("plant a foreign entry under this key");
 
-        let loaded = load_go_gin_cache(&cx, &key);
+        let loaded = load_go_gin_cache(&cx, &key, None);
 
         let missing = !path.exists();
         let _ = std::fs::remove_dir_all(&cx.project_root);
@@ -4101,14 +4362,85 @@ mod tests {
         assert!(missing, "a foreign entry must be discarded from the cache");
     }
 
+    /// A machine's store answers a checkout that never computed the analysis itself.
+    #[test]
+    fn a_stored_analysis_answers_a_checkout_that_has_none_and_lands_in_its_own_cache() {
+        let produced = go_module_cx("cache-store-produced");
+        let consumed = go_module_cx("cache-store-consumed");
+        let store = crate::store::Store::at(produced.project_root.join("store"));
+        let key = "d".repeat(64);
+        save_go_gin_cache(&produced, &key, Some(&store), &ApiGraph::default());
+
+        let loaded = load_go_gin_cache(&consumed, &key, Some(&store));
+
+        let landed = go_gin_cache_path(&consumed, &key).is_file();
+        let _ = std::fs::remove_dir_all(&produced.project_root);
+        let _ = std::fs::remove_dir_all(&consumed.project_root);
+        assert!(loaded.is_some(), "a stored entry must answer under its key");
+        assert!(
+            landed,
+            "a store hit must leave the checkout in the state a local recompute would have"
+        );
+    }
+
+    /// A store entry that does not record THIS key is untrusted input, exactly as a local one is.
+    #[test]
+    fn a_stored_entry_recorded_under_another_key_is_discarded() {
+        let cx = go_module_cx("cache-store-foreign-key");
+        let store = crate::store::Store::at(cx.project_root.join("store"));
+        let recorded = "e".repeat(64);
+        save_go_gin_cache(&cx, &recorded, Some(&store), &ApiGraph::default());
+        let planted = "f".repeat(64);
+        let bytes = store
+            .read(crate::store::Namespace::GoGinSource, &recorded)
+            .expect("the entry must have been published");
+        store.publish(crate::store::Namespace::GoGinSource, &planted, &bytes);
+        let _ = std::fs::remove_dir_all(cx.project_root.join(".gnr8"));
+
+        let loaded = load_go_gin_cache(&cx, &planted, Some(&store));
+
+        let discarded = store
+            .read(crate::store::Namespace::GoGinSource, &planted)
+            .is_none();
+        let landed = go_gin_cache_path(&cx, &planted).exists();
+        let _ = std::fs::remove_dir_all(&cx.project_root);
+        assert!(loaded.is_none(), "a foreign entry must never be returned");
+        assert!(
+            discarded,
+            "a foreign entry must be discarded from the store"
+        );
+        assert!(
+            !landed,
+            "a foreign entry must not be written into a checkout"
+        );
+    }
+
+    /// With no store, the analysis cache is exactly the project's own — nothing else is consulted.
+    #[test]
+    fn without_a_store_only_the_checkouts_own_cache_answers() {
+        let produced = go_module_cx("cache-store-absent-produced");
+        let consumed = go_module_cx("cache-store-absent-consumed");
+        let store = crate::store::Store::at(produced.project_root.join("store"));
+        let key = "a".repeat(64);
+        save_go_gin_cache(&produced, &key, None, &ApiGraph::default());
+
+        let shared = store.read(crate::store::Namespace::GoGinSource, &key);
+        let loaded = load_go_gin_cache(&consumed, &key, Some(&store));
+
+        let _ = std::fs::remove_dir_all(&produced.project_root);
+        let _ = std::fs::remove_dir_all(&consumed.project_root);
+        assert!(shared.is_none(), "no store means nothing is published");
+        assert!(loaded.is_none(), "no store means nothing is shared");
+    }
+
     /// A same-key entry round-trips, so the fix keeps the cache useful.
     #[test]
     fn go_gin_cache_entry_round_trips_under_its_own_key() {
         let cx = go_module_cx("cache-entry-round-trip");
         let key = "c".repeat(64);
-        save_go_gin_cache(&cx, &key, &ApiGraph::default());
+        save_go_gin_cache(&cx, &key, None, &ApiGraph::default());
 
-        let loaded = load_go_gin_cache(&cx, &key);
+        let loaded = load_go_gin_cache(&cx, &key, None);
 
         let _ = std::fs::remove_dir_all(&cx.project_root);
         assert!(loaded.is_some(), "an entry must load under its own key");
@@ -6963,25 +7295,28 @@ mod tests {
         let cx = cx();
         assert!(
             matches!(
-                FastApi::new().load(&cx),
+                FastApi::new().load(&cx, None),
                 Err(crate::CoreError::Config { .. })
             ),
             "FastApi with no inputs must be a Config error"
         );
         assert!(
             matches!(
-                FastApi::new().inputs(["a", "b"]).load(&cx),
+                FastApi::new().inputs(["a", "b"]).load(&cx, None),
                 Err(crate::CoreError::Config { .. })
             ),
             "FastApi with many inputs must be a Config error"
         );
         assert!(
-            matches!(Flask::new().load(&cx), Err(crate::CoreError::Config { .. })),
+            matches!(
+                Flask::new().load(&cx, None),
+                Err(crate::CoreError::Config { .. })
+            ),
             "Flask with no inputs must be a Config error"
         );
         assert!(
             matches!(
-                Flask::new().inputs(["a", "b"]).load(&cx),
+                Flask::new().inputs(["a", "b"]).load(&cx, None),
                 Err(crate::CoreError::Config { .. })
             ),
             "Flask with many inputs must be a Config error"
@@ -7067,7 +7402,7 @@ func (s Server) create(c *gin.Context) {
             .inputs(["."])
             .route_packages(["./internal/api"])
             .schema_packages(["./internal/dto"])
-            .load(&Cx::new(project))
+            .load(&Cx::new(project), None)
             .unwrap();
 
         assert_eq!(graph.operations.len(), 1);
@@ -7091,14 +7426,14 @@ func (s Server) create(c *gin.Context) {
         let cx = cx();
         assert!(
             matches!(
-                NestJs::new().load(&cx),
+                NestJs::new().load(&cx, None),
                 Err(crate::CoreError::Config { .. })
             ),
             "NestJs with no inputs must be a Config error"
         );
         assert!(
             matches!(
-                NestJs::new().inputs(["a", "b"]).load(&cx),
+                NestJs::new().inputs(["a", "b"]).load(&cx, None),
                 Err(crate::CoreError::Config { .. })
             ),
             "NestJs with many inputs must be a Config error"

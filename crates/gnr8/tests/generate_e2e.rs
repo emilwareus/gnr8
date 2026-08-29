@@ -106,10 +106,20 @@ func main() {
 }
 
 /// Run `gnr8 <args...>` with `current_dir = root`, returning (success, stdout, stderr).
+///
+/// Every invocation shares through a store INSIDE the staging dir. The machine-global store is on by
+/// default, and a test that used the developer's own would both read answers it did not produce and
+/// leave answers behind; rooting it here keeps the run hermetic and still exercises the sharing path.
 fn run_gnr8(root: &Path, args: &[&str]) -> (bool, String, String) {
+    run_gnr8_sharing_through(root, args, &root.join("gnr8-store"))
+}
+
+/// Run `gnr8 <args...>` against `root`, sharing through the store at `store`.
+fn run_gnr8_sharing_through(root: &Path, args: &[&str], store: &Path) -> (bool, String, String) {
     let output = Command::new(GNR8_BIN)
         .args(args)
         .current_dir(root)
+        .env("GNR8_CACHE_STORE", store)
         .output()
         .expect("spawn the gnr8 host binary");
     (
@@ -117,6 +127,103 @@ fn run_gnr8(root: &Path, args: &[&str]) -> (bool, String, String) {
         String::from_utf8_lossy(&output.stdout).into_owned(),
         String::from_utf8_lossy(&output.stderr).into_owned(),
     )
+}
+
+/// A second checkout of this project, holding everything a repository would carry.
+///
+/// `.gnr8/target` and `.gnr8/cache` are the two directories gnr8 owns and git ignores, so a fresh
+/// checkout is exactly the tracked half — which is what makes it ask the machine the same question.
+fn copy_checkout(from: &Path, to: &Path) {
+    fn copy_tree(from: &Path, to: &Path) {
+        std::fs::create_dir_all(to).expect("create the checkout directory");
+        for entry in std::fs::read_dir(from).expect("read the source checkout") {
+            let entry = entry.expect("read a source entry");
+            let name = entry.file_name();
+            let (source, destination) = (entry.path(), to.join(&name));
+            if entry.file_type().expect("stat a source entry").is_dir() {
+                if matches!(name.to_string_lossy().as_ref(), "target" | "cache") {
+                    continue;
+                }
+                copy_tree(&source, &destination);
+            } else {
+                std::fs::copy(&source, &destination).expect("copy a checkout file");
+            }
+        }
+    }
+    copy_tree(&from.join(".gnr8"), &to.join(".gnr8"));
+    for name in ["main.go", "go.mod"] {
+        std::fs::copy(from.join(name), to.join(name)).expect("copy a source file");
+    }
+}
+
+/// Every regular file under `dir`, relative to it, with its bytes.
+fn tree_bytes(dir: &Path) -> std::collections::BTreeMap<String, Vec<u8>> {
+    fn walk(
+        root: &Path,
+        dir: &Path,
+        out: &mut std::collections::BTreeMap<String, Vec<u8>>,
+    ) -> Option<()> {
+        for entry in std::fs::read_dir(dir).ok()? {
+            let path = entry.ok()?.path();
+            if path.is_dir() {
+                walk(root, &path, out)?;
+            } else {
+                let rel = path.strip_prefix(root).ok()?.to_string_lossy().into_owned();
+                out.insert(rel, std::fs::read(&path).ok()?);
+            }
+        }
+        Some(())
+    }
+    let mut out = std::collections::BTreeMap::new();
+    if dir.is_file() {
+        out.insert(
+            dir.file_name().unwrap_or_default().to_string_lossy().into(),
+            std::fs::read(dir).expect("read a generated file"),
+        );
+        return out;
+    }
+    walk(dir, dir, &mut out).expect("read the generated tree");
+    assert!(!out.is_empty(), "{} holds no generated file", dir.display());
+    out
+}
+
+/// A second checkout, sharing this machine's store, generates the same bytes as the first.
+///
+/// This is the whole claim the machine-global store makes, over the real pipeline: the worker binary
+/// and the Go source analysis both answer a question about content, so the checkout that asks it
+/// second may have the first one's answer — and what it generates must be indistinguishable from
+/// what it would have computed itself.
+fn assert_a_second_checkout_generates_the_same_bytes(root: &Path) {
+    let store = root.join("gnr8-store");
+    let second = root.with_file_name(format!(
+        "{}-second",
+        root.file_name().unwrap_or_default().to_string_lossy()
+    ));
+    let _ = std::fs::remove_dir_all(&second);
+    copy_checkout(root, &second);
+
+    let (ok, out, err) = run_gnr8_sharing_through(&second, &["generate", "-v"], &store);
+    assert!(
+        ok,
+        "a second checkout must generate.\nstdout:\n{out}\nstderr:\n{err}"
+    );
+    assert!(
+        out.contains("worker: restored") || err.contains("worker: restored"),
+        "the second checkout must restore the worker the first one built:\n{out}{err}"
+    );
+    assert!(
+        second.join(".gnr8/cache/sources").is_dir(),
+        "a shared source analysis must land in the checkout's own cache"
+    );
+
+    for produced in ["openapi.yaml", "sdk"] {
+        assert_eq!(
+            tree_bytes(&second.join(produced)),
+            tree_bytes(&root.join(produced)),
+            "the store decides how fast a run is, never what it writes ({produced})"
+        );
+    }
+    let _ = std::fs::remove_dir_all(&second);
 }
 
 #[cfg(not(windows))]
@@ -149,6 +256,7 @@ fn assert_cached_watch_cold_start_preserves_outputs(root: &Path) {
     command
         .arg("watch")
         .current_dir(root)
+        .env("GNR8_CACHE_STORE", root.join("gnr8-store"))
         .stdout(Stdio::piped())
         .stderr(Stdio::piped());
     #[cfg(unix)]
@@ -335,6 +443,10 @@ fn generate_e2e_scaffolds_compiles_runs_and_is_idempotent() {
     );
     #[cfg(not(windows))]
     assert_cached_watch_cold_start_preserves_outputs(&root);
+
+    // 3b. A second checkout of the same project, sharing this machine's store, writes the same bytes
+    //     without repeating the build or the analysis.
+    assert_a_second_checkout_generates_the_same_bytes(&root);
 
     // 4. `gnr8 check` reports up-to-date (exit 0) after the no-op.
     let (ok, out, _err) = run_gnr8(&root, &["check"]);

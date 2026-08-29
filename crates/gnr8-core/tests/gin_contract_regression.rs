@@ -55,6 +55,9 @@ fn run_pipeline() -> Option<gnr8_engine::pipeline::PipelineOutcome> {
     }
     let fixture = unique_temp_dir("fixture");
     copy_fixture(Path::new(FIXTURE_DIR), &fixture);
+    // A store of this test's own: the source analysis is shared through one, and a test must never
+    // read from or write to the store the developer running it keeps for their own projects.
+    let store = gnr8_engine::store::Store::at(fixture.join("cache-store"));
     let pipeline = Pipeline::new()
         .source(GoGin::new().inputs(["."]))
         .transform(ApiOverrides::new().sse_response("GET", "/v1/items/raw-stream"))
@@ -63,7 +66,7 @@ fn run_pipeline() -> Option<gnr8_engine::pipeline::PipelineOutcome> {
         .target(PySdk::new().module("example_sdk").to("generated/py"))
         .target(GoSdk::new().module("example.com/sdk").to("generated/go"));
     Some(
-        gnr8_engine::pipeline::run_in_process(&pipeline, &Cx::new(&fixture))
+        gnr8_engine::pipeline::run_in_process(&pipeline, &Cx::new(&fixture), Some(&store))
             .expect("gin contract pipeline must generate SDKs"),
     )
 }

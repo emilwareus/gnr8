@@ -35,11 +35,11 @@ use crate::graph::{
     Prim, RuntimePolicy, Type,
 };
 use crate::sdk::emit_common::{
-    check_unique_schema_names, error_response_bodies_of, is_json_object_key, join_path,
-    operation_auth_alternatives, operation_prose, path_tokens, path_tokens_match,
-    quoted_string_literal, request_body_model_of, split_words, success_responses_of,
-    ApiKeyLocation, ErrorResponseBody, HttpAuthScheme, OperationApiKeyScheme, OperationAuthScheme,
-    RequestBodyEncoding, RequestBodyModel, SuccessResponses,
+    error_response_bodies_of, is_json_object_key, join_path, operation_auth_alternatives,
+    operation_prose, path_tokens, path_tokens_match, quoted_string_literal, request_body_model_of,
+    split_words, success_responses_of, ApiKeyLocation, ErrorResponseBody, HttpAuthScheme,
+    OperationApiKeyScheme, OperationAuthScheme, RequestBodyEncoding, RequestBodyModel,
+    SuccessResponses, UniqueSchemaNames,
 };
 use crate::CoreError;
 
@@ -272,7 +272,7 @@ pub(crate) fn emit_models(graph: &ApiGraph, package: &str) -> Result<String, Cor
     let _ = package;
     let mut out = String::new();
 
-    check_unique_schema_names(graph, "TypeScript SDK")?;
+    UniqueSchemaNames::check(graph, "TypeScript SDK")?;
 
     let directions = schema_directions(graph);
     for (i, schema) in graph.schemas.iter().enumerate() {
@@ -321,8 +321,8 @@ pub(crate) fn emit_model_schema(
     schema: &crate::graph::Schema,
     models_module: &str,
     directions: SchemaDirections,
+    _names: UniqueSchemaNames,
 ) -> Result<String, CoreError> {
-    check_unique_schema_names(graph, "TypeScript SDK")?;
     let mut body = String::new();
     match &schema.body {
         Type::Enum(members) => emit_enum_alias(&mut body, &schema.name, members)?,
@@ -3369,7 +3369,7 @@ fn ts_status_match(expr: &str, statuses: &[u16]) -> String {
 /// `import { Client, Book } from "<pkg>"`. Symbols are emitted in graph order (deterministic). Twin of
 /// `pysdk::emit::emit_init`.
 ///
-/// Shares the SINGLE [`check_unique_schema_names`] validator with [`emit_models`] so the re-export
+/// Shares the SINGLE [`UniqueSchemaNames`] validator with [`emit_models`] so the re-export
 /// surface can never drift from the model definitions: a duplicate schema name is rejected here too
 /// (WR-05), regardless of the `generate` call order (this runs before `emit_models`). One source of
 /// truth, no second rule (rule 3).
@@ -3388,7 +3388,7 @@ pub(crate) fn emit_index_with_models(
     _package: &str,
     model_module: &str,
 ) -> Result<String, CoreError> {
-    check_unique_schema_names(graph, "TypeScript SDK")?;
+    UniqueSchemaNames::check(graph, "TypeScript SDK")?;
 
     let ops: Vec<&Operation> = graph.operations.iter().collect();
     check_params_type_names(graph, &ops)?;

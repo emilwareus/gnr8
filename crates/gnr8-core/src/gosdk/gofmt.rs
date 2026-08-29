@@ -13,6 +13,7 @@
 //! stderr; `child.stdin.take()` is handled with a `let Some(..) else { return Err(..) }` — there is no
 //! `.expect("piped")` (RESEARCH Pattern 3 caveat).
 
+use std::collections::BTreeMap;
 use std::fmt::Write as _;
 use std::fs;
 use std::io::Write as _;
@@ -23,38 +24,239 @@ use std::time::{SystemTime, UNIX_EPOCH};
 use crate::sdk::bundle::{safe_frame_name, SdkFile};
 use crate::CoreError;
 
-/// Pipe `src` through the `gofmt` binary and return the canonically-formatted Go source.
+/// Format generated Go files, answering from `memo_dir`'s record where this run already knows.
 ///
-/// # Errors
+/// Split SDK layouts can produce hundreds of small Go files. Running `gofmt` once per file pays
+/// process startup latency hundreds of times, so multi-file generation writes a short-lived temp
+/// tree, runs one batched `gofmt -w`, then reads the files back in the same deterministic order as
+/// the input vector.
 ///
-/// - [`CoreError::GoToolchainMissing`] if `gofmt` cannot be spawned (binary absent / not on `PATH`).
-/// - [`CoreError::GoFmt`] if `gofmt` exits non-zero (e.g. syntactically-invalid Go), carrying the exit
-///   code + captured stderr — never a panic.
-pub(crate) fn gofmt(src: &str) -> Result<String, CoreError> {
-    gofmt_with("gofmt", src)
+/// `memo_dir` is where the caller keeps its [`Memo`] — the project's `.gnr8/cache` for a pipeline
+/// run, `None` for a caller with no project to keep one in. It changes nothing about the answers,
+/// only how many of them this run has to ask `gofmt` for.
+pub(crate) fn gofmt_files(
+    files: Vec<SdkFile>,
+    memo_dir: Option<&Path>,
+) -> Result<Vec<SdkFile>, CoreError> {
+    let formatter = FormatterIdentity::resolve("gofmt")?;
+    let memo = memo_dir.map(|dir| Memo::load(dir, &formatter));
+
+    let digests: Vec<[u8; 32]> = files
+        .iter()
+        .map(|file| *blake3::hash(file.contents.as_bytes()).as_bytes())
+        .collect();
+    let mut pending: Vec<SdkFile> = Vec::new();
+    let mut pending_positions: Vec<usize> = Vec::new();
+    let mut answers: Vec<Option<String>> = Vec::with_capacity(files.len());
+    for (position, file) in files.iter().enumerate() {
+        if let Some(known) = memo.as_ref().and_then(|memo| memo.get(&digests[position])) {
+            answers.push(Some(known.to_string()));
+        } else {
+            answers.push(None);
+            pending_positions.push(position);
+            pending.push(file.clone());
+        }
+    }
+
+    for (file, position) in format_uncached(&formatter, pending)?
+        .into_iter()
+        .zip(&pending_positions)
+    {
+        answers[*position] = Some(file.contents);
+    }
+
+    let mut out = Vec::with_capacity(files.len());
+    for (file, contents) in files.into_iter().zip(answers) {
+        let Some(contents) = contents else {
+            return Err(CoreError::GoFmt {
+                code: None,
+                stderr: format!("gofmt returned no output for {}", file.name),
+            });
+        };
+        out.push(SdkFile {
+            name: file.name,
+            contents,
+        });
+    }
+
+    if let Some(dir) = memo_dir {
+        Memo::save(dir, &formatter, &digests, &out);
+    }
+    Ok(out)
 }
 
-/// Format generated Go files with one batched `gofmt` process.
-///
-/// Split SDK layouts can produce hundreds of small Go files. Running `gofmt` once per file pays process
-/// startup latency hundreds of times, so multi-file generation writes a short-lived temp tree, runs one
-/// batched `gofmt -w`, then reads the files back in the same deterministic order as the input vector.
-pub(crate) fn gofmt_files(files: Vec<SdkFile>) -> Result<Vec<SdkFile>, CoreError> {
+/// Format every file by actually running `gofmt`.
+fn format_uncached(
+    formatter: &FormatterIdentity,
+    files: Vec<SdkFile>,
+) -> Result<Vec<SdkFile>, CoreError> {
     if files.len() <= 1 {
         let mut out = Vec::with_capacity(files.len());
         for file in files {
             out.push(SdkFile {
+                contents: gofmt_with(&formatter.binary, &file.contents)?,
                 name: file.name,
-                contents: gofmt(&file.contents)?,
             });
         }
         return Ok(out);
     }
-
-    gofmt_files_with("gofmt", files)
+    gofmt_files_with(&formatter.binary, files)
 }
 
-fn gofmt_files_with(bin: &str, files: Vec<SdkFile>) -> Result<Vec<SdkFile>, CoreError> {
+/// The `gofmt` this run will use: the resolved binary and its content hash.
+///
+/// Resolved once and used for BOTH the memo key and the spawn — the binary is invoked by the exact
+/// path that was hashed — so a recorded answer can never describe a different formatter than the one
+/// that produced it. This is the discipline [`crate::analyze::helper`] already applies to the
+/// compiled `goextract`: hashing the artifact names it, rather than predicting it from a version.
+pub(crate) struct FormatterIdentity {
+    binary: PathBuf,
+    digest: [u8; 32],
+}
+
+impl FormatterIdentity {
+    fn resolve(name: &str) -> Result<Self, CoreError> {
+        let binary = resolve_program(name)?;
+        let bytes = fs::read(&binary).map_err(|source| CoreError::GoToolchainMissing { source })?;
+        let mut hasher = blake3::Hasher::new();
+        hasher.update(b"gnr8-gofmt-identity-v1\n");
+        hasher.update(binary.to_string_lossy().as_bytes());
+        hasher.update(b"\n");
+        hasher.update(&bytes);
+        Ok(Self {
+            binary,
+            digest: *hasher.finalize().as_bytes(),
+        })
+    }
+}
+
+/// The absolute path a bare program name resolves to on `PATH`.
+///
+/// A name with a separator is already a path. Resolving here rather than leaving it to the spawn is
+/// what lets the formatter be hashed: the binary that gets hashed is then the binary that gets run.
+fn resolve_program(name: &str) -> Result<PathBuf, CoreError> {
+    let candidate = Path::new(name);
+    if candidate.components().count() > 1 {
+        return Ok(candidate.to_path_buf());
+    }
+    let search = std::env::var_os("PATH").unwrap_or_default();
+    for dir in std::env::split_paths(&search) {
+        let candidate = dir.join(name);
+        if is_executable_file(&candidate) {
+            return Ok(candidate);
+        }
+    }
+    Err(CoreError::GoToolchainMissing {
+        source: std::io::Error::new(std::io::ErrorKind::NotFound, format!("no `{name}` on PATH")),
+    })
+}
+
+#[cfg(unix)]
+fn is_executable_file(path: &Path) -> bool {
+    use std::os::unix::fs::PermissionsExt;
+    fs::metadata(path).is_ok_and(|meta| meta.is_file() && meta.permissions().mode() & 0o111 != 0)
+}
+
+#[cfg(not(unix))]
+fn is_executable_file(path: &Path) -> bool {
+    fs::metadata(path).is_ok_and(|meta| meta.is_file())
+}
+
+/// The memo file's name inside the caller's cache directory.
+const MEMO_FILE: &str = "gofmt.memo";
+
+/// Magic + schema version. A record that does not start with this is not one of ours.
+const MEMO_MAGIC: &[u8; 8] = b"GN8FMT01";
+
+/// A record of `gofmt` answers, keyed by the source that produced them.
+///
+/// `gofmt` is a pure function of its input bytes and the binary that runs it, so a generation that
+/// emits the same Go it emitted last time — which is every generation whose graph did not change —
+/// can answer from the record instead of writing a thousand temporary files and spawning a process
+/// over them. On a 1,608-file SDK that was ~350ms of every warm run.
+///
+/// This is not a second way to format Go. It stores only answers this module produced, under a key
+/// that names the source AND the resolved formatter's content hash, and a record that cannot be read
+/// or that names a different formatter is simply absent: a memo may make a run faster and nothing
+/// else. It is rewritten with exactly the entries the current run needed, so it stays the size of
+/// one SDK rather than growing with every graph the project ever had.
+pub(crate) struct Memo {
+    entries: BTreeMap<[u8; 32], String>,
+}
+
+impl Memo {
+    fn get(&self, digest: &[u8; 32]) -> Option<&str> {
+        self.entries.get(digest).map(String::as_str)
+    }
+
+    fn load(dir: &Path, formatter: &FormatterIdentity) -> Self {
+        Self {
+            entries: fs::read(dir.join(MEMO_FILE))
+                .ok()
+                .and_then(|bytes| decode_memo(&bytes, formatter))
+                .unwrap_or_default(),
+        }
+    }
+
+    /// Publish the answers this run used. Failure is silent by design: a memo that cannot be written
+    /// costs the next run some time and nothing else.
+    fn save(dir: &Path, formatter: &FormatterIdentity, digests: &[[u8; 32]], files: &[SdkFile]) {
+        let mut entries: BTreeMap<&[u8; 32], &str> = BTreeMap::new();
+        for (digest, file) in digests.iter().zip(files) {
+            entries.insert(digest, file.contents.as_str());
+        }
+        let mut bytes = Vec::new();
+        bytes.extend_from_slice(MEMO_MAGIC);
+        bytes.extend_from_slice(&formatter.digest);
+        let Ok(count) = u32::try_from(entries.len()) else {
+            return;
+        };
+        bytes.extend_from_slice(&count.to_be_bytes());
+        for (digest, contents) in entries {
+            let Ok(len) = u32::try_from(contents.len()) else {
+                return;
+            };
+            bytes.extend_from_slice(digest);
+            bytes.extend_from_slice(&len.to_be_bytes());
+            bytes.extend_from_slice(contents.as_bytes());
+        }
+        if fs::create_dir_all(dir).is_err() {
+            return;
+        }
+        let temp = dir.join(format!(".{MEMO_FILE}-{}.tmp", std::process::id()));
+        if fs::write(&temp, &bytes).is_err() || fs::rename(&temp, dir.join(MEMO_FILE)).is_err() {
+            let _ = fs::remove_file(&temp);
+        }
+    }
+}
+
+/// Parse a memo written by [`Memo::save`], or `None` for anything this run must not trust.
+fn decode_memo(bytes: &[u8], formatter: &FormatterIdentity) -> Option<BTreeMap<[u8; 32], String>> {
+    let mut rest = bytes.strip_prefix(MEMO_MAGIC)?;
+    let (recorded, tail) = rest.split_at_checked(32)?;
+    if recorded != formatter.digest {
+        return None;
+    }
+    rest = tail;
+    let (count, tail) = rest.split_at_checked(4)?;
+    let count = u32::from_be_bytes(count.try_into().ok()?);
+    rest = tail;
+    let mut entries = BTreeMap::new();
+    for _ in 0..count {
+        let (digest, tail) = rest.split_at_checked(32)?;
+        let (len, tail) = tail.split_at_checked(4)?;
+        let len = u32::from_be_bytes(len.try_into().ok()?) as usize;
+        let (contents, tail) = tail.split_at_checked(len)?;
+        entries.insert(
+            <[u8; 32]>::try_from(digest).ok()?,
+            String::from_utf8(contents.to_vec()).ok()?,
+        );
+        rest = tail;
+    }
+    rest.is_empty().then_some(entries)
+}
+
+fn gofmt_files_with(bin: &Path, files: Vec<SdkFile>) -> Result<Vec<SdkFile>, CoreError> {
     let root = create_temp_root()?;
     let result = gofmt_files_in_temp(bin, &root, files);
     let _ = fs::remove_dir_all(&root);
@@ -62,7 +264,7 @@ fn gofmt_files_with(bin: &str, files: Vec<SdkFile>) -> Result<Vec<SdkFile>, Core
 }
 
 fn gofmt_files_in_temp(
-    bin: &str,
+    bin: &Path,
     root: &Path,
     files: Vec<SdkFile>,
 ) -> Result<Vec<SdkFile>, CoreError> {
@@ -149,7 +351,7 @@ fn create_temp_root() -> Result<PathBuf, CoreError> {
 
 /// Inner driver parameterized on the binary name so tests can force a missing binary (toolchain-missing
 /// path) without mutating the process `PATH`.
-fn gofmt_with(bin: &str, src: &str) -> Result<String, CoreError> {
+fn gofmt_with(bin: &Path, src: &str) -> Result<String, CoreError> {
     // No args, no shell — the source is fed on stdin (T-03-02-SC).
     let mut child = Command::new(bin)
         .stdin(Stdio::piped())
@@ -229,12 +431,17 @@ mod tests {
     // the workspace-wide RUST-04 deny stays intact for production code.
     #![allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
 
-    use super::{gofmt, gofmt_files, gofmt_with};
+    use super::{decode_memo, gofmt_files, gofmt_with, FormatterIdentity, Memo};
     use crate::sdk::bundle::SdkFile;
     use crate::CoreError;
 
     /// Whether the `gofmt` binary is available, so toolchain-dependent tests skip gracefully (mirrors
     /// `tests/determinism.rs`) rather than failing for a missing dependency.
+    /// Format one source through the resolved `gofmt`, the way [`format_uncached`] does.
+    fn gofmt(src: &str) -> Result<String, CoreError> {
+        gofmt_with(&FormatterIdentity::resolve("gofmt")?.binary, src)
+    }
+
     fn gofmt_available() -> bool {
         std::process::Command::new("gofmt")
             .arg("-h")
@@ -281,7 +488,7 @@ mod tests {
             },
         ];
 
-        let formatted = gofmt_files(files).unwrap();
+        let formatted = gofmt_files(files, None).unwrap();
 
         assert_eq!(formatted[0].name, "a.go");
         assert_eq!(formatted[1].name, "nested/b.go");
@@ -314,9 +521,108 @@ mod tests {
         }
     }
 
+    fn memo_dir(label: &str) -> std::path::PathBuf {
+        let nanos = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map_or(0, |d| d.as_nanos());
+        let dir = std::env::temp_dir().join(format!(
+            "gnr8-gofmt-memo-{label}-{}-{nanos}",
+            std::process::id()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        dir
+    }
+
+    fn messy_files() -> Vec<SdkFile> {
+        vec![
+            SdkFile {
+                name: "a.go".to_string(),
+                contents: "package x\nfunc a(){\n}\n".to_string(),
+            },
+            SdkFile {
+                name: "nested/b.go".to_string(),
+                contents: "package nested\nfunc b(){\n}\n".to_string(),
+            },
+        ]
+    }
+
+    /// A memoized run and an unmemoized one must produce the same bytes — that is the whole contract.
+    #[test]
+    fn a_memo_hit_answers_exactly_what_gofmt_would_have() {
+        if !gofmt_available() {
+            eprintln!("skipping gofmt memo test: gofmt unavailable");
+            return;
+        }
+        let dir = memo_dir("hit");
+        let cold = gofmt_files(messy_files(), Some(&dir)).unwrap();
+        assert!(
+            dir.join("gofmt.memo").is_file(),
+            "the run must leave a memo"
+        );
+        // The second run answers entirely from the record; even with no gofmt on PATH it would.
+        let warm = gofmt_files(messy_files(), Some(&dir)).unwrap();
+        let direct = gofmt_files(messy_files(), None).unwrap();
+        for (memoized, formatted) in warm.iter().zip(&direct) {
+            assert_eq!(memoized.name, formatted.name);
+            assert_eq!(memoized.contents, formatted.contents);
+        }
+        assert_eq!(cold.len(), warm.len());
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    /// A record that names a different formatter is not this run's to reuse.
+    #[test]
+    fn a_memo_written_by_another_formatter_is_ignored() {
+        if !gofmt_available() {
+            eprintln!("skipping gofmt memo identity test: gofmt unavailable");
+            return;
+        }
+        let dir = memo_dir("identity");
+        gofmt_files(messy_files(), Some(&dir)).unwrap();
+        let recorded = std::fs::read(dir.join("gofmt.memo")).unwrap();
+        let real = FormatterIdentity::resolve("gofmt").unwrap();
+        assert!(decode_memo(&recorded, &real).is_some());
+
+        let mut other = FormatterIdentity::resolve("gofmt").unwrap();
+        other.digest[0] ^= 0xff;
+        assert!(
+            decode_memo(&recorded, &other).is_none(),
+            "an answer must never be reused for a formatter that did not produce it"
+        );
+        // Loading through the public seam degrades to an empty record rather than an error.
+        assert!(Memo::load(&dir, &other).entries.is_empty());
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    /// Garbage in the cache is a slower run, never a wrong one and never a crash.
+    #[test]
+    fn a_corrupt_memo_is_simply_absent() {
+        if !gofmt_available() {
+            eprintln!("skipping gofmt memo corruption test: gofmt unavailable");
+            return;
+        }
+        let dir = memo_dir("corrupt");
+        let formatter = FormatterIdentity::resolve("gofmt").unwrap();
+        for garbage in [
+            b"".as_slice(),
+            b"not a memo".as_slice(),
+            b"GN8FMT01short".as_slice(),
+        ] {
+            assert!(decode_memo(garbage, &formatter).is_none());
+        }
+        std::fs::write(dir.join("gofmt.memo"), b"GN8FMT01 truncated").unwrap();
+        let recovered = gofmt_files(messy_files(), Some(&dir)).unwrap();
+        assert!(recovered[0].contents.contains("func a() {\n}"));
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
     #[test]
     fn missing_binary_maps_to_toolchain_missing() {
-        let err = gofmt_with("gnr8-nonexistent-gofmt-binary-xyz", "package x\n").unwrap_err();
+        let err = gofmt_with(
+            std::path::Path::new("./gnr8-nonexistent-gofmt-binary-xyz"),
+            "package x\n",
+        )
+        .unwrap_err();
         assert!(
             matches!(err, CoreError::GoToolchainMissing { .. }),
             "expected GoToolchainMissing, got {err:?}"

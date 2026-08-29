@@ -184,6 +184,8 @@ pub(crate) struct DoctorRuntime {
     pub(crate) binary_path: Option<String>,
     /// Resolved resource directory, if any.
     pub(crate) resource_dir: Option<String>,
+    /// The machine-global cache store this run shares through, or `None` when sharing is off.
+    pub(crate) cache_store: Option<String>,
     /// Output anchors reported by the generation pipeline.
     pub(crate) output_anchors: Vec<String>,
 }

@@ -85,7 +85,7 @@ fn run_pipeline(label: &str, pipeline: Pipeline) -> BTreeMap<String, String> {
         .target(GoSdk::new().module("github.com/acme/fixture").to("go"))
         .target(PySdk::new().module("acme-fixture").to("python"))
         .target(TsSdk::new().module("@acme/fixture").to("ts"));
-    let outcome = gnr8_engine::pipeline::run_in_process(&pipeline, &Cx::new(&root))
+    let outcome = gnr8_engine::pipeline::run_in_process(&pipeline, &Cx::new(&root), None)
         .expect("pipeline must generate");
     let files = outcome
         .artifacts
@@ -274,7 +274,7 @@ fn openapi_document_is_unchanged_by_go_identifier_spelling() {
     let pipeline = Pipeline::new()
         .source(OpenApi::new().input("openapi.yaml"))
         .target(OpenApi31::new().to("out.yaml"));
-    let outcome = gnr8_engine::pipeline::run_in_process(&pipeline, &Cx::new(&root))
+    let outcome = gnr8_engine::pipeline::run_in_process(&pipeline, &Cx::new(&root), None)
         .expect("pipeline must generate");
     let document = outcome
         .artifacts

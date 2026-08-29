@@ -4,8 +4,9 @@
 //! project's `.gnr8/` worker must never compile: source extraction and the language sidecars
 //! ([`analyze`]), the direction analysis and generation projection ([`graph`]), `OpenAPI` lowering
 //! ([`lower`]), the Go/Python/TypeScript emitters ([`gosdk`], [`pysdk`], [`tssdk`]), the ownership
-//! manifest and filesystem writer ([`manifest`], [`lifecycle`]), and the two sides of the worker
-//! boundary — stage ordering ([`pipeline`]) and the worker build/session ([`worker`]).
+//! manifest and filesystem writer ([`manifest`], [`lifecycle`]), the two sides of the worker
+//! boundary — stage ordering ([`pipeline`]) and the worker build/session ([`worker`]) — and the
+//! machine-global cache every checkout on a machine shares ([`store`]).
 //!
 //! The composition surface a user writes against — the API graph, the four stage traits,
 //! [`sdk::Pipeline`], the built-in stage declarations, and the frame protocol — lives in the
@@ -33,10 +34,12 @@ pub mod graph;
 pub mod lifecycle;
 pub mod lower;
 pub mod manifest;
+pub(crate) mod parallel;
 pub mod pipeline;
 pub mod pysdk;
 pub mod resource;
 pub mod sdk;
+pub mod store;
 pub mod tssdk;
 pub mod worker;
 pub mod workspace;

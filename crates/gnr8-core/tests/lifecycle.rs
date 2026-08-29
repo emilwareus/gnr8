@@ -349,14 +349,14 @@ fn plan_writes_truth_table() {
     manifest.record("stale-record.go", &blake3_hex(b"OLD"), "generated");
     // untracked.go is deliberately NOT in the manifest.
 
-    let on_disk = |path: &str| -> Option<Vec<u8>> {
+    let on_disk = |path: &str| -> Option<&'static [u8]> {
         match path {
             "absent.go" => None,
-            "noop.go" => Some(b"SAME".to_vec()),
-            "changed.go" => Some(b"OLD".to_vec()),
-            "edited.go" => Some(b"HUMAN-EDIT".to_vec()),
-            "adopted.go" | "stale-record.go" => Some(b"NEW".to_vec()),
-            "untracked.go" => Some(b"PRE-EXISTING".to_vec()),
+            "noop.go" => Some(b"SAME"),
+            "changed.go" => Some(b"OLD"),
+            "edited.go" => Some(b"HUMAN-EDIT"),
+            "adopted.go" | "stale-record.go" => Some(b"NEW"),
+            "untracked.go" => Some(b"PRE-EXISTING"),
             other => panic!("unexpected on_disk lookup for {other}"),
         }
     };
