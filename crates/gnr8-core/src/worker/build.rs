@@ -732,11 +732,6 @@ pub fn ensure_worker(
         || Ok(binary_identity(&workspace.binary_path())),
     )?;
     let before = fingerprints_of(workspace, &host_hash, &workspace_files)?;
-    // The store answers a question asked from another checkout, so it may only be reached when this
-    // fingerprint names the same bytes there. Decided once, over the inputs already enumerated, so
-    // the restore below and the publish at the end can never disagree about it.
-    let store =
-        store.filter(|_| inputs_are_the_same_from_every_checkout(&workspace.dir, &workspace_files));
     if let Some(stamp) = read_stamp(workspace) {
         if stamp_matches(
             workspace,
@@ -762,6 +757,12 @@ pub fn ensure_worker(
             ),
         });
     }
+    // The store answers a question asked from another checkout, so it may only be reached when this
+    // fingerprint names the same bytes there. Decided once, here — past the stamp a warm run returns
+    // on, so that run never pays for it — and used by both the restore below and the publish at the
+    // end, which therefore cannot disagree about it.
+    let store =
+        store.filter(|_| inputs_are_the_same_from_every_checkout(&workspace.dir, &workspace_files));
     // The store is where a build comes from when it does not have to happen again, so it is reached
     // on the same terms as the build it replaces: `--no-build` withholds consent for producing a
     // worker binary in this checkout at all, not merely for running cargo.
