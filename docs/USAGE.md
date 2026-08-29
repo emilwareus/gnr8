@@ -251,7 +251,8 @@ project asks the same question. gnr8 keeps the answers in one machine-global sto
 `$XDG_CACHE_HOME/gnr8/store` (`~/.cache/gnr8/store`), `~/Library/Caches/gnr8/store` on macOS, or
 `%LOCALAPPDATA%\gnr8\store` on Windows — so a fresh worktree restores the worker the previous one
 built instead of compiling it again, and reuses a Go source analysis it has already performed. On a
-4,836-artifact project that is a first run of about 5 s instead of 31-47 s.
+4,836-artifact project a fresh worktree's first `generate` went from 22.5 s to 0.9 s when this machine
+had already analyzed the same sources, and to 5.6 s when only the worker was shared.
 
 Two rules make sharing safe. Every entry is stored under the key the derivation already computes over
 its complete input surface, and records that key inside itself, so an entry can only ever be returned
@@ -259,9 +260,12 @@ for the exact question it answered — a differing `.gnr8/Cargo.lock`, gnr8 vers
 source byte is a different key and a miss. And every restored binary is re-hashed against the length
 and digest the entry recorded before it is moved into place; a mismatch deletes the entry and builds.
 
-The store is user-owned local state, at the trust level of `~/.cargo/registry`. gnr8 creates it
-private to you (`0700` on Unix), never shares it between users or machines, and never fails a run over
-it: a missing, unwritable, full, or corrupt store is a miss. Deleting it is always safe.
+The store is one user's state on one machine, at the trust level of `~/.cargo/registry`. gnr8 creates
+it private to you (`0700` on Unix), never shares it between users, machines, or over a network, and
+never fails a run over it: a missing, unwritable, full, or corrupt store is a miss. Deleting it is
+always safe, and nothing evicts entries — see
+[artifacts and CI](operations/artifacts-and-ci.md#the-machine-global-store) for the trust boundary a
+content hash cannot cross, and point `GNR8_CACHE_STORE` at local storage only you can write.
 
 | `GNR8_CACHE_STORE` | Effect |
 |---|---|
