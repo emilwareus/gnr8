@@ -19,16 +19,17 @@ must move the minor version.
   with nothing of its own restores from it instead of compiling and extracting again.
 
   Measured on an 8-core Linux machine against a 4,836-artifact / 251-source-file Go project, median
-  of repeated runs, with a warm store:
+  of repeated runs, every run reporting `0 written, 4836 unchanged` with a clean `git status`:
 
   | first `generate` in a fresh worktree | before | now | |
   |---|---:|---:|---:|
-  | identical sources to one already generated | 23.5 s | 0.88 s | **27x** |
-  | different commit, same `.gnr8/` (worker restored, analysis recomputed) | 23.5 s | 5.6 s | **4.2x** |
-  | that worktree's own second run | 0.62 s | 0.61 s | unchanged |
+  | sources this machine has already analyzed | 22.5 s | 0.86 s | **26x** |
+  | a different commit, same `.gnr8/` — worker restored, analysis recomputed | 22.5 s | 5.6 s | **4.0x** |
+  | nothing in the store yet | 22.5 s | 21.4 s | unchanged |
+  | `GNR8_CACHE_STORE=off` | 22.5 s | 21.5 s | unchanged |
 
-  A warm run does not touch the store at all — the checkout's own stamp and cache still answer first —
-  and measures the same as before (0.617 s → 0.611 s, noise).
+  A warm run never reaches the store — the checkout's own stamp and cache still answer first — and
+  measures the same as before (0.617 s → 0.611 s over eight interleaved samples each, noise).
 
   `GNR8_CACHE_STORE` is the whole configuration surface: an absolute path names the store, `off`
   (or `disabled`/`none`) turns sharing off and leaves each checkout with only its own `.gnr8/cache`,

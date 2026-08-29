@@ -810,8 +810,9 @@ fn restore_worker(workspace: &Workspace, store: &Store, fingerprint: &str) -> Op
 
     // The binary is copied to a temporary name beside its destination and verified BEFORE it is
     // moved into place, so a corrupt entry never lands at the path the host is about to execute.
-    // Renaming rather than writing over the destination also leaves a worker this machine is
-    // already running on its own inode.
+    // Renaming rather than writing over the destination is also what makes replacing a worker this
+    // machine is currently running safe: on Unix the running process keeps its own inode, and on
+    // Windows the rename fails instead of tearing the file, which is a miss like any other.
     let destination = workspace.binary_path();
     let parent = destination.parent()?;
     std::fs::create_dir_all(parent).ok()?;
