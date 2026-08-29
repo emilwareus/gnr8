@@ -164,6 +164,17 @@ and stamped locally exactly as before and never published. A path that stays ins
 covered by content like every other input, and an absolute one names a single directory on this
 machine, so both stay shareable.
 
+A cargo config reaches the same build from outside every checkout. `[patch]`, `[replace]` and
+`paths` send a package's source somewhere neither the manifest nor the lockfile names, so `.gnr8/`
+is byte-identical either side of one while what cargo compiles is not — and a fingerprint over
+`.gnr8/` cannot move to record it. A config declaring one therefore disables sharing for that run,
+in either direction: gnr8 reads `config.toml` and its extensionless spelling in the project's
+`.cargo/`, in every ancestor's, and in `$CARGO_HOME` (else `~/.cargo`), and takes the build out of
+the store if any of them does. It never asks WHICH package is redirected — a patch of any crate in
+the worker's graph moves the same unhashed bytes a patch of the SDK does — and a config it cannot
+read, cannot parse, or that `include`s another file counts as a redirect too. A false yes costs one
+local build; a false no would share the wrong binary.
+
 The ownership manifest is deliberately **not** shared: it records what *this* checkout's outputs are,
 which is checkout state rather than an answer. Neither is the `gofmt` memo, which is rewritten with
 exactly the entries one run needed and would otherwise thrash between projects. The compiled
@@ -182,6 +193,11 @@ because whoever can rewrite an entry can rewrite the hash beside it. Point `GNR8
 storage only you can write — not at a share several machines mount. The build fingerprint covers the
 host `gnr8` executable's own content, so a different platform's gnr8 can never match one of these
 keys, but it says nothing about the system libraries the machine that built a worker linked against.
+The cargo-config check above reads files, so a redirect that reaches cargo some other way is outside
+it: a `CARGO_*` environment variable, a wrapper script named by `GNR8_CARGO`, or a file pulled in by
+an `include` (which is why an `include` is treated as unprovable rather than followed). Those remain
+what they have always been — the invoking user's own environment, at the same trust level as the
+store itself.
 
 **Failure is a miss.** A store that does not exist, cannot be created, is full, or holds an entry this
 gnr8 cannot read never fails a run — it costs the time the answer would have saved. Deleting the whole

@@ -269,6 +269,11 @@ a directory the fingerprint never hashes — and a different one in every checko
 built and stamped in this checkout exactly as before and nothing is published. Writing that
 dependency as an absolute path, or keeping it inside `.gnr8/`, keeps it shareable. (A Go `replace`
 that points at a local directory needs no such care: the source key hashes that directory too.)
+A cargo `[patch]`, `[replace]` or `paths` override does the same from outside every checkout —
+`.gnr8/` does not change by a byte, lockfile included, while the sources the build compiles do — so
+a config declaring one, in the project's `.cargo/`, any ancestor's, or `$CARGO_HOME`'s, disables
+sharing for that run. The check is deliberately conservative: it does not ask which package is
+redirected, and a config it cannot read, cannot parse, or that `include`s another file counts as one.
 
 The store is one user's state on one machine, at the trust level of `~/.cargo/registry`. gnr8 creates
 it private to you (`0700` on Unix), never shares it between users, machines, or over a network, and
