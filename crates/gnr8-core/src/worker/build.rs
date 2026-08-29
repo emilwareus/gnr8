@@ -21,11 +21,24 @@
 //! The fingerprint covers every file under `.gnr8/` (except `target/` and `cache/`), the host
 //! executable's own content hash — which is what makes an in-repo path dependency on the SDK safe —
 //! and the protocol/capability constants. So an unchanged project runs `cargo` zero times.
+//!
+//! ## Sharing a build across checkouts
+//!
+//! That fingerprint names inputs, not a location: two worktrees holding byte-identical `.gnr8/`
+//! sources compute the same one. So a build that has already happened on this machine does not have
+//! to happen again in the next checkout — [`crate::store`] keeps the binary under that fingerprint,
+//! and a stamp miss looks there before it reaches `cargo`.
+//!
+//! A restored binary is verified the same way the recorded one is: the store's entry records the
+//! length and content hash of the bytes it published, and the copy is re-hashed and compared BEFORE
+//! it is moved into place. What that catches is a corrupt or truncated entry. What it cannot catch
+//! is a store some other user can write into — see [`crate::store`] for that boundary.
 
 use std::path::{Path, PathBuf};
 use std::process::Command;
 
 use crate::manifest::{blake3_file, blake3_hex};
+use crate::store::{Namespace, Store};
 use crate::CoreError;
 
 /// The env var that overrides the cargo binary used to build the worker (checked before `CARGO`).
@@ -579,13 +592,39 @@ fn require_real_worker_path(path: &Path, kind: EntryKind) -> Result<(), CoreErro
     Ok(())
 }
 
+/// Where the worker binary a run is about to execute came from.
+///
+/// Three ways, and no fourth: it was already recorded in this checkout, it was copied from the
+/// machine's store under this build's own fingerprint, or `cargo` produced it here and now.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum WorkerOrigin {
+    /// The checkout's own build stamp still described the binary on disk.
+    Reused,
+    /// The machine's store held the build output of exactly these inputs.
+    Restored,
+    /// `cargo` was invoked.
+    Built,
+}
+
+impl WorkerOrigin {
+    /// The one word a report uses for this origin.
+    #[must_use]
+    pub const fn label(self) -> &'static str {
+        match self {
+            Self::Reused => "reused",
+            Self::Restored => "restored",
+            Self::Built => "built",
+        }
+    }
+}
+
 /// The outcome of making a worker binary available.
 #[derive(Debug, Clone)]
 pub struct WorkerBinary {
     /// The executable to run.
     pub path: PathBuf,
-    /// Whether `cargo` was invoked to produce it.
-    pub built: bool,
+    /// How this run obtained it.
+    pub origin: WorkerOrigin,
 }
 
 /// Ensure a runnable worker binary exists for `workspace`, building it only when its inputs changed.
@@ -598,6 +637,7 @@ pub struct WorkerBinary {
 pub fn ensure_worker(
     workspace: &Workspace,
     policy: WorkerPolicy,
+    store: Option<&Store>,
 ) -> Result<WorkerBinary, CoreError> {
     // Deciding whether the recorded worker is still current means reading the host executable, every
     // `.gnr8/` input, and the built worker — tens of megabytes of unrelated files. They are read at
@@ -622,9 +662,17 @@ pub fn ensure_worker(
             confirm_binary_is_inside_the_workspace(workspace, &binary)?;
             return Ok(WorkerBinary {
                 path: binary,
-                built: false,
+                origin: WorkerOrigin::Reused,
             });
         }
+    }
+    if let Some(binary) = store.and_then(|store| restore_worker(workspace, store, &before.complete))
+    {
+        confirm_binary_is_inside_the_workspace(workspace, &binary)?;
+        return Ok(WorkerBinary {
+            path: binary,
+            origin: WorkerOrigin::Restored,
+        });
     }
     if !policy.allow_build {
         return Err(CoreError::WorkerBuild {
@@ -663,16 +711,133 @@ pub fn ensure_worker(
     write_stamp(
         workspace,
         &WorkerStamp {
-            fingerprint: after.complete,
+            fingerprint: after.complete.clone(),
             binary: project_relative(&workspace.project_root, &binary),
             binary_len,
-            binary_hash,
+            binary_hash: binary_hash.clone(),
         },
     );
+    if let Some(store) = store {
+        publish_worker(store, &after.complete, &binary, binary_len, &binary_hash);
+    }
     Ok(WorkerBinary {
         path: binary,
-        built: true,
+        origin: WorkerOrigin::Built,
     })
+}
+
+/// The schema version of a stored worker entry.
+const WORKER_ENTRY_VERSION: u32 = 1;
+
+/// What the store records about one built worker: which blob is the binary, and what it must hash to.
+///
+/// The fingerprint is recorded INSIDE the entry as well as in its file name, for the same reason the
+/// source cache records its key: an entry must be able to prove which question it answers, so that a
+/// rewritten or restored store directory cannot present one answer as another.
+#[derive(Debug, serde::Serialize, serde::Deserialize)]
+struct WorkerEntry {
+    version: u32,
+    fingerprint: String,
+    /// The blake3 of the binary's bytes, which is also the blob's name in the store.
+    binary_hash: String,
+    /// The binary's length in bytes.
+    binary_len: u64,
+}
+
+/// Put this build's output in the machine's store, under the fingerprint of its inputs.
+///
+/// Best-effort in both halves: the blob is written first and the entry that names it second, so an
+/// entry never points at a blob that was never durable. Two publishers of the same fingerprint can
+/// produce different bytes — cargo's output is not byte-reproducible across target directories — so
+/// the blob is named by its own content and the entry, not the blob, is what they race on. Either
+/// entry is complete and correct.
+fn publish_worker(store: &Store, fingerprint: &str, binary: &Path, len: u64, hash: &str) {
+    store.publish_blob(hash, binary);
+    let entry = WorkerEntry {
+        version: WORKER_ENTRY_VERSION,
+        fingerprint: fingerprint.to_string(),
+        binary_hash: hash.to_string(),
+        binary_len: len,
+    };
+    if let Ok(bytes) = serde_json::to_vec(&entry) {
+        store.publish(Namespace::Worker, fingerprint, &bytes);
+    }
+}
+
+/// Whether every directory a restored worker would be written through is a real directory here.
+///
+/// A level that does not exist yet is fine — it is about to be created as a real one. A level that
+/// exists as a symlink is not, and is the one case that stops the restore.
+fn worker_build_dirs_are_real(workspace: &Workspace) -> bool {
+    [workspace.target_dir(), workspace.profile_dir()]
+        .iter()
+        .all(|dir| match std::fs::symlink_metadata(dir) {
+            Ok(metadata) => metadata.is_dir() && !metadata.file_type().is_symlink(),
+            Err(_) => true,
+        })
+}
+
+/// Copy the stored build output for `fingerprint` into this checkout, or answer `None`.
+///
+/// `None` is always "build it here instead", never an error: an absent entry, an entry this gnr8
+/// cannot read, a missing blob, a copy that fails, or bytes that do not hash to what the entry
+/// recorded all mean the same thing to the caller. An entry that is *provably* wrong — the wrong
+/// schema, the wrong fingerprint, or a blob that does not match its own record — is deleted on the
+/// way out, because it can never become right.
+fn restore_worker(workspace: &Workspace, store: &Store, fingerprint: &str) -> Option<PathBuf> {
+    let bytes = store.read(Namespace::Worker, fingerprint)?;
+    let entry = serde_json::from_slice::<WorkerEntry>(&bytes)
+        .ok()
+        .filter(|entry| entry.version == WORKER_ENTRY_VERSION && entry.fingerprint == fingerprint);
+    let Some(entry) = entry else {
+        store.discard(Namespace::Worker, fingerprint);
+        return None;
+    };
+    let Some(blob) = store.blob_path(&entry.binary_hash) else {
+        store.discard(Namespace::Worker, fingerprint);
+        return None;
+    };
+
+    // gnr8 owns `.gnr8/target` and will not write a binary into it through a symlink, for the same
+    // reason it will not run one from there: that subtree is excluded from the fingerprint, so a
+    // link out of it is a redirection nothing else would notice.
+    if !worker_build_dirs_are_real(workspace) {
+        return None;
+    }
+
+    // The binary is copied to a temporary name beside its destination and verified BEFORE it is
+    // moved into place, so a corrupt entry never lands at the path the host is about to execute.
+    // Renaming rather than writing over the destination also leaves a worker this machine is
+    // already running on its own inode.
+    let destination = workspace.binary_path();
+    let parent = destination.parent()?;
+    std::fs::create_dir_all(parent).ok()?;
+    let temporary = parent.join(format!(".{}.{}.tmp", workspace.package, std::process::id()));
+    let restored = std::fs::copy(&blob, &temporary)
+        .ok()
+        .and_then(|_| binary_identity(&temporary))
+        .is_some_and(|(len, hash)| len == entry.binary_len && hash == entry.binary_hash);
+    if !restored {
+        let _ = std::fs::remove_file(&temporary);
+        // The blob did not match the entry that named it, so neither is usable by anyone.
+        let _ = std::fs::remove_file(&blob);
+        store.discard(Namespace::Worker, fingerprint);
+        return None;
+    }
+    if std::fs::rename(&temporary, &destination).is_err() {
+        let _ = std::fs::remove_file(&temporary);
+        return None;
+    }
+    write_stamp(
+        workspace,
+        &WorkerStamp {
+            fingerprint: fingerprint.to_string(),
+            binary: project_relative(&workspace.project_root, &destination),
+            binary_len: entry.binary_len,
+            binary_hash: entry.binary_hash,
+        },
+    );
+    Some(destination)
 }
 
 /// Publish the build stamp atomically.
@@ -795,7 +960,7 @@ fn describe_status(status: std::process::ExitStatus) -> String {
 mod tests {
     #![allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
 
-    use super::{exact_pin, validate_workspace, workspace_input_files, WorkerPolicy};
+    use super::{exact_pin, validate_workspace, workspace_input_files, Namespace, WorkerPolicy};
     use std::path::PathBuf;
 
     fn temp_project(label: &str) -> PathBuf {
@@ -927,6 +1092,140 @@ mod tests {
         assert!(!WorkerPolicy::no_execute().allow_build);
         assert!(!WorkerPolicy::no_execute().allow_execute);
         assert!(WorkerPolicy::default().allow_build);
+    }
+
+    /// Publish a worker entry the way a real build does, then hand back what it recorded.
+    fn publish_fake_worker(
+        store: &crate::store::Store,
+        workspace: &super::Workspace,
+        fingerprint: &str,
+        bytes: &[u8],
+    ) -> (u64, String) {
+        let binary = workspace.binary_path();
+        std::fs::create_dir_all(binary.parent().unwrap()).unwrap();
+        std::fs::write(&binary, bytes).unwrap();
+        let (len, hash) = super::binary_identity(&binary).unwrap();
+        super::publish_worker(store, fingerprint, &binary, len, &hash);
+        std::fs::remove_file(&binary).unwrap();
+        (len, hash)
+    }
+
+    #[test]
+    fn a_published_worker_is_restored_and_recorded_in_this_checkouts_own_stamp() {
+        let root = temp_project("restore");
+        write_manifest(&root, CURRENT);
+        let workspace = validate_workspace(&root).unwrap();
+        let store = crate::store::Store::at(root.join("store"));
+        let fingerprint = "a".repeat(64);
+        let (len, hash) = publish_fake_worker(&store, &workspace, &fingerprint, b"worker bytes");
+
+        let restored = super::restore_worker(&workspace, &store, &fingerprint);
+
+        assert_eq!(restored.as_deref(), Some(workspace.binary_path().as_path()));
+        assert_eq!(
+            std::fs::read(workspace.binary_path()).unwrap(),
+            b"worker bytes"
+        );
+        let stamp = super::read_stamp(&workspace).expect("a restore must record a stamp");
+        assert_eq!(stamp.fingerprint, fingerprint);
+        assert_eq!(stamp.binary_len, len);
+        assert_eq!(stamp.binary_hash, hash);
+        assert!(super::stamp_matches(
+            &workspace,
+            &stamp,
+            &fingerprint,
+            super::binary_identity(&workspace.binary_path()).as_ref()
+        ));
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn an_entry_that_does_not_answer_this_fingerprint_is_discarded_rather_than_read() {
+        let root = temp_project("restore-foreign");
+        write_manifest(&root, CURRENT);
+        let workspace = validate_workspace(&root).unwrap();
+        let store = crate::store::Store::at(root.join("store"));
+        let recorded = "b".repeat(64);
+        publish_fake_worker(&store, &workspace, &recorded, b"worker bytes");
+        // Plant that entry under a different fingerprint, the way a rewritten store directory could.
+        let planted = "c".repeat(64);
+        let bytes = store.read(Namespace::Worker, &recorded).unwrap();
+        store.publish(Namespace::Worker, &planted, &bytes);
+
+        assert!(super::restore_worker(&workspace, &store, &planted).is_none());
+
+        assert_eq!(
+            store.read(Namespace::Worker, &planted),
+            None,
+            "an entry that answers another question must be discarded"
+        );
+        assert!(
+            !workspace.binary_path().exists(),
+            "nothing must be written into the checkout"
+        );
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn an_entry_written_by_another_schema_is_a_miss() {
+        let root = temp_project("restore-version");
+        write_manifest(&root, CURRENT);
+        let workspace = validate_workspace(&root).unwrap();
+        let store = crate::store::Store::at(root.join("store"));
+        let fingerprint = "d".repeat(64);
+        store.publish(
+            Namespace::Worker,
+            &fingerprint,
+            br#"{"version":9999,"fingerprint":"dddd","binary_hash":"ab","binary_len":1}"#,
+        );
+
+        assert!(super::restore_worker(&workspace, &store, &fingerprint).is_none());
+        assert_eq!(store.read(Namespace::Worker, &fingerprint), None);
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn a_blob_that_no_longer_matches_its_entry_is_removed_and_never_moved_into_place() {
+        let root = temp_project("restore-corrupt");
+        write_manifest(&root, CURRENT);
+        let workspace = validate_workspace(&root).unwrap();
+        let store = crate::store::Store::at(root.join("store"));
+        let fingerprint = "e".repeat(64);
+        let (_, hash) = publish_fake_worker(&store, &workspace, &fingerprint, b"worker bytes");
+        let blob = store.blob_path(&hash).unwrap();
+        std::fs::write(&blob, b"tampered").unwrap();
+
+        assert!(super::restore_worker(&workspace, &store, &fingerprint).is_none());
+
+        assert!(!blob.exists(), "a blob that lies about itself is removed");
+        assert_eq!(store.read(Namespace::Worker, &fingerprint), None);
+        assert!(
+            !workspace.binary_path().exists(),
+            "a corrupt entry must never reach the path the host executes"
+        );
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_restore_refuses_to_write_through_a_symlinked_build_directory() {
+        let root = temp_project("restore-symlink");
+        write_manifest(&root, CURRENT);
+        let workspace = validate_workspace(&root).unwrap();
+        let store = crate::store::Store::at(root.join("store"));
+        let fingerprint = "f".repeat(64);
+        publish_fake_worker(&store, &workspace, &fingerprint, b"worker bytes");
+        std::fs::remove_dir_all(workspace.target_dir()).unwrap();
+        let elsewhere = root.join("elsewhere");
+        std::fs::create_dir_all(&elsewhere).unwrap();
+        std::os::unix::fs::symlink(&elsewhere, workspace.target_dir()).unwrap();
+
+        assert!(super::restore_worker(&workspace, &store, &fingerprint).is_none());
+        assert!(
+            !elsewhere.join("gnr8").exists(),
+            "nothing may be written through the link"
+        );
+        let _ = std::fs::remove_dir_all(root);
     }
 
     #[test]

@@ -106,10 +106,15 @@ func main() {
 }
 
 /// Run `gnr8 <args...>` with `current_dir = root`, returning (success, stdout, stderr).
+///
+/// Every invocation shares through a store INSIDE the staging dir. The machine-global store is on by
+/// default, and a test that used the developer's own would both read answers it did not produce and
+/// leave answers behind; rooting it here keeps the run hermetic and still exercises the sharing path.
 fn run_gnr8(root: &Path, args: &[&str]) -> (bool, String, String) {
     let output = Command::new(GNR8_BIN)
         .args(args)
         .current_dir(root)
+        .env("GNR8_CACHE_STORE", root.join("gnr8-store"))
         .output()
         .expect("spawn the gnr8 host binary");
     (
@@ -149,6 +154,7 @@ fn assert_cached_watch_cold_start_preserves_outputs(root: &Path) {
     command
         .arg("watch")
         .current_dir(root)
+        .env("GNR8_CACHE_STORE", root.join("gnr8-store"))
         .stdout(Stdio::piped())
         .stderr(Stdio::piped());
     #[cfg(unix)]

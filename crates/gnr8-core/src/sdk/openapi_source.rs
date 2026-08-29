@@ -4431,7 +4431,7 @@ components:
             .source(OpenApi::new().input("openapi.yaml"))
             .target(OpenApi31Json::new().to("generated/openapi.json"))
             .target(TsSdk::new().module("@acme/books").to("generated/ts"));
-        let outcome = crate::pipeline::run_in_process(&pipeline, &Cx::new(&root)).unwrap();
+        let outcome = crate::pipeline::run_in_process(&pipeline, &Cx::new(&root), None).unwrap();
 
         let paths = outcome
             .artifacts

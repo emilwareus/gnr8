@@ -34,10 +34,12 @@ use gnr8::protocol::{
 use crate::graph::ApiGraph;
 use crate::pipeline::StageRunner;
 use crate::sdk::{Artifact, Cx, StagePlan};
+use crate::store::Store;
 use crate::CoreError;
 
 pub use build::{
-    ensure_worker, stamp_path, validate_workspace, WorkerBinary, WorkerPolicy, Workspace,
+    ensure_worker, stamp_path, validate_workspace, WorkerBinary, WorkerOrigin, WorkerPolicy,
+    Workspace,
 };
 
 /// How much worker stderr is retained for an error message before truncation.
@@ -170,7 +172,7 @@ pub struct WorkerSession {
     watchdog: Watchdog,
     plan: StagePlan,
     finished: bool,
-    built: bool,
+    origin: WorkerOrigin,
     /// The graph vectors the worker holds — what every graph patch is measured against.
     held_graph: HeldGraph,
     /// The artifact set the worker holds — what every artifact patch is measured against.
@@ -184,7 +186,11 @@ impl WorkerSession {
     ///
     /// Returns [`CoreError::WorkerBuild`] for workspace/build failures and
     /// [`CoreError::WorkerRun`] for spawn, handshake, or protocol failures.
-    pub fn start(project_root: &std::path::Path, policy: WorkerPolicy) -> Result<Self, CoreError> {
+    pub fn start(
+        project_root: &std::path::Path,
+        policy: WorkerPolicy,
+        store: Option<&Store>,
+    ) -> Result<Self, CoreError> {
         let workspace = validate_workspace(project_root)?;
         if !policy.allow_execute {
             return Err(CoreError::WorkerRun {
@@ -196,9 +202,9 @@ impl WorkerSession {
                 ),
             });
         }
-        let binary = ensure_worker(&workspace, policy)?;
+        let binary = ensure_worker(&workspace, policy, store)?;
         let mut session = Self::start_binary(&workspace, &binary.path)?;
-        session.built = binary.built;
+        session.origin = binary.origin;
         Ok(session)
     }
 
@@ -253,7 +259,7 @@ impl WorkerSession {
             watchdog,
             plan: StagePlan::default(),
             finished: false,
-            built: false,
+            origin: WorkerOrigin::Reused,
             held_graph: HeldGraph::default(),
             held_artifacts: Vec::new(),
         };
@@ -312,10 +318,10 @@ impl WorkerSession {
         &self.plan
     }
 
-    /// Whether `cargo` was invoked to produce the binary this session is running.
+    /// How the binary this session is running was obtained.
     #[must_use]
-    pub const fn worker_built(&self) -> bool {
-        self.built
+    pub const fn worker_origin(&self) -> WorkerOrigin {
+        self.origin
     }
 
     /// Ask the worker to exit, then reap it.
@@ -632,8 +638,8 @@ fn drain_stderr(mut stream: std::process::ChildStderr, buffer: &Arc<Mutex<Stderr
 pub struct PipelineRun {
     /// What the pipeline produced.
     pub outcome: crate::pipeline::PipelineOutcome,
-    /// Whether `cargo` was invoked for this run.
-    pub worker_built: bool,
+    /// How this run obtained the worker binary it ran.
+    pub worker_origin: WorkerOrigin,
 }
 
 /// Run a complete generation for `project_root`: build/start the worker, run the plan, stop.
@@ -644,16 +650,17 @@ pub struct PipelineRun {
 pub fn run_pipeline(
     project_root: &std::path::Path,
     policy: WorkerPolicy,
+    store: Option<&Store>,
 ) -> Result<PipelineRun, CoreError> {
-    let mut session = WorkerSession::start(project_root, policy)?;
+    let mut session = WorkerSession::start(project_root, policy, store)?;
     let plan = session.plan().clone();
-    let worker_built = session.worker_built();
+    let worker_origin = session.worker_origin();
     let cx = Cx::new(project_root.to_path_buf());
-    let outcome = crate::pipeline::run(&plan, &cx, &mut session)?;
+    let outcome = crate::pipeline::run(&plan, &cx, &mut session, store)?;
     session.shutdown()?;
     Ok(PipelineRun {
         outcome,
-        worker_built,
+        worker_origin,
     })
 }
 
@@ -665,11 +672,12 @@ pub fn run_pipeline(
 pub fn inspect_pipeline(
     project_root: &std::path::Path,
     policy: WorkerPolicy,
+    store: Option<&Store>,
 ) -> Result<ApiGraph, CoreError> {
-    let mut session = WorkerSession::start(project_root, policy)?;
+    let mut session = WorkerSession::start(project_root, policy, store)?;
     let plan = session.plan().clone();
     let cx = Cx::new(project_root.to_path_buf());
-    let graph = crate::pipeline::build_ir(&plan, &cx, &mut session)?;
+    let graph = crate::pipeline::build_ir(&plan, &cx, &mut session, store)?;
     session.shutdown()?;
     Ok(graph)
 }

@@ -15,6 +15,7 @@ use crate::sdk::{
     builtins, validate_artifact_paths, Artifact, Artifacts, BuiltinTarget, Cx, ReadinessTarget,
     StagePlan,
 };
+use crate::store::Store;
 use crate::CoreError;
 
 /// The worker-side half of a pipeline run: whatever executes the user's own stages.
@@ -226,6 +227,7 @@ pub fn build_ir(
     plan: &StagePlan,
     cx: &Cx,
     runner: &mut dyn StageRunner,
+    store: Option<&Store>,
 ) -> Result<ApiGraph, CoreError> {
     let source = match plan.sources.as_slice() {
         [single] => single,
@@ -248,7 +250,7 @@ pub fn build_ir(
     };
 
     let mut ir = match source {
-        PlanStage::Builtin(spec) => builtins::load_source(spec, cx)?,
+        PlanStage::Builtin(spec) => builtins::load_source(spec, cx, store)?,
         PlanStage::Custom { index, .. } => runner.load_source(*index)?,
     };
 
@@ -279,8 +281,9 @@ pub fn run(
     plan: &StagePlan,
     cx: &Cx,
     runner: &mut dyn StageRunner,
+    store: Option<&Store>,
 ) -> Result<PipelineOutcome, CoreError> {
-    let ir = build_ir(plan, cx, runner)?;
+    let ir = build_ir(plan, cx, runner, store)?;
     let diagnostics: Vec<Diagnostic> = ir.diagnostics.clone();
     let source_files = distinct_source_files(&ir);
 
@@ -577,10 +580,11 @@ impl StageRunner for InProcessRunner<'_> {
 pub fn run_in_process(
     pipeline: &crate::sdk::Pipeline,
     cx: &Cx,
+    store: Option<&Store>,
 ) -> Result<PipelineOutcome, CoreError> {
     let plan = pipeline.plan();
     let mut runner = InProcessRunner::new(pipeline, cx);
-    run(&plan, cx, &mut runner)
+    run(&plan, cx, &mut runner, store)
 }
 
 /// Build `pipeline`'s post-transform graph in this process.
@@ -591,10 +595,11 @@ pub fn run_in_process(
 pub fn build_ir_in_process(
     pipeline: &crate::sdk::Pipeline,
     cx: &Cx,
+    store: Option<&Store>,
 ) -> Result<ApiGraph, CoreError> {
     let plan = pipeline.plan();
     let mut runner = InProcessRunner::new(pipeline, cx);
-    build_ir(&plan, cx, &mut runner)
+    build_ir(&plan, cx, &mut runner, store)
 }
 
 #[cfg(test)]
@@ -712,7 +717,7 @@ mod tests {
 
     #[test]
     fn a_plan_with_no_source_is_a_config_error() {
-        let err = build_ir(&StagePlan::default(), &cx(), &mut NoCustomStages).unwrap_err();
+        let err = build_ir(&StagePlan::default(), &cx(), &mut NoCustomStages, None).unwrap_err();
         assert!(matches!(err, CoreError::Config { .. }), "{err:?}");
     }
 
@@ -722,7 +727,7 @@ mod tests {
             .source(Custom(CustomSource))
             .source(Custom(CustomSource))
             .plan();
-        let err = build_ir(&plan, &cx(), &mut RecordingRunner::default()).unwrap_err();
+        let err = build_ir(&plan, &cx(), &mut RecordingRunner::default(), None).unwrap_err();
         assert!(err.to_string().contains("2 sources"), "{err}");
     }
 
@@ -736,7 +741,7 @@ mod tests {
             .target(Custom(CustomTarget))
             .plan();
         let mut runner = RecordingRunner::default();
-        let outcome = run(&plan, &cx(), &mut runner).unwrap();
+        let outcome = run(&plan, &cx(), &mut runner, None).unwrap();
 
         // The two custom transforms are separated by a built-in, so they are two runs; a run of
         // adjacent customs would have been one request.
@@ -769,7 +774,7 @@ mod tests {
             .target(decl::OpenApi31::new().to("generated/openapi.yaml"))
             .target(decl::OpenApi31::new().to("generated/openapi.yaml"))
             .plan();
-        let err = run(&plan, &cx(), &mut RecordingRunner::default()).unwrap_err();
+        let err = run(&plan, &cx(), &mut RecordingRunner::default(), None).unwrap_err();
         let CoreError::ArtifactOwnership {
             code,
             path,
@@ -835,7 +840,7 @@ mod tests {
             .target(Custom(ClaimsOpenApi))
             .target(decl::OpenApi31::new().to("generated/openapi.yaml"))
             .plan();
-        let err = run(&plan, &cx(), &mut ClaimingRunner).unwrap_err();
+        let err = run(&plan, &cx(), &mut ClaimingRunner, None).unwrap_err();
         assert!(
             err.to_string().contains("already owned"),
             "a built-in must not silently take a path a custom target claimed: {err}"
@@ -853,7 +858,7 @@ mod tests {
             .target(decl::OpenApi31Json::new().to("generated/z-openapi.json"))
             .plan();
         let mut runner = RecordingRunner::default();
-        let outcome = run(&plan, &cx(), &mut runner).unwrap();
+        let outcome = run(&plan, &cx(), &mut runner, None).unwrap();
         let paths: Vec<&str> = outcome
             .artifacts
             .iter()
@@ -886,7 +891,7 @@ mod tests {
             .plan();
         // The source is the only custom stage; nothing else may reach the runner.
         let mut runner = RecordingRunner::default();
-        run(&plan, &cx(), &mut runner).unwrap();
+        run(&plan, &cx(), &mut runner, None).unwrap();
         assert_eq!(runner.calls, vec!["source[0]"]);
     }
 
@@ -927,7 +932,7 @@ mod tests {
             .source(Custom(CustomSource))
             .target(Custom(CustomTarget))
             .plan();
-        let err = run(&plan, &cx(), &mut EscapingRunner).unwrap_err();
+        let err = run(&plan, &cx(), &mut EscapingRunner, None).unwrap_err();
         assert!(
             matches!(err, CoreError::ArtifactOwnership { ref code, .. } if code == "artifact.path_invalid"),
             "{err:?}"
@@ -973,7 +978,7 @@ mod tests {
             .target(decl::OpenApi31::new().to("generated/openapi.yaml"))
             .target(Custom(CustomTarget))
             .plan();
-        let err = run(&plan, &cx(), &mut DroppingRunner).unwrap_err();
+        let err = run(&plan, &cx(), &mut DroppingRunner, None).unwrap_err();
         assert!(
             err.to_string().contains("never drop one"),
             "a dropped artifact would be deleted from disk as stale: {err}"
@@ -1029,7 +1034,7 @@ mod tests {
             .target(Custom(CustomTarget))
             .target(Custom(CustomTarget))
             .plan();
-        let err = run(&plan, &cx(), &mut AliasRunner(0)).unwrap_err();
+        let err = run(&plan, &cx(), &mut AliasRunner(0), None).unwrap_err();
         assert!(
             matches!(err, CoreError::ArtifactOwnership { ref code, .. } if code == "artifact.path_collision"),
             "{err:?}"

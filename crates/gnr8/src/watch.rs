@@ -46,6 +46,7 @@ use gnr8_engine::lifecycle::GenerateOutcome;
 use notify_debouncer_full::notify::RecursiveMode;
 use notify_debouncer_full::{new_debouncer, DebounceEventResult};
 
+use gnr8_engine::store::Store;
 use gnr8_engine::worker::WorkerPolicy;
 
 /// One regeneration's latency + counts — the `--json` shape for WATCH-03.
@@ -259,6 +260,7 @@ pub(crate) fn run(
     project_root: &Path,
     debounce: Duration,
     policy: WorkerPolicy,
+    store: Option<&Store>,
     json: bool,
     verbose: u8,
 ) -> anyhow::Result<()> {
@@ -351,6 +353,7 @@ pub(crate) fn run(
                     scenario_for_trigger_count(triggers),
                     project_root,
                     policy,
+                    store,
                     json,
                     verbose,
                 );
@@ -377,8 +380,9 @@ pub(crate) fn run(
 fn regenerate_once(
     project_root: &Path,
     policy: WorkerPolicy,
+    store: Option<&Store>,
 ) -> Result<GenerateOutcome, gnr8_engine::CoreError> {
-    let run = gnr8_engine::worker::run_pipeline(project_root, policy)?;
+    let run = gnr8_engine::worker::run_pipeline(project_root, policy, store)?;
     gnr8_engine::lifecycle::regenerate_with_anchors(
         project_root,
         &run.outcome.artifacts,
@@ -393,11 +397,12 @@ fn regenerate_and_report(
     scenario: &str,
     project_root: &Path,
     policy: WorkerPolicy,
+    store: Option<&Store>,
     json: bool,
     verbose: u8,
 ) {
     let t0 = Instant::now();
-    match regenerate_once(project_root, policy) {
+    match regenerate_once(project_root, policy, store) {
         Ok(outcome) => {
             let elapsed = t0.elapsed();
             for path in &outcome.skipped {
@@ -448,12 +453,13 @@ fn print_report(report: &LatencyReport, json: bool, verbose: u8, outcome: &Gener
 pub(crate) fn cold_regenerate(
     project_root: &Path,
     policy: WorkerPolicy,
+    store: Option<&Store>,
     json: bool,
     verbose: u8,
 ) -> anyhow::Result<()> {
     let t0 = Instant::now();
-    let outcome =
-        regenerate_once(project_root, policy).context("initial (cold) regeneration failed")?;
+    let outcome = regenerate_once(project_root, policy, store)
+        .context("initial (cold) regeneration failed")?;
     let elapsed = t0.elapsed();
     for path in &outcome.skipped {
         eprintln!(

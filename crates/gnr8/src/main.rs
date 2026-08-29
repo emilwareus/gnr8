@@ -16,6 +16,7 @@ mod watch;
 use anyhow::{bail, Result};
 use clap::Parser;
 use cli::{Cli, Commands, GuideTopic, InspectAction, SdkPreset, SourcePreset};
+use gnr8_engine::store::Store;
 use gnr8_engine::worker::WorkerPolicy;
 use std::path::{Component, Path, PathBuf};
 use std::process::Command;
@@ -44,6 +45,15 @@ fn main() -> Result<()> {
         Commands::Watch { debounce_ms } => run_watch(*debounce_ms, policy, output),
         Commands::Doctor => run_doctor(policy, output),
     }
+}
+
+/// The machine's shared cache for this invocation, or `None` when sharing is off.
+///
+/// This is the process's ONE reading of the environment for it: the engine takes the resolved store
+/// as an argument everywhere below, so no library call can pick up an ambient one and no test can
+/// reach the developer's own store by accident.
+fn cache_store() -> Option<Store> {
+    Store::from_env()
 }
 
 /// Resolve what this invocation may do with the project's `.gnr8/` crate.
@@ -361,7 +371,7 @@ struct LifecycleReport {
     timings_ms: LifecycleTimings,
     /// Diagnostic counts from the pipeline.
     diagnostics: DiagnosticCounts,
-    /// Whether this run built the project's worker or reused the one already on disk.
+    /// How this run obtained the project's worker: `built`, `reused`, or `restored`.
     worker: String,
     /// Number of source/input files considered.
     source_files: usize,
@@ -403,7 +413,7 @@ fn run_generate(force: bool, policy: WorkerPolicy, output: Output) -> Result<()>
 
     output.progress("generate: running pipeline");
     let pipeline_start = Instant::now();
-    let run = gnr8_engine::worker::run_pipeline(&root, policy)?;
+    let run = gnr8_engine::worker::run_pipeline(&root, policy, cache_store().as_ref())?;
     let pipeline_elapsed = pipeline_start.elapsed();
 
     output.progress("generate: writing outputs");
@@ -445,7 +455,7 @@ fn run_generate(force: bool, policy: WorkerPolicy, output: Output) -> Result<()>
                 total: duration_ms(total_start.elapsed()),
             },
             diagnostics: diagnostic_counts(&diagnostics),
-            worker: worker_label(run.worker_built).to_string(),
+            worker: run.worker_origin.label().to_string(),
             source_files: run.outcome.source_files,
             artifact_files: run.outcome.artifacts.len(),
         };
@@ -453,7 +463,7 @@ fn run_generate(force: bool, policy: WorkerPolicy, output: Output) -> Result<()>
     } else {
         let summary = lifecycle_summary(&outcome);
         output.progress(format!("generate: done ({summary})"));
-        output.verbose(format!("worker: {}", worker_label(run.worker_built)));
+        output.verbose(format!("worker: {}", run.worker_origin.label()));
         output.verbose(format!("parsed/input files: {}", run.outcome.source_files));
         output.verbose(format!("artifacts: {}", run.outcome.artifacts.len()));
         output.verbose(format!("pipeline: {}", fmt_duration(pipeline_elapsed)));
@@ -469,15 +479,6 @@ fn run_generate(force: bool, policy: WorkerPolicy, output: Output) -> Result<()>
     Ok(())
 }
 
-/// How the worker for this run was obtained — the only two possibilities, named for the report.
-const fn worker_label(built: bool) -> &'static str {
-    if built {
-        "built"
-    } else {
-        "reused"
-    }
-}
-
 /// Run `gnr8 check`: run the project's pipeline, then DRY-RUN the same `plan_writes` decision (no
 /// writes, no manifest save). Exits NON-ZERO (code 1) if any output is stale (`Write`) or drifted
 /// (`UserEdited`); exits 0 when every output is `Unchanged`. Reuses the exact pure decision function —
@@ -490,7 +491,7 @@ fn run_check(policy: WorkerPolicy, output: Output) -> Result<()> {
 
     output.progress("check: running pipeline");
     let pipeline_start = Instant::now();
-    let run = gnr8_engine::worker::run_pipeline(&root, policy)?;
+    let run = gnr8_engine::worker::run_pipeline(&root, policy, cache_store().as_ref())?;
     let pipeline_elapsed = pipeline_start.elapsed();
 
     output.progress("check: planning writes");
@@ -554,7 +555,7 @@ fn run_check(policy: WorkerPolicy, output: Output) -> Result<()> {
                 total: duration_ms(total_start.elapsed()),
             },
             diagnostics: diagnostic_counts(&diagnostics),
-            worker: worker_label(run.worker_built).to_string(),
+            worker: run.worker_origin.label().to_string(),
             source_files: run.outcome.source_files,
             artifact_files: run.outcome.artifacts.len(),
         };
@@ -568,7 +569,7 @@ fn run_check(policy: WorkerPolicy, output: Output) -> Result<()> {
     } else {
         output.progress(format!("check: up to date ({} unchanged)", clean.len()));
     }
-    output.verbose(format!("worker: {}", worker_label(run.worker_built)));
+    output.verbose(format!("worker: {}", run.worker_origin.label()));
     output.verbose(format!("parsed/input files: {}", run.outcome.source_files));
     output.verbose(format!("outputs checked: {}", plan.files.len()));
     output.verbose(format!("pipeline: {}", fmt_duration(pipeline_elapsed)));
@@ -1495,11 +1496,12 @@ struct DoctorRun {
 
 /// Run the project's pipeline once for `doctor`, keeping the plan's declared source roots.
 fn doctor_pipeline(root: &Path, policy: WorkerPolicy) -> Result<DoctorRun, gnr8_engine::CoreError> {
-    let mut session = gnr8_engine::worker::WorkerSession::start(root, policy)?;
+    let store = cache_store();
+    let mut session = gnr8_engine::worker::WorkerSession::start(root, policy, store.as_ref())?;
     let plan = session.plan().clone();
     let cx = gnr8_engine::sdk::Cx::new(root.to_path_buf());
     let input_roots = gnr8_engine::pipeline::source_input_roots(&plan, &cx);
-    let outcome = gnr8_engine::pipeline::run(&plan, &cx, &mut session)?;
+    let outcome = gnr8_engine::pipeline::run(&plan, &cx, &mut session, store.as_ref())?;
     session.shutdown()?;
     Ok(DoctorRun {
         outcome,
@@ -1556,10 +1558,18 @@ fn run_watch(debounce_ms: u64, policy: WorkerPolicy, output: Output) -> Result<(
     }
 
     // The COLD scenario: an initial regeneration ensures outputs are current and measures cold latency.
-    watch::cold_regenerate(&root, policy, output.json, output.verbose)?;
+    let store = cache_store();
+    watch::cold_regenerate(&root, policy, store.as_ref(), output.json, output.verbose)?;
 
     let debounce = std::time::Duration::from_millis(debounce_ms.max(MIN_DEBOUNCE_MS));
-    watch::run(&root, debounce, policy, output.json, output.verbose)
+    watch::run(
+        &root,
+        debounce,
+        policy,
+        store.as_ref(),
+        output.json,
+        output.verbose,
+    )
 }
 
 /// Build the API graph for an `inspect` subcommand, render it (table or `--json`), and print it.
@@ -1604,7 +1614,11 @@ fn inspect_graph(
             "inspect: using .gnr8 pipeline at {}",
             root.display()
         ));
-        return Ok(gnr8_engine::worker::inspect_pipeline(&root, policy)?);
+        return Ok(gnr8_engine::worker::inspect_pipeline(
+            &root,
+            policy,
+            cache_store().as_ref(),
+        )?);
     }
     bail!("no .gnr8 pipeline found; run `gnr8 init` or pass a source path to `gnr8 inspect`")
 }
