@@ -9,6 +9,8 @@ must move the minor version.
 
 ## Unreleased
 
+## 0.10.1 — 2026-08-29
+
 ### Added
 
 - **A machine-global cache, on by default, so a fresh checkout does not repeat work this machine has
@@ -85,6 +87,7 @@ must move the minor version.
   The one regression is generation from scratch on a SMALL project, and it is a deliberate trade:
   the worker and its dependencies are now compiled optimized, which costs 4.7 s of first build and
   is worth 1.5-1.8x on every warm run after it.
+
 
 ## 0.10.0 — 2026-08-28
 
