@@ -7,7 +7,8 @@
 //! - `cargo` is invoked exactly once, and never again while `.gnr8/` is unchanged;
 //! - each row of the invalidation matrix rebuilds exactly what it should;
 //! - a user's own `Transform` and `Target` round-trip through the frame protocol;
-//! - `--no-build` and `--no-execute` withhold consent, and say why.
+//! - `--no-build` and `--no-execute` withhold consent, and say why;
+//! - the machine-global store shares a build between checkouts and never changes what a run produces.
 //!
 //! Every pipeline here uses the `OpenApi` source, which reads a YAML file the test writes, so no Go,
 //! Python or Node toolchain is involved.
@@ -174,6 +175,20 @@ fn gnr8_sharing_through(root: &Path, args: &[&str], cargo: Option<&Path>, store:
         command.env("GNR8_CARGO", cargo);
     }
     command.output().expect("the gnr8 host must run")
+}
+
+/// Assert cargo ran again since `before`, and answer the new count.
+fn assert_built_since(log: &Path, before: usize, why: &str) -> usize {
+    let now = cargo_invocations(log);
+    assert!(now > before, "{why} ({before} -> {now})");
+    now
+}
+
+/// Assert a run succeeded and reported the origin it should have obtained its worker from.
+fn assert_worker(output: &Output, origin: &str, why: &str) {
+    let text = combined(output);
+    assert!(output.status.success(), "{why}: {text}");
+    assert!(text.contains(&format!("worker: {origin}")), "{why}: {text}");
 }
 
 fn combined(output: &Output) -> String {
@@ -537,15 +552,18 @@ fn a_worker_binary_reached_through_a_symlinked_target_dir_is_refused() {
     let _ = std::fs::remove_dir_all(root);
 }
 
-/// The worker store, end to end: publish once, restore into a second checkout, refuse a corrupt entry.
+/// The whole store contract in one project, because each fresh `.gnr8/` otherwise costs a cold build.
 ///
 /// The build fingerprint names inputs and nothing else, so a second checkout holding the same
 /// `.gnr8/` — the same manifest, the same lockfile, the same sources — asks the same question and
 /// gets the answer the first checkout already paid for. Neither directory here is a git repository,
 /// which is the point: nothing in this chain reads git, so a "checkout" is only ever a directory.
+///
+/// Rows 4 onward run in the first checkout, whose build directory is already warm, so proving what
+/// `GNR8_CACHE_STORE` decides costs incremental compiles rather than more cold ones.
 #[cfg(unix)]
 #[test]
-fn a_second_checkout_restores_the_worker_the_first_one_built() {
+fn the_store_shares_a_build_between_checkouts_and_never_decides_the_outcome() {
     if !cargo_available() {
         eprintln!("skipping worker_contract: cargo unavailable");
         return;
@@ -558,49 +576,74 @@ fn a_second_checkout_restores_the_worker_the_first_one_built() {
 
     // 1. The first checkout has nothing to reuse and nothing to restore, so it builds and publishes.
     let cold = gnr8_sharing_through(&first, &["generate", "-v"], Some(&cargo), &store);
-    assert!(cold.status.success(), "{}", combined(&cold));
-    assert!(
-        combined(&cold).contains("worker: built"),
-        "the first checkout must build its own worker: {}",
-        combined(&cold)
+    assert_worker(
+        &cold,
+        "built",
+        "the first checkout must build its own worker",
     );
-    let built = cargo_invocations(&log);
-    assert!(built >= 1, "the cold run must build the worker");
+    let mut invocations = cargo_invocations(&log);
+    assert!(invocations >= 1, "the cold run must build the worker");
+    let expected = std::fs::read(first.join("generated/openapi.yaml")).unwrap();
 
     // 2. A second checkout of the same `.gnr8/` restores that build instead of repeating it.
     let second = base.join("second");
     copy_checkout(&first, &second);
     let restored = gnr8_sharing_through(&second, &["generate", "-v"], Some(&cargo), &store);
-    assert!(restored.status.success(), "{}", combined(&restored));
-    assert!(
-        combined(&restored).contains("worker: restored"),
-        "the second checkout must restore the first one's worker: {}",
-        combined(&restored)
+    assert_worker(
+        &restored,
+        "restored",
+        "the second checkout must restore the first one's worker",
     );
     assert_eq!(
         cargo_invocations(&log),
-        built,
+        invocations,
         "a restored worker must not invoke cargo"
     );
     assert_eq!(
-        std::fs::read(first.join("generated/openapi.yaml")).unwrap(),
         std::fs::read(second.join("generated/openapi.yaml")).unwrap(),
+        expected,
         "a restored worker must produce byte-identical output"
     );
 
-    // 3. The restored binary is now this checkout's own, recorded in its own stamp.
+    // 3. The restored binary is now that checkout's own, recorded in its own stamp.
     let warm = gnr8_sharing_through(&second, &["generate", "-v"], Some(&cargo), &store);
-    assert!(warm.status.success(), "{}", combined(&warm));
-    assert!(
-        combined(&warm).contains("worker: reused"),
-        "the next run must reuse the restored binary from its own stamp: {}",
-        combined(&warm)
+    assert_worker(
+        &warm,
+        "reused",
+        "the next run must reuse its own stamped binary",
     );
 
-    // 4. A stored blob that no longer hashes to what its entry recorded is not an answer: the entry
-    //    is dropped and the worker is built. Done in the first checkout, whose build directory is
-    //    already warm, so proving this costs an incremental compile rather than another cold one.
-    std::fs::remove_file(worker_binary(&first, "contract-gnr8-gen")).unwrap();
+    // 4. With sharing off, a checkout that has lost its worker builds again rather than restoring —
+    //    and never creates a store of its own.
+    let never_created = base.join("never-created");
+    forget_worker(&first, "contract-gnr8-gen");
+    let off = gnr8_sharing_through(&first, &["generate", "-v"], Some(&cargo), Path::new("off"));
+    assert_worker(&off, "built", "sharing off must not restore anything");
+    assert!(
+        cargo_invocations(&log) > invocations,
+        "sharing off must reach a real build"
+    );
+    assert!(
+        !never_created.exists(),
+        "sharing off must not create a store"
+    );
+    invocations = cargo_invocations(&log);
+
+    // 5. A location gnr8 cannot use costs time and nothing else.
+    let unusable = base.join("not-a-directory");
+    std::fs::write(&unusable, b"file").unwrap();
+    forget_worker(&first, "contract-gnr8-gen");
+    let broken = gnr8_sharing_through(&first, &["generate", "-v"], Some(&cargo), &unusable);
+    assert_worker(
+        &broken,
+        "built",
+        "an unusable store is a miss, never a failure",
+    );
+    invocations = assert_built_since(&log, invocations, "an unusable store must reach a build");
+
+    // 6. A stored blob that no longer hashes to what its entry recorded is not an answer: the entry
+    //    is dropped and the worker is built.
+    forget_worker(&first, "contract-gnr8-gen");
     let blob = walk_files(&store.join("blobs"))
         .into_iter()
         .next()
@@ -609,95 +652,33 @@ fn a_second_checkout_restores_the_worker_the_first_one_built() {
     corrupt.extend_from_slice(b"tamper");
     std::fs::write(&blob, corrupt).unwrap();
     let rejected = gnr8_sharing_through(&first, &["generate", "-v"], Some(&cargo), &store);
-    assert!(rejected.status.success(), "{}", combined(&rejected));
-    assert!(
-        combined(&rejected).contains("worker: built"),
-        "a blob that does not match its entry must be rebuilt, not run: {}",
-        combined(&rejected)
+    assert_worker(
+        &rejected,
+        "built",
+        "a blob that does not match its entry must be rebuilt, not run",
     );
-    assert!(
-        cargo_invocations(&log) > built,
-        "rejecting a corrupt entry must reach a real build"
+    assert_built_since(
+        &log,
+        invocations,
+        "rejecting a corrupt entry must reach a build",
     );
+
+    // 7. `--no-build` still refuses. A restore produces a worker binary in this checkout, which is
+    //    the consent that flag withholds — it is not merely a way to avoid running cargo.
+    forget_worker(&first, "contract-gnr8-gen");
+    let refused = gnr8_sharing_through(&first, &["generate", "--no-build"], Some(&cargo), &store);
+    assert!(!refused.status.success(), "{}", combined(&refused));
+    assert!(
+        combined(&refused).contains("building was refused"),
+        "--no-build must not restore from the store: {}",
+        combined(&refused)
+    );
+
+    // 8. However the worker was obtained, along every row, the output never moved.
     assert_eq!(
         std::fs::read(first.join("generated/openapi.yaml")).unwrap(),
-        std::fs::read(second.join("generated/openapi.yaml")).unwrap(),
-        "however the worker was obtained, the output is the same"
-    );
-
-    let _ = std::fs::remove_dir_all(base);
-}
-
-/// What `GNR8_CACHE_STORE` decides, in one project so it costs one cold build.
-///
-/// `off` is exactly the behaviour before there was a store — nothing read, nothing written — and a
-/// location gnr8 cannot use is the same miss, reached without failing the run.
-#[cfg(unix)]
-#[test]
-fn the_store_setting_decides_sharing_and_never_decides_the_outcome() {
-    if !cargo_available() {
-        eprintln!("skipping worker_contract: cargo unavailable");
-        return;
-    }
-    let base = unique_dir("store-setting");
-    let store = base.join("store");
-    let root = base.join("project");
-    write_project(&root, "", OPENAPI_PIPELINE);
-    let (cargo, log) = install_cargo_sentinel(&base);
-
-    // 1. One cold build, published to the store.
-    let cold = gnr8_sharing_through(&root, &["generate", "-v"], Some(&cargo), &store);
-    assert!(cold.status.success(), "{}", combined(&cold));
-    let mut invocations = cargo_invocations(&log);
-    assert!(invocations >= 1, "the cold run must build the worker");
-    let expected = std::fs::read(root.join("generated/openapi.yaml")).unwrap();
-
-    // 2. With sharing off, a checkout that has lost its worker builds again rather than restoring —
-    //    and never creates a store of its own.
-    let off_store = base.join("never-created");
-    forget_worker(&root, "contract-gnr8-gen");
-    let off = gnr8_sharing_through(&root, &["generate", "-v"], Some(&cargo), Path::new("off"));
-    assert!(off.status.success(), "{}", combined(&off));
-    assert!(
-        combined(&off).contains("worker: built"),
-        "sharing off must not restore anything: {}",
-        combined(&off)
-    );
-    assert!(
-        cargo_invocations(&log) > invocations,
-        "sharing off must reach a real build"
-    );
-    assert!(!off_store.exists(), "sharing off must not create a store");
-    invocations = cargo_invocations(&log);
-
-    // 3. A location gnr8 cannot use costs time and nothing else.
-    let unusable = base.join("not-a-directory");
-    std::fs::write(&unusable, b"file").unwrap();
-    forget_worker(&root, "contract-gnr8-gen");
-    let broken = gnr8_sharing_through(&root, &["generate", "-v"], Some(&cargo), &unusable);
-    assert!(
-        broken.status.success(),
-        "an unusable store must not fail the run: {}",
-        combined(&broken)
-    );
-    assert!(
-        cargo_invocations(&log) > invocations,
-        "an unusable store is a miss, so the worker is built"
-    );
-
-    // 4. Pointed back at the real store, the entry published in step 1 is still the answer.
-    forget_worker(&root, "contract-gnr8-gen");
-    let shared = gnr8_sharing_through(&root, &["generate", "-v"], Some(&cargo), &store);
-    assert!(shared.status.success(), "{}", combined(&shared));
-    assert!(
-        combined(&shared).contains("worker: restored"),
-        "the published entry must still be restorable: {}",
-        combined(&shared)
-    );
-    assert_eq!(
-        std::fs::read(root.join("generated/openapi.yaml")).unwrap(),
         expected,
-        "however the worker was obtained, the output is the same"
+        "the store decides how fast a run is, never what it produces"
     );
 
     let _ = std::fs::remove_dir_all(base);

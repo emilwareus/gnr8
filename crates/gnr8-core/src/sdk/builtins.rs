@@ -465,6 +465,12 @@ fn save_go_gin_cache(cx: &Cx, key: &str, store: Option<&Store>, graph: &ApiGraph
     }
 }
 
+/// Write one cache entry so a concurrent reader sees either the whole file or no file.
+///
+/// Two `gnr8` processes in one project can reach this at the same time. A torn entry would only cost
+/// a recompute — it does not parse, and the loader treats that as no entry — but write-then-rename
+/// removes the window entirely, and the temporary name carries the writer's pid so two concurrent
+/// writes never collide.
 fn write_go_gin_cache_file(path: &Path, bytes: &[u8]) {
     let Some(parent) = path.parent() else {
         return;
@@ -472,7 +478,10 @@ fn write_go_gin_cache_file(path: &Path, bytes: &[u8]) {
     if std::fs::create_dir_all(parent).is_err() {
         return;
     }
-    let _ = std::fs::write(path, bytes);
+    let temporary = parent.join(format!(".entry.{}.tmp", std::process::id()));
+    if std::fs::write(&temporary, bytes).is_err() || std::fs::rename(&temporary, path).is_err() {
+        let _ = std::fs::remove_file(&temporary);
+    }
 }
 
 fn go_gin_cache_path(cx: &Cx, key: &str) -> std::path::PathBuf {

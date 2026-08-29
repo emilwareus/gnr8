@@ -74,11 +74,11 @@ pub enum Namespace {
 }
 
 impl Namespace {
-    /// The namespace's directory, relative to the store root.
-    const fn dir(self) -> &'static str {
+    /// The namespace's directory under a store root.
+    fn dir(self, root: &Path) -> PathBuf {
         match self {
-            Self::Worker => "worker",
-            Self::GoGinSource => "sources/go-gin",
+            Self::Worker => root.join("worker"),
+            Self::GoGinSource => root.join("sources").join("go-gin"),
         }
     }
 }
@@ -175,8 +175,8 @@ impl Store {
     /// The file an entry for `key` is stored in, or `None` when `key` is not a key this store writes.
     fn entry_path(&self, namespace: Namespace, key: &str) -> Option<PathBuf> {
         Some(
-            self.root
-                .join(namespace.dir())
+            namespace
+                .dir(&self.root)
                 .join(shard(key)?)
                 .join(format!("{key}.json")),
         )

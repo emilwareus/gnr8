@@ -666,14 +666,6 @@ pub fn ensure_worker(
             });
         }
     }
-    if let Some(binary) = store.and_then(|store| restore_worker(workspace, store, &before.complete))
-    {
-        confirm_binary_is_inside_the_workspace(workspace, &binary)?;
-        return Ok(WorkerBinary {
-            path: binary,
-            origin: WorkerOrigin::Restored,
-        });
-    }
     if !policy.allow_build {
         return Err(CoreError::WorkerBuild {
             message: format!(
@@ -682,6 +674,17 @@ pub fn ensure_worker(
                  --no-build to allow it.",
                 workspace.project_root.display()
             ),
+        });
+    }
+    // The store is where a build comes from when it does not have to happen again, so it is reached
+    // on the same terms as the build it replaces: `--no-build` withholds consent for producing a
+    // worker binary in this checkout at all, not merely for running cargo.
+    if let Some(binary) = store.and_then(|store| restore_worker(workspace, store, &before.complete))
+    {
+        confirm_binary_is_inside_the_workspace(workspace, &binary)?;
+        return Ok(WorkerBinary {
+            path: binary,
+            origin: WorkerOrigin::Restored,
         });
     }
 
