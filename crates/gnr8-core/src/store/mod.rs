@@ -20,15 +20,18 @@
 //!
 //! ## Trust
 //!
-//! The store is **user-owned local state**, at the trust level of `~/.cargo/registry` or the
-//! `$TMPDIR/gnr8-goextract` directory gnr8 already keeps its compiled extractor in. gnr8 creates it
-//! private to the invoking user (`0700` on Unix) and never shares it between users, over a network,
-//! or with a remote. Every restore re-hashes the bytes it copied before anything runs them.
+//! The store is **one user's state on one machine**, at the trust level of `~/.cargo/registry` or
+//! the `$TMPDIR/gnr8-goextract` directory gnr8 already keeps its compiled extractor in. gnr8 creates
+//! it private to the invoking user (`0700` on Unix) and never shares it between users, over a
+//! network, or with a remote. Every restore re-hashes the bytes it copied before anything runs them.
 //!
 //! Content verification catches corruption — a truncated copy, a half-written file, a bad disk. It
 //! cannot make a directory that OTHER users can write into safe, because whoever can rewrite an
-//! entry can rewrite the hash beside it. Point [`GNR8_CACHE_STORE_ENV`] only at a directory only you
-//! can write, exactly as you would for a cargo registry.
+//! entry can rewrite the hash beside it. Point [`GNR8_CACHE_STORE_ENV`] at local storage only you
+//! can write, exactly as you would a cargo registry — not at a share several machines mount. A
+//! worker binary is a native executable, and while the build fingerprint covers the host `gnr8`
+//! executable's own content — so a different platform's gnr8 can never match one of these keys — it
+//! says nothing about the system libraries the machine that built it linked against.
 //!
 //! ## Failure is a miss, never an error
 //!
@@ -152,6 +155,10 @@ impl Store {
     ///
     /// The caller has already hashed `source` — that hash is what the entry pointing at this blob
     /// records — so the store takes it rather than reading the file a second time.
+    ///
+    /// A blob that is already there is left alone: it is named by its own content, so re-copying it
+    /// could only produce the same bytes. If it has since been corrupted, the restore that reads it
+    /// removes it, and the publish after that build writes it again.
     pub fn publish_blob(&self, hash: &str, source: &Path) {
         let Some(path) = self.blob_path(hash) else {
             return;

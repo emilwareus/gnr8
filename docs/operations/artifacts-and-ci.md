@@ -166,12 +166,14 @@ determinism rule that makes gnr8's output byte-identical for identical input: a 
 version, `.gnr8/Cargo.lock`, toolchain, or source byte is a different key and a miss. A restored
 worker binary is additionally re-hashed before it is moved into place; a mismatch deletes the entry.
 
-**Trust.** The store is user-owned local state, at the trust level of `~/.cargo/registry` or the
-`$TMPDIR/gnr8-goextract` directory the compiled extractor already lives in. gnr8 creates it private to
-the invoking user (`0700` on Unix) and never shares it between users, machines, or over a network.
+**Trust.** The store is one user's state on one machine, at the trust level of `~/.cargo/registry` or
+the `$TMPDIR/gnr8-goextract` directory the compiled extractor already lives in. gnr8 creates it private
+to the invoking user (`0700` on Unix) and never shares it between users, machines, or over a network.
 Content verification catches corruption; it cannot make a directory *other* users can write into safe,
-because whoever can rewrite an entry can rewrite the hash beside it. Point `GNR8_CACHE_STORE` only at
-a directory only you can write.
+because whoever can rewrite an entry can rewrite the hash beside it. Point `GNR8_CACHE_STORE` at local
+storage only you can write — not at a share several machines mount. The build fingerprint covers the
+host `gnr8` executable's own content, so a different platform's gnr8 can never match one of these
+keys, but it says nothing about the system libraries the machine that built a worker linked against.
 
 **Failure is a miss.** A store that does not exist, cannot be created, is full, or holds an entry this
 gnr8 cannot read never fails a run — it costs the time the answer would have saved. Deleting the whole
