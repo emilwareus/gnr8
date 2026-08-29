@@ -31,6 +31,11 @@
 //! build it replaces: a restore puts a worker binary in this checkout, so a [`WorkerPolicy`] that
 //! forbids building forbids that too.
 //!
+//! Sharing it is only sound while the fingerprint names the same bytes read from any checkout, which
+//! is [`inputs_are_the_same_from_every_checkout`]: a `path` dependency written RELATIVE to `.gnr8/`
+//! points at a directory the walk never sees AND at a different one in each checkout, so a build
+//! that has one is built and stamped here exactly as always and simply never reaches the store.
+//!
 //! A restored binary is verified the same way the recorded one is: the store's entry records the
 //! length and content hash of the bytes it published, and the copy is re-hashed and compared BEFORE
 //! it is moved into place. What that catches is a corrupt or truncated entry. What it cannot catch
@@ -40,6 +45,7 @@ use std::path::{Path, PathBuf};
 use std::process::Command;
 
 use crate::manifest::{blake3_file, blake3_hex};
+use crate::sdk::resolved_lexically;
 use crate::store::{Namespace, Store};
 use crate::CoreError;
 
@@ -511,6 +517,79 @@ fn fingerprints_of(
     })
 }
 
+/// Whether this fingerprint names the same bytes read from any checkout on this machine.
+///
+/// The fingerprint hashes every file under `.gnr8/`, which is the whole of what the build compiles
+/// as long as every dependency comes from a registry or a git revision: `Cargo.lock` pins those and
+/// cargo verifies them by checksum. A `path` dependency is the one construct a manifest has for
+/// naming sources the walk cannot see, and a RELATIVE one is resolved against the manifest — so
+/// `../helpers` names a different directory in every checkout, and two checkouts holding
+/// byte-identical `.gnr8/` sources would compute one fingerprint over two different builds.
+///
+/// That is only a problem for a key that crosses checkouts. An absolute path names one directory on
+/// this machine, and a path that stays inside `.gnr8/` is hashed by content like every other input;
+/// both mean the fingerprint identifies the same bytes wherever it is computed. A relative path that
+/// leaves `.gnr8/` does not, so a build that has one is built and stamped here exactly as before and
+/// simply never reaches [`crate::store`] — the same "an unprovable input surface is not shared"
+/// rule the source cache applies to a Go module it cannot bound.
+///
+/// The manifests under `.gnr8/` are the only place such a pointer can appear and are already in the
+/// enumerated input set, so this answers from the files the caller has. Anything unreadable or
+/// unparseable answers `false`: a surface that cannot be proven is never shared.
+fn inputs_are_the_same_from_every_checkout(dir: &Path, files: &[PathBuf]) -> bool {
+    files
+        .iter()
+        .filter(|path| path.file_name().is_some_and(|name| name == "Cargo.toml"))
+        .all(|manifest| manifest_paths_stay_put(dir, manifest))
+}
+
+/// Whether every `path` one manifest declares names the same directory from every checkout.
+fn manifest_paths_stay_put(dir: &Path, manifest: &Path) -> bool {
+    let Some(manifest_dir) = manifest.parent() else {
+        return false;
+    };
+    let Ok(text) = std::fs::read_to_string(manifest) else {
+        return false;
+    };
+    let Ok(value) = toml::from_str::<toml::Value>(&text) else {
+        return false;
+    };
+    let mut declared = Vec::new();
+    collect_declared_paths(&value, &mut declared);
+    declared.iter().all(|path| {
+        let path = Path::new(path);
+        path.is_absolute() || resolved_lexically(manifest_dir, path).starts_with(dir)
+    })
+}
+
+/// Every string filed under a `path` key anywhere in a manifest.
+///
+/// Taken over the whole document rather than a list of dependency tables, because a manifest has
+/// many of them — `[dependencies]`, `[dev-dependencies]`, `[build-dependencies]`, one pair per
+/// `[target.'cfg(…)']`, `[patch.*]`, `[workspace.dependencies]` — and a table this misses is a
+/// pointer that leaves the fingerprint. The keys it also collects (`[[bin]] path`, `[lib] path`)
+/// name files inside the crate, which is the answer they should give anyway.
+fn collect_declared_paths(value: &toml::Value, out: &mut Vec<String>) {
+    match value {
+        toml::Value::Table(table) => {
+            for (key, nested) in table {
+                if key == "path" {
+                    if let Some(text) = nested.as_str() {
+                        out.push(text.to_string());
+                    }
+                }
+                collect_declared_paths(nested, out);
+            }
+        }
+        toml::Value::Array(items) => {
+            for item in items {
+                collect_declared_paths(item, out);
+            }
+        }
+        _ => {}
+    }
+}
+
 fn read_stamp(workspace: &Workspace) -> Option<WorkerStamp> {
     let bytes = std::fs::read(workspace.stamp_path()).ok()?;
     serde_json::from_slice(&bytes).ok()
@@ -653,6 +732,11 @@ pub fn ensure_worker(
         || Ok(binary_identity(&workspace.binary_path())),
     )?;
     let before = fingerprints_of(workspace, &host_hash, &workspace_files)?;
+    // The store answers a question asked from another checkout, so it may only be reached when this
+    // fingerprint names the same bytes there. Decided once, over the inputs already enumerated, so
+    // the restore below and the publish at the end can never disagree about it.
+    let store =
+        store.filter(|_| inputs_are_the_same_from_every_checkout(&workspace.dir, &workspace_files));
     if let Some(stamp) = read_stamp(workspace) {
         if stamp_matches(
             workspace,
@@ -1126,6 +1210,97 @@ mod tests {
         assert_eq!(
             before.authored, after.authored,
             "the lockfile is not part of the concurrent-edit bracket"
+        );
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    /// Whether this workspace's inputs are the same read from any checkout, over its real files.
+    fn shareable(root: &std::path::Path) -> bool {
+        let dir = root.join(".gnr8");
+        let files = workspace_input_files(&dir).unwrap();
+        super::inputs_are_the_same_from_every_checkout(&dir, &files)
+    }
+
+    /// A `path` dependency that leaves `.gnr8/` by a RELATIVE path names a different directory in
+    /// every checkout, so one fingerprint would cover two different builds — the store must not see
+    /// it. Everything else a manifest can point at is either hashed here or fixed on this machine.
+    #[test]
+    fn only_a_relative_path_dependency_that_escapes_the_workspace_stops_it_being_shared() {
+        let root = temp_project("share-paths");
+        write_manifest(&root, CURRENT);
+        assert!(shareable(&root), "a registry dependency is shared");
+
+        // A file the crate itself owns is not a pointer out of the fingerprint.
+        write_manifest(
+            &root,
+            &format!("{CURRENT}\n[[bin]]\nname = \"x\"\npath = \"src/main.rs\"\n"),
+        );
+        assert!(shareable(&root), "a bin target names a file inside .gnr8/");
+
+        // A vendored crate under `.gnr8/` is hashed by content like every other input.
+        std::fs::create_dir_all(root.join(".gnr8/vendor/helpers")).unwrap();
+        write_manifest(
+            &root,
+            &format!("{CURRENT}helpers = {{ path = \"vendor/helpers\" }}\n"),
+        );
+        assert!(shareable(&root), "a path inside .gnr8/ is fingerprinted");
+
+        // An absolute path names one directory on this machine, which is what this checkout's own
+        // stamp already assumes about it.
+        write_manifest(
+            &root,
+            &format!("{CURRENT}helpers = {{ path = \"/opt/helpers\" }}\n"),
+        );
+        assert!(shareable(&root), "an absolute path names one directory");
+
+        // The one that must not be shared, in each of the tables a manifest keeps dependencies in.
+        for table in [
+            "[dependencies]",
+            "[dev-dependencies]",
+            "[build-dependencies]",
+            "[target.'cfg(unix)'.dependencies]",
+            "[patch.crates-io]",
+        ] {
+            write_manifest(
+                &root,
+                &format!("{CURRENT}\n{table}\nhelpers = {{ path = \"../helpers\" }}\n"),
+            );
+            assert!(
+                !shareable(&root),
+                "a relative path escaping .gnr8/ in {table} must not be shared"
+            );
+        }
+
+        // A manifest that does not parse cannot be proven either way.
+        std::fs::write(root.join(".gnr8/Cargo.toml"), "[package\nname =").unwrap();
+        assert!(!shareable(&root), "an unreadable manifest is never shared");
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    /// A relative path is resolved against the manifest that declares it, not the workspace root.
+    #[test]
+    fn a_nested_manifest_resolves_its_own_paths() {
+        let root = temp_project("share-nested");
+        write_manifest(&root, CURRENT);
+        std::fs::create_dir_all(root.join(".gnr8/vendor/helpers/src")).unwrap();
+        std::fs::write(
+            root.join(".gnr8/vendor/helpers/Cargo.toml"),
+            "[package]\nname = \"helpers\"\nversion = \"0.1.0\"\n\n[dependencies]\nsib = { path = \"../sibling\" }\n",
+        )
+        .unwrap();
+        assert!(
+            shareable(&root),
+            "`../sibling` from .gnr8/vendor/helpers stays under .gnr8/"
+        );
+
+        std::fs::write(
+            root.join(".gnr8/vendor/helpers/Cargo.toml"),
+            "[package]\nname = \"helpers\"\nversion = \"0.1.0\"\n\n[dependencies]\nout = { path = \"../../../outside\" }\n",
+        )
+        .unwrap();
+        assert!(
+            !shareable(&root),
+            "`../../../outside` leaves .gnr8/ and must not be shared"
         );
         let _ = std::fs::remove_dir_all(root);
     }

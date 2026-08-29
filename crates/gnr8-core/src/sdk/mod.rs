@@ -151,6 +151,28 @@ pub fn validate_openapi_artifact(text: &str, path: &Path) -> Result<(), CoreErro
     openapi_source::validate_openapi_artifact(text, path)
 }
 
+/// `base` joined with `path`, folding `.` and `..` textually rather than through the filesystem.
+///
+/// The question both callers ask is which directory a manifest NAMES — a Cargo `path` dependency, a
+/// `go.mod` replacement — so that they can tell a location inside the tree they hash from one
+/// outside it. Textual, because it must answer for a directory that does not exist yet and must not
+/// resolve symlinks (that would make two different declarations look like one). A `..` that walks
+/// off the root keeps the accumulated prefix and therefore fails the containment test it is asked
+/// for, which is the conservative answer.
+pub(crate) fn resolved_lexically(base: &Path, path: &Path) -> PathBuf {
+    let mut out = base.to_path_buf();
+    for part in path.components() {
+        match part {
+            std::path::Component::CurDir => {}
+            std::path::Component::ParentDir => {
+                out.pop();
+            }
+            other => out.push(other.as_os_str()),
+        }
+    }
+    out
+}
+
 /// The digest recorded for a path this run could not read.
 ///
 /// A file that vanished between the walk and the read is a real change to the input surface, so it

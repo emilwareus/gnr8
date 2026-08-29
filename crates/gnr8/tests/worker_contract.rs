@@ -613,6 +613,9 @@ fn the_store_shares_a_build_between_checkouts_and_never_decides_the_outcome() {
         "the next run must reuse its own stamped binary",
     );
 
+    // 3b. The two consent flags govern a restored worker exactly as they govern a built one.
+    assert_the_policies_that_govern_a_build_govern_a_restore(&second, &cargo, &store);
+
     // 4. With sharing off, a checkout that has lost its worker builds again rather than restoring —
     //    and never creates a store of its own.
     let never_created = base.join("never-created");
@@ -682,6 +685,91 @@ fn the_store_shares_a_build_between_checkouts_and_never_decides_the_outcome() {
     );
 
     let _ = std::fs::remove_dir_all(base);
+}
+
+/// A build that compiles a directory the fingerprint cannot see is never shared.
+///
+/// The fingerprint hashes every file under `.gnr8/`. A `path` dependency written RELATIVE to that
+/// directory names a different tree in every checkout, so two checkouts holding byte-identical
+/// `.gnr8/` sources would compute one fingerprint over two different builds — and the second would
+/// run a worker compiled from the first one's code. Such a build stays entirely local: nothing is
+/// published, so nothing can be restored, and every checkout compiles what it actually holds.
+#[cfg(unix)]
+#[test]
+fn a_build_that_reads_bytes_outside_the_workspace_is_never_published() {
+    if !cargo_available() {
+        eprintln!("skipping worker_contract: cargo unavailable");
+        return;
+    }
+    let root = unique_dir("unshareable");
+    let store = root.join("store");
+    write_project(&root, "", OPENAPI_PIPELINE);
+    // A crate beside the project, reached by a relative path. Declaring it is what makes cargo
+    // compile it, which is what makes its bytes part of this build.
+    std::fs::create_dir_all(root.join("helpers/src")).unwrap();
+    std::fs::write(
+        root.join("helpers/Cargo.toml"),
+        "[package]\nname = \"contract-helpers\"\nversion = \"0.1.0\"\nedition = \"2021\"\npublish = false\n",
+    )
+    .unwrap();
+    std::fs::write(
+        root.join("helpers/src/lib.rs"),
+        "pub fn mark() -> u8 { 1 }\n",
+    )
+    .unwrap();
+    let manifest = std::fs::read_to_string(root.join(".gnr8/Cargo.toml")).unwrap();
+    std::fs::write(
+        root.join(".gnr8/Cargo.toml"),
+        manifest.replace(
+            "\n\n[workspace]",
+            "\ncontract-helpers = { path = \"../helpers\" }\n\n[workspace]",
+        ),
+    )
+    .unwrap();
+
+    let built = gnr8_sharing_through(&root, &["generate", "-v"], None, &store);
+    assert_worker(&built, "built", "the first run must build");
+    assert!(
+        walk_files(&store.join("worker")).is_empty(),
+        "a build whose inputs reach outside .gnr8/ must not be published: {:?}",
+        walk_files(&store)
+    );
+
+    // And with nothing published there is nothing to restore: the next checkout builds its own.
+    forget_worker(&root, "contract-gnr8-gen");
+    let again = gnr8_sharing_through(&root, &["generate", "-v"], None, &store);
+    assert_worker(&again, "built", "an unshareable build is never restored");
+
+    let _ = std::fs::remove_dir_all(root);
+}
+
+/// `--no-build` and `--no-execute` mean the same thing to a restore as to the build it replaces.
+///
+/// A restore leaves the checkout in the state a build would have left it in, so the run that refuses
+/// to invoke cargo accepts the stamp it wrote — that equivalence is the whole claim. And the run that
+/// refuses to run anything from `.gnr8/` never reaches the store at all: entry or no entry, nothing
+/// is written into the checkout.
+fn assert_the_policies_that_govern_a_build_govern_a_restore(
+    checkout: &Path,
+    cargo: &Path,
+    store: &Path,
+) {
+    let no_build = gnr8_sharing_through(checkout, &["--no-build", "generate", "-v"], None, store);
+    assert_worker(
+        &no_build,
+        "reused",
+        "--no-build must accept a stamp a restore wrote",
+    );
+
+    forget_worker(checkout, "contract-gnr8-gen");
+    let refused = gnr8_sharing_through(checkout, &["--no-execute", "generate"], Some(cargo), store);
+    let text = combined(&refused);
+    assert!(!refused.status.success(), "{text}");
+    assert!(text.contains("--no-execute"), "{text}");
+    assert!(
+        !checkout.join(".gnr8/cache/worker.json").exists(),
+        "--no-execute must not restore a worker into the checkout"
+    );
 }
 
 /// The pipeline every store test runs, so they all fingerprint the same `.gnr8/` sources.
