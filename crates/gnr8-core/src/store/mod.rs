@@ -14,6 +14,11 @@
 //! provably equal to recomputing locally: same key ⇒ same inputs ⇒ same output, which is the
 //! determinism invariant the whole product already rests on.
 //!
+//! That obligation is the caller's, and it is the only one this module asks for: a derivation whose
+//! key does NOT name everything it read — a `.gnr8/` crate compiling a directory its fingerprint
+//! never hashes — never reaches the store at all, because there one key would cover two different
+//! answers. It is recomputed locally instead, which is slower and never wrong.
+//!
 //! So the store is a memo, not a second derivation path. There is still exactly one way to build a
 //! worker and exactly one way to extract a graph; the store only lets a machine skip repeating one.
 //! An entry that cannot prove it belongs to this question is deleted, not interpreted.

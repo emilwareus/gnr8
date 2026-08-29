@@ -156,6 +156,14 @@ What is shared, and nothing else:
 | the built `.gnr8/` worker binary | the build fingerprint above | the fingerprint covers every build input and no path |
 | a Go source analysis | the source cache key above | the key covers the module's build inputs, the extractor binary, the toolchain and the gnr8 version; the stored graph holds only project-relative paths |
 
+Each is shared only while its key provably names the same bytes read from any checkout, and a
+derivation that reaches outside the tree its key hashes is simply never shared. A `.gnr8/Cargo.toml`
+with a `path` dependency written RELATIVE to it — `helpers = { path = "../helpers" }` — compiles a
+directory the fingerprint never sees, and a different one in every checkout, so that worker is built
+and stamped locally exactly as before and never published. A path that stays inside `.gnr8/` is
+covered by content like every other input, and an absolute one names a single directory on this
+machine, so both stay shareable.
+
 The ownership manifest is deliberately **not** shared: it records what *this* checkout's outputs are,
 which is checkout state rather than an answer. Neither is the `gofmt` memo, which is rewritten with
 exactly the entries one run needed and would otherwise thrash between projects. The compiled
@@ -197,7 +205,9 @@ For the Go source that bound is the **enclosing module**, not just the configure
 `go/packages` type-checks the input packages together with everything they import, using whatever `go`
 is on PATH, so the module's build inputs and the toolchain identity are both part of the key. A module
 rooted above the project root, a Go workspace that puts other modules in scope, or a tree that cannot
-be enumerated exactly, is not cached at all. Every entry
+be enumerated exactly, is not cached at all. A `go.mod` `replace` that compiles a local directory in
+place of a module makes that directory part of the same surface, so the key hashes it too and moves
+when it changes — one level, because `go` applies only the main module's replacements. Every entry
 records the key it was computed under and is discarded when that recording does not match the current
 run, so a cache restored from another commit can only cost time, never change a verdict.
 Deleting cache is safe; the next run recomputes it. Pre-child pipeline skipping is disabled:

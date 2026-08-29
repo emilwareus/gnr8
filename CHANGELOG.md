@@ -38,7 +38,12 @@ must move the minor version.
   Sharing is safe for one reason: an entry is filed under the key the derivation already computes and
   records that key inside itself, so it can only ever be returned for the exact question it answered —
   a different gnr8 version, `.gnr8/Cargo.lock`, Go toolchain, or source byte is a different key and a
-  miss. A restored worker binary is additionally re-hashed against the length and digest its entry
+  miss. A derivation whose key cannot name everything it read is never shared at all: a `.gnr8/` crate
+  that depends on a directory by a path written RELATIVE to it compiles bytes the fingerprint never
+  hashes, and different ones in every checkout, so it is built and stamped in that checkout exactly as
+  before and nothing is published.
+
+  A restored worker binary is additionally re-hashed against the length and digest its entry
   recorded before it is moved into place; a mismatch deletes the entry and builds. Only those two
   artifacts are shared: the ownership manifest and the `gofmt` memo describe one checkout rather than
   an answer, and stay in `.gnr8/cache`.

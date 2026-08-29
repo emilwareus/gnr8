@@ -8,7 +8,8 @@ Run commands from the application repository root. Global options are:
 ```text
 --json          emit machine-readable output and suppress progress text
 -v, --verbose   show more detail; repeat for additional verbosity
---no-build      never invoke cargo; require an already-built, matching .gnr8 worker
+--no-build      never produce a worker binary here (no cargo, no shared-cache restore);
+                require a matching one this checkout already built
 --no-execute    never build and never run the .gnr8 worker
 -h, --help      print help for the selected command
 -V, --version   print the CLI version

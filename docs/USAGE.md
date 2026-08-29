@@ -260,6 +260,16 @@ for the exact question it answered — a differing `.gnr8/Cargo.lock`, gnr8 vers
 source byte is a different key and a miss. And every restored binary is re-hashed against the length
 and digest the entry recorded before it is moved into place; a mismatch deletes the entry and builds.
 
+Commit `.gnr8/Cargo.lock`. It pins what the worker compiles, so it is part of the key: a checkout
+that arrives without one asks a different question and shares nothing until it has built its own.
+
+A derivation whose key cannot name its whole input surface is never shared at all. If `.gnr8/Cargo.toml`
+depends on a crate by a path written relative to it (`helpers = { path = "../helpers" }`), that names
+a directory the fingerprint never hashes — and a different one in every checkout — so the worker is
+built and stamped in this checkout exactly as before and nothing is published. Writing that
+dependency as an absolute path, or keeping it inside `.gnr8/`, keeps it shareable. (A Go `replace`
+that points at a local directory needs no such care: the source key hashes that directory too.)
+
 The store is one user's state on one machine, at the trust level of `~/.cargo/registry`. gnr8 creates
 it private to you (`0700` on Unix), never shares it between users, machines, or over a network, and
 never fails a run over it: a missing, unwritable, full, or corrupt store is a miss. Deleting it is
