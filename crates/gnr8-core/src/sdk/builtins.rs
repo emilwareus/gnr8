@@ -469,16 +469,19 @@ fn save_go_gin_cache(cx: &Cx, key: &str, store: Option<&Store>, graph: &ApiGraph
 ///
 /// Two `gnr8` processes in one project can reach this at the same time. A torn entry would only cost
 /// a recompute — it does not parse, and the loader treats that as no entry — but write-then-rename
-/// removes the window entirely, and the temporary name carries the writer's pid so two concurrent
-/// writes never collide.
+/// removes the window entirely. The temporary is named for the entry AND the writer's pid, the same
+/// discipline the build stamp uses, so no two writers can ever be holding the same one.
 fn write_go_gin_cache_file(path: &Path, bytes: &[u8]) {
     let Some(parent) = path.parent() else {
+        return;
+    };
+    let Some(name) = path.file_name().map(std::ffi::OsStr::to_string_lossy) else {
         return;
     };
     if std::fs::create_dir_all(parent).is_err() {
         return;
     }
-    let temporary = parent.join(format!(".entry.{}.tmp", std::process::id()));
+    let temporary = parent.join(format!(".{name}.{}.tmp", std::process::id()));
     if std::fs::write(&temporary, bytes).is_err() || std::fs::rename(&temporary, path).is_err() {
         let _ = std::fs::remove_file(&temporary);
     }
