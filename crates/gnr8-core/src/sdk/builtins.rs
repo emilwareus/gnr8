@@ -36,6 +36,7 @@ use crate::sdk::emit_common::quoted_string_literal;
 use crate::sdk::hash_files;
 use crate::sdk::model::SdkModel;
 use crate::sdk::model_style::PyModelStyle;
+use crate::sdk::resolved_lexically;
 use crate::store::{Namespace, Store};
 use crate::CoreError;
 use std::collections::{BTreeMap, BTreeSet};
@@ -252,6 +253,60 @@ fn go_gin_cache_scope(project_root: &Path, input: &Path) -> Option<PathBuf> {
     }
 }
 
+/// Every directory this `go.mod` compiles in place of a module, in the order it declares them.
+///
+/// A `replace` whose right-hand side is a filesystem path makes `go` build THAT directory instead of
+/// the named module, so its sources are as much an input to the analysis as the module's own — and a
+/// path leaving the module sits outside the tree the scope walk covers. Hashing those directories
+/// too is what keeps the key a name for everything the extractor reads: a monorepo that points its
+/// service module at `../sdks/go` gets a key that moves when that SDK changes, and two checkouts
+/// share an entry only when both trees match.
+///
+/// One level is the whole of it: `go` applies only the MAIN module's replacements and ignores a
+/// dependency's, so there is nothing below these to follow.
+///
+/// A right-hand side that is a module path and version instead is left alone — `go.sum` already pins
+/// that by content. `None` when `go.mod` cannot be read, because an input surface that cannot be
+/// proven gets no cache key at all.
+///
+/// `go.mod` is the module manifest the Go toolchain itself consumes and `=>` is its own syntax;
+/// nothing here reads a convention another tool invented.
+fn local_replacement_dirs(scope: &Path) -> Option<Vec<PathBuf>> {
+    let text = std::fs::read_to_string(scope.join("go.mod")).ok()?;
+    let mut dirs = Vec::new();
+    for line in text.lines() {
+        let statement = line.split_once("//").map_or(line, |(code, _)| code);
+        let Some((_, replacement)) = statement.split_once("=>") else {
+            continue;
+        };
+        let Some(target) = replacement.split_whitespace().next() else {
+            continue;
+        };
+        if !is_local_module_path(target) {
+            continue;
+        }
+        let path = Path::new(target);
+        dirs.push(if path.is_absolute() {
+            path.to_path_buf()
+        } else {
+            resolved_lexically(scope, path)
+        });
+    }
+    Some(dirs)
+}
+
+/// Whether a `replace` target names a directory rather than a module version.
+///
+/// Go's own rule: the right-hand side is a local directory when it is absolute or begins with `./`
+/// or `../`. Everything else is a module path, which the module graph resolves and `go.sum` verifies.
+fn is_local_module_path(target: &str) -> bool {
+    Path::new(target).is_absolute()
+        || matches!(
+            target.split(['/', '\\']).next(),
+            Some("." | "..") if target.contains(['/', '\\'])
+        )
+}
+
 /// Whether a Go workspace governs `input`, which puts modules outside the enclosing one in scope.
 ///
 /// In workspace mode `go` resolves imports across every module the workspace lists, so the input
@@ -354,14 +409,24 @@ fn go_gin_cache_scope_files(scope: &Path) -> Option<Vec<PathBuf>> {
 ///
 /// Pure with respect to the toolchain: the caller resolves [`ExtractorIdentity`] once and hands it
 /// in, so the key and the run can never describe two different helpers.
-/// The analyzed module's directory and one digest over every build input under it.
+/// The analyzed module's directory and one digest over every build input it and its replacements hold.
 ///
 /// `None` whenever the input surface cannot be proven exactly — no enclosing module inside the
 /// project, a Go workspace, or a tree that cannot be enumerated — which means no cache key, which
 /// means the analysis is simply recomputed.
 fn go_gin_scope_digest(input: &Path, cx: &Cx) -> Option<(PathBuf, String)> {
     let scope = go_gin_cache_scope(&cx.project_root, input)?;
-    let files = go_gin_cache_scope_files(&scope)?;
+    let mut files = go_gin_cache_scope_files(&scope)?;
+    // What `go.mod` replaces a module with is compiled in that module's place, so it is part of the
+    // same input surface — a directory the walk above cannot reach when the replacement leaves the
+    // module. One that cannot be enumerated leaves the surface unprovable, which means no key.
+    for replacement in local_replacement_dirs(&scope)? {
+        files.extend(go_gin_cache_scope_files(&replacement)?);
+    }
+    // A replacement pointing back inside the module names files the walk already found; the digest
+    // is over a SET of inputs, so it must not depend on how many directives mentioned one.
+    files.sort();
+    files.dedup();
     let digest = hash_files(&files, &cx.project_root).ok()?;
     Some((scope, digest))
 }
@@ -3961,8 +4026,8 @@ mod tests {
     /// The toolchain the extractor runs under is still a key input in its own right.
     ///
     /// It decides which files the build constraints select and what stdlib type information comes
-    /// back, so a `GOOS`/`GOARCH`/`GOFLAGS`/`GOTOOLCHAIN` change must miss the cache even when the
-    /// same binary runs.
+    /// back, so a `GOOS`/`GOARCH`/`GOFLAGS`/`CGO_ENABLED`/`GOTOOLCHAIN` change must miss the cache
+    /// even when the same binary runs.
     #[test]
     fn go_gin_cache_key_changes_with_the_toolchain_the_extractor_runs_under() {
         let cx = go_module_cx("cache-key-run-toolchain");
@@ -4150,6 +4215,112 @@ mod tests {
         assert!(
             key.is_none(),
             "an input that escapes the project root must produce no cache key"
+        );
+    }
+
+    /// A `replace` compiles a directory in place of a module, so it is part of the input surface.
+    ///
+    /// The scope walk stops at the module directory, so a replacement that leaves it names sources
+    /// no other part of the key covers: editing them would leave the key — and therefore the graph
+    /// gnr8 reports — exactly where it was, and the machine-global store would answer a second
+    /// checkout with the first one's analysis. The key hashes those directories too, so it moves
+    /// when they do, and a replacement gnr8 cannot enumerate produces no key at all.
+    #[test]
+    fn go_gin_cache_key_covers_the_directories_go_mod_replaces_a_module_with() {
+        let cx = go_module_cx("cache-key-replace");
+        let input = cx.project_root.clone();
+        let go_mod = input.join("go.mod");
+        let outside = cx.project_root.join("..").join(format!(
+            "gnr8-cache-key-replace-shared-{}",
+            std::process::id()
+        ));
+        std::fs::create_dir_all(&outside).expect("create the replaced module");
+        std::fs::write(outside.join("go.mod"), "module example.com/shared\n").expect("go.mod");
+        std::fs::write(outside.join("shared.go"), "package shared\n").expect("shared.go");
+        let routes = vec!["./...".to_string()];
+        let schemas = vec!["./...".to_string()];
+        let key = || go_gin_cache_key(&input, &routes, &schemas, &extractor("helper"), &cx);
+
+        // Nothing replaced: the module's own tree is the whole surface.
+        std::fs::write(&go_mod, "module example.com/app\n\ngo 1.22\n").expect("go.mod");
+        let plain = key();
+
+        // A module path and version on the right is not a directory — `go.sum` pins that by content.
+        std::fs::write(
+            &go_mod,
+            "module example.com/app\n\ngo 1.22\n\nreplace example.com/x => example.com/y v1.3.0\n",
+        )
+        .expect("go.mod");
+        assert!(key().is_some(), "a module replacement must still key");
+
+        // A directory outside the module is hashed, so editing it moves the key.
+        let directive = format!(
+            "module example.com/app\n\ngo 1.22\n\nreplace example.com/shared => {}\n",
+            outside.to_string_lossy().replace('\\', "/")
+        );
+        std::fs::write(&go_mod, &directive).expect("go.mod");
+        let with_replacement = key();
+        std::fs::write(
+            outside.join("shared.go"),
+            "package shared\n\ntype T struct{}\n",
+        )
+        .expect("shared.go");
+        let after_editing_it = key();
+
+        // A replacement gnr8 cannot enumerate leaves the surface unprovable.
+        std::fs::remove_dir_all(&outside).expect("remove the replaced module");
+        let missing = key();
+
+        let _ = std::fs::remove_dir_all(&cx.project_root);
+        let _ = std::fs::remove_dir_all(&outside);
+        assert!(plain.is_some(), "a module with no replacement must key");
+        assert!(with_replacement.is_some(), "a replaced directory must key");
+        assert_ne!(
+            plain, with_replacement,
+            "the replaced directory is part of the surface the key names"
+        );
+        assert_ne!(
+            with_replacement, after_editing_it,
+            "editing a replaced directory must move the key"
+        );
+        assert!(
+            missing.is_none(),
+            "a replacement that cannot be enumerated must produce no cache key"
+        );
+    }
+
+    /// A replacement pointing back inside the module still keys, over the tree the walk already found.
+    ///
+    /// This is the shape `fixtures/gin-contract-regression` uses (`replace … => ./ginstub`): the
+    /// replaced directory is part of the module, so hashing the replacements adds nothing to the
+    /// surface and must not cost the cache. The key still moves, because the directive itself is a
+    /// line of the `go.mod` the key already hashes.
+    #[test]
+    fn a_replacement_inside_the_module_still_keys() {
+        let cx = go_module_cx("cache-key-replace-inside");
+        let input = cx.project_root.clone();
+        std::fs::create_dir_all(input.join("ginstub")).expect("create the stub");
+        std::fs::write(input.join("ginstub/go.mod"), "module example.com/stub\n").expect("go.mod");
+        std::fs::write(input.join("ginstub/stub.go"), "package stub\n").expect("stub.go");
+        let routes = vec!["./...".to_string()];
+        let schemas = vec!["./...".to_string()];
+        let key = || go_gin_cache_key(&input, &routes, &schemas, &extractor("helper"), &cx);
+
+        std::fs::write(input.join("go.mod"), "module example.com/app\n\ngo 1.22\n")
+            .expect("go.mod");
+        let plain = key();
+        std::fs::write(
+            input.join("go.mod"),
+            "module example.com/app\n\ngo 1.22\n\nreplace example.com/stub => ./ginstub\n",
+        )
+        .expect("go.mod");
+        let replaced = key();
+
+        let _ = std::fs::remove_dir_all(&cx.project_root);
+        assert!(plain.is_some() && replaced.is_some());
+        assert_ne!(
+            plain, replaced,
+            "the directive itself lives in go.mod, which the key already hashes"
         );
     }
 

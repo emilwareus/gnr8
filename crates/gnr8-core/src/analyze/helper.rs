@@ -97,7 +97,7 @@ pub(crate) fn resolve_target(target_dir: &str) -> Result<String, CoreError> {
 /// One value, resolved once, used for both the cache key and the extraction — so the key can
 /// never describe a different helper than the one that produced the facts (CLAUDE.md rule 3).
 pub(crate) struct ExtractorIdentity {
-    /// The analyzed module's `go env GOVERSION GOOS GOARCH GOFLAGS GOTOOLCHAIN` reading.
+    /// The analyzed module's `go env GOVERSION GOOS GOARCH GOFLAGS CGO_ENABLED GOTOOLCHAIN` reading.
     toolchain: GoToolchain,
     /// The resolved path of the compiled helper that will run.
     binary: PathBuf,
@@ -255,9 +255,12 @@ struct GoToolchain {
     version: String,
     /// The caller's effective `GOTOOLCHAIN` selection policy.
     selection: String,
-    /// The full `GOVERSION`/`GOOS`/`GOARCH`/`GOFLAGS`/`GOTOOLCHAIN` reading, which keys the binary
-    /// cache. The policy is part of the key so a binary built while downloads were allowed cannot
-    /// bypass a later `local` or `path` run.
+    /// The full `GOVERSION`/`GOOS`/`GOARCH`/`GOFLAGS`/`CGO_ENABLED`/`GOTOOLCHAIN` reading, which
+    /// keys the binary cache. The policy is part of the key so a binary built while downloads were
+    /// allowed cannot bypass a later `local` or `path` run. `CGO_ENABLED` is there because it is a
+    /// build constraint like `GOOS`: it decides whether the cgo-gated files of a package compile,
+    /// and therefore which types the analysis sees. `GOTOOLCHAIN` stays LAST because
+    /// [`GoToolchain::selection`] reads the final line.
     identity: String,
 }
 
@@ -269,6 +272,7 @@ fn go_toolchain(go_bin: &str, target_dir: &str) -> Result<GoToolchain, CoreError
             "GOOS",
             "GOARCH",
             "GOFLAGS",
+            "CGO_ENABLED",
             "GOTOOLCHAIN",
         ])
         .current_dir(target_dir)
