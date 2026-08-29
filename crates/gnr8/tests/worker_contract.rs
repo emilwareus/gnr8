@@ -743,6 +743,65 @@ fn a_build_that_reads_bytes_outside_the_workspace_is_never_published() {
     let _ = std::fs::remove_dir_all(root);
 }
 
+/// A build a cargo config redirects is never shared either, and for the same reason.
+///
+/// `[patch]`, `[replace]` and `paths` send a package's source somewhere neither the manifest nor the
+/// lockfile names, from a file that belongs to the machine rather than to any checkout. `.gnr8/` is
+/// byte-identical either side of one, so the fingerprint is too, while what the build compiles is
+/// not — the escaping `path` dependency above, reached through cargo's configuration. The answer is
+/// the same: nothing is published, so nothing can be restored, and every checkout compiles what its
+/// own environment resolves.
+#[cfg(unix)]
+#[test]
+fn a_build_a_cargo_config_redirects_is_never_published() {
+    if !cargo_available() {
+        eprintln!("skipping worker_contract: cargo unavailable");
+        return;
+    }
+    let root = unique_dir("redirected");
+    let store = root.join("store");
+    write_project(&root, "", OPENAPI_PIPELINE);
+    // A crate of the SDK's own name beside the project, and a cargo config in one of the standard
+    // locations sending the SDK to it. Nothing under `.gnr8/` mentions either, which is the point:
+    // this patch happens to resolve to nothing here, and the fingerprint would not have moved if it
+    // had resolved to a whole different SDK.
+    std::fs::create_dir_all(root.join("elsewhere/src")).unwrap();
+    std::fs::write(
+        root.join("elsewhere/Cargo.toml"),
+        "[package]\nname = \"gnr8\"\nversion = \"0.9.0\"\nedition = \"2021\"\npublish = false\n",
+    )
+    .unwrap();
+    std::fs::write(
+        root.join("elsewhere/src/lib.rs"),
+        "pub fn mark() -> u8 { 1 }\n",
+    )
+    .unwrap();
+    std::fs::create_dir_all(root.join(".cargo")).unwrap();
+    std::fs::write(
+        root.join(".cargo/config.toml"),
+        format!(
+            "[patch.crates-io]\ngnr8 = {{ path = {:?} }}\n",
+            root.join("elsewhere").to_string_lossy()
+        ),
+    )
+    .unwrap();
+
+    let built = gnr8_sharing_through(&root, &["generate", "-v"], None, &store);
+    assert_worker(&built, "built", "the first run must build");
+    assert!(
+        walk_files(&store.join("worker")).is_empty(),
+        "a build a cargo config redirects must not be published: {:?}",
+        walk_files(&store)
+    );
+
+    // And with nothing published there is nothing to restore: the next checkout builds its own.
+    forget_worker(&root, "contract-gnr8-gen");
+    let again = gnr8_sharing_through(&root, &["generate", "-v"], None, &store);
+    assert_worker(&again, "built", "a redirected build is never restored");
+
+    let _ = std::fs::remove_dir_all(root);
+}
+
 /// `--no-build` and `--no-execute` mean the same thing to a restore as to the build it replaces.
 ///
 /// A restore leaves the checkout in the state a build would have left it in, so the run that refuses

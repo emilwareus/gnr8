@@ -32,9 +32,12 @@
 //! forbids building forbids that too.
 //!
 //! Sharing it is only sound while the fingerprint names the same bytes read from any checkout, which
-//! is [`inputs_are_the_same_from_every_checkout`]: a `path` dependency written RELATIVE to `.gnr8/`
-//! points at a directory the walk never sees AND at a different one in each checkout, so a build
-//! that has one is built and stamped here exactly as always and simply never reaches the store.
+//! is [`inputs_are_the_same_from_every_checkout`]. Two constructs can break that. A `path`
+//! dependency written RELATIVE to `.gnr8/` points at a directory the walk never sees AND at a
+//! different one in each checkout. A cargo `[patch]`, `[replace]` or `paths` override does it from
+//! outside the tree altogether: `.gnr8/` does not change by a byte, lockfile included, while the
+//! sources it sends the build to do. Either way the build is made and stamped here exactly as always
+//! and simply never reaches the store.
 //!
 //! A restored binary is verified the same way the recorded one is: the store's entry records the
 //! length and content hash of the bytes it published, and the copy is re-hashed and compared BEFORE
@@ -57,6 +60,20 @@ const CARGO_ENV: &str = "CARGO";
 const DEFAULT_CARGO: &str = "cargo";
 /// Set to `1` to pass `--offline` to every cargo invocation.
 pub const GNR8_CARGO_OFFLINE_ENV: &str = "GNR8_CARGO_OFFLINE";
+/// The env var naming cargo's home directory, which is where its user-wide config lives.
+const CARGO_HOME_ENV: &str = "CARGO_HOME";
+/// The env var cargo falls back to for that directory's parent (`~/.cargo`).
+const HOME_ENV: &str = "HOME";
+/// The same fallback on Windows, where `HOME` is usually unset.
+const WINDOWS_HOME_ENV: &str = "USERPROFILE";
+
+/// The names cargo reads a config from in a `.cargo/` directory: the current one and the
+/// extensionless one it kept honoring for the projects written before 1.39.
+const CARGO_CONFIG_NAMES: [&str; 2] = ["config.toml", "config"];
+
+/// The cargo config keys that can put a package's source somewhere other than where the manifest and
+/// the lockfile say it is — see [`a_cargo_config_redirects_a_dependency`] for why `include` is one.
+const CARGO_REDIRECT_KEYS: [&str; 4] = ["patch", "replace", "paths", "include"];
 
 /// The cargo profile gnr8 compiles a project's worker under.
 ///
@@ -533,10 +550,21 @@ fn fingerprints_of(
 /// simply never reaches [`crate::store`] — the same "an unprovable input surface is not shared"
 /// rule the source cache applies to a Go module it cannot bound.
 ///
-/// The manifests under `.gnr8/` are the only place such a pointer can appear and are already in the
-/// enumerated input set, so this answers from the files the caller has. Anything unreadable or
-/// unparseable answers `false`: a surface that cannot be proven is never shared.
-fn inputs_are_the_same_from_every_checkout(dir: &Path, files: &[PathBuf]) -> bool {
+/// A manifest is not the only thing that can point a build somewhere else, though: a cargo config
+/// can redirect a package's source without any file under `.gnr8/` changing by a byte — which is the
+/// same defect through a different door, and the reason the second half of this answer reads them.
+///
+/// Both halves are asked from what the caller already has or from a handful of fixed locations, and
+/// anything unreadable or unparseable answers `false`: a surface that cannot be proven is never
+/// shared.
+fn inputs_are_the_same_from_every_checkout(workspace: &Workspace, files: &[PathBuf]) -> bool {
+    every_manifest_path_stays_put(&workspace.dir, files)
+        && !a_cargo_config_redirects_a_dependency(&workspace.project_root)
+}
+
+/// Whether every `path` the manifests under `dir` declare names the same directory from every
+/// checkout. The manifests are the only place in the enumerated input set such a pointer can appear.
+fn every_manifest_path_stays_put(dir: &Path, files: &[PathBuf]) -> bool {
     files
         .iter()
         .filter(|path| path.file_name().is_some_and(|name| name == "Cargo.toml"))
@@ -587,6 +615,99 @@ fn collect_declared_paths(value: &toml::Value, out: &mut Vec<String>) {
             }
         }
         _ => {}
+    }
+}
+
+/// Whether a cargo config that applies to this build redirects where a dependency's source is read
+/// from.
+///
+/// `Cargo.lock` pins a registry or git dependency and cargo verifies it by checksum, which is what
+/// lets the fingerprint stand for the whole of what a build compiles. A cargo config can undo that
+/// from OUTSIDE the tree the fingerprint hashes: `[patch]` and `[replace]` send a named package to
+/// another source, and `paths` overrides whatever packages it finds in the directories it lists. The
+/// lockfile does not record where those pointed, so `.gnr8/` — lockfile included — is byte-identical
+/// either side of such a config while the sources compiled through it are not. That is the escaping
+/// `path` dependency again, reached through cargo's configuration instead of the manifest, and it
+/// gets the same answer: build here, stamp here, share nothing.
+///
+/// It never asks WHICH package is redirected. A `paths` entry names directories rather than packages
+/// and could only be attributed by reading the manifests it points at, a `replace` key is a
+/// package-id spec that would have to be parsed to be attributed, and a patch of any crate in the
+/// worker's graph moves bytes the fingerprint cannot see exactly as a patch of the SDK does. One
+/// question — does this build read sources the fingerprint cannot name — has one answer for all of
+/// them, and a false yes costs a local build while a false no shares the wrong binary.
+fn a_cargo_config_redirects_a_dependency(project_root: &Path) -> bool {
+    cargo_config_files(project_root, cargo_home())
+        .iter()
+        .any(|path| redirects_a_dependency(path))
+}
+
+/// Every cargo config file that can apply to a worker build rooted at `project_root`.
+///
+/// cargo merges the `.cargo/` config of the directory it runs in — [`cargo_build`] runs it in the
+/// project root — with those of every ancestor of that directory, and with `$CARGO_HOME`'s. Both
+/// file names are taken at every location because cargo still honors the extensionless one it used
+/// before 1.39. Nothing here requires a file to exist; a name that is not there is read as absent.
+fn cargo_config_files(project_root: &Path, cargo_home: Option<PathBuf>) -> Vec<PathBuf> {
+    project_root
+        .ancestors()
+        .map(|dir| dir.join(".cargo"))
+        .chain(cargo_home)
+        .flat_map(|dir| CARGO_CONFIG_NAMES.map(|name| dir.join(name)))
+        .collect()
+}
+
+/// Where cargo keeps its user-wide config: `$CARGO_HOME`, else `~/.cargo`, resolved the way cargo
+/// itself resolves it. `None` when the environment names neither, which is no location to read.
+fn cargo_home() -> Option<PathBuf> {
+    if let Some(home) = env_path(CARGO_HOME_ENV) {
+        return Some(home);
+    }
+    env_path(HOME_ENV)
+        .or_else(|| env_path(WINDOWS_HOME_ENV))
+        .map(|home| home.join(".cargo"))
+}
+
+/// One environment variable read as a directory, treating an empty value as the absence it means.
+fn env_path(var: &str) -> Option<PathBuf> {
+    std::env::var_os(var)
+        .filter(|value| !value.is_empty())
+        .map(PathBuf::from)
+}
+
+/// Whether one cargo config file redirects where a package's source is read from.
+///
+/// A file that is not there redirects nothing — nor does a location where cargo could not keep one,
+/// such as a `.cargo` that is a file rather than a directory. A file that IS there and cannot be read
+/// or parsed is treated as if it did redirect, as is one that `include`s a file whose contents this
+/// does not follow: the store may only ever make a run faster, so a config whose effect this run
+/// could not establish is never one it claims to have proven.
+fn redirects_a_dependency(path: &Path) -> bool {
+    if !path.is_file() {
+        return false;
+    }
+    let Ok(text) = std::fs::read_to_string(path) else {
+        return true;
+    };
+    let Ok(config) = toml::from_str::<toml::Value>(&text) else {
+        return true;
+    };
+    CARGO_REDIRECT_KEYS
+        .iter()
+        .any(|key| declares_an_entry(config.get(key)))
+}
+
+/// Whether a config key is present AND names something, so that a `[patch.crates-io]` header with no
+/// entries under it — which redirects nothing — is not read as a redirect.
+fn declares_an_entry(value: Option<&toml::Value>) -> bool {
+    match value {
+        None => false,
+        Some(toml::Value::Table(table)) => table.values().any(|entry| match entry {
+            toml::Value::Table(inner) => !inner.is_empty(),
+            _ => true,
+        }),
+        Some(toml::Value::Array(items)) => !items.is_empty(),
+        Some(_) => true,
     }
 }
 
@@ -762,7 +883,7 @@ pub fn ensure_worker(
     // on, so that run never pays for it — and used by both the restore below and the publish at the
     // end, which therefore cannot disagree about it.
     let store =
-        store.filter(|_| inputs_are_the_same_from_every_checkout(&workspace.dir, &workspace_files));
+        store.filter(|_| inputs_are_the_same_from_every_checkout(workspace, &workspace_files));
     // The store is where a build comes from when it does not have to happen again, so it is reached
     // on the same terms as the build it replaces: `--no-build` withholds consent for producing a
     // worker binary in this checkout at all, not merely for running cargo.
@@ -1215,11 +1336,16 @@ mod tests {
         let _ = std::fs::remove_dir_all(root);
     }
 
-    /// Whether this workspace's inputs are the same read from any checkout, over its real files.
+    /// Whether every path this workspace's manifests declare names the same directory from every
+    /// checkout, over its real files.
+    ///
+    /// This is the half of the answer the manifests carry. The other half reads the machine's cargo
+    /// configuration, which is why it is asked of fixed inputs below rather than of the environment
+    /// the suite happens to run in.
     fn shareable(root: &std::path::Path) -> bool {
         let dir = root.join(".gnr8");
         let files = workspace_input_files(&dir).unwrap();
-        super::inputs_are_the_same_from_every_checkout(&dir, &files)
+        super::every_manifest_path_stays_put(&dir, &files)
     }
 
     /// A `path` dependency that leaves `.gnr8/` by a RELATIVE path names a different directory in
@@ -1302,6 +1428,149 @@ mod tests {
         assert!(
             !shareable(&root),
             "`../../../outside` leaves .gnr8/ and must not be shared"
+        );
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    /// Every location cargo would merge a config from is a location a redirect can hide in: the
+    /// directory the build runs in, every ancestor of it, and cargo's own home — under both names.
+    #[test]
+    fn every_standard_cargo_config_location_is_scanned() {
+        let files = super::cargo_config_files(
+            std::path::Path::new("/a/b/project"),
+            Some(PathBuf::from("/elsewhere/cargo-home")),
+        );
+
+        for expected in [
+            "/a/b/project/.cargo/config.toml",
+            "/a/b/project/.cargo/config",
+            "/a/b/.cargo/config.toml",
+            "/a/b/.cargo/config",
+            "/a/.cargo/config.toml",
+            "/.cargo/config.toml",
+            "/elsewhere/cargo-home/config.toml",
+            "/elsewhere/cargo-home/config",
+        ] {
+            assert!(
+                files.contains(&PathBuf::from(expected)),
+                "{expected} must be scanned, got {files:?}"
+            );
+        }
+
+        // An environment that names no cargo home leaves exactly the four directories the build
+        // walks, under both names, and nothing else.
+        let files = super::cargo_config_files(std::path::Path::new("/a/b/project"), None);
+        assert_eq!(
+            files.len(),
+            8,
+            "no cargo home means no location beyond the ones the build walks: {files:?}"
+        );
+    }
+
+    /// What a cargo config has to say to disable sharing, and what it does not.
+    #[test]
+    fn a_cargo_config_that_redirects_a_package_is_read_as_one_and_nothing_else_is() {
+        let root = temp_project("cargo-config");
+        let config = root.join("config.toml");
+
+        assert!(
+            !super::redirects_a_dependency(&root.join("not-there.toml")),
+            "a config that does not exist redirects nothing"
+        );
+
+        for benign in [
+            "",
+            "[build]\njobs = 2\n",
+            "[target.aarch64-unknown-linux-gnu]\nlinker = \"aarch64-linux-gnu-gcc\"\n",
+            "[net]\noffline = true\n",
+            // Present but empty: a header with no entries under it redirects nothing.
+            "[patch.crates-io]\n",
+        ] {
+            std::fs::write(&config, benign).unwrap();
+            assert!(
+                !super::redirects_a_dependency(&config),
+                "must not be read as a redirect:\n{benign}"
+            );
+        }
+
+        for redirect in [
+            // The measured case: the SDK sent to a working tree, from a config no checkout holds.
+            "[patch.crates-io]\ngnr8 = { path = \"/elsewhere/gnr8-sdk\" }\n",
+            "[patch.\"https://github.com/example/registry\"]\ngnr8 = { git = \"https://example.invalid/gnr8\" }\n",
+            // Any other crate in the worker's graph moves bytes the fingerprint cannot see too.
+            "[patch.crates-io]\nserde = { path = \"/elsewhere/serde\" }\n",
+            "[replace]\n\"gnr8:0.9.0\" = { path = \"/elsewhere/gnr8-sdk\" }\n",
+            "paths = [\"/elsewhere/gnr8-sdk\"]\n",
+            // An include names a file whose contents this deliberately does not follow.
+            "include = \"shared.toml\"\n",
+        ] {
+            std::fs::write(&config, redirect).unwrap();
+            assert!(
+                super::redirects_a_dependency(&config),
+                "must be read as a redirect:\n{redirect}"
+            );
+        }
+
+        // A config this run cannot establish the effect of is treated as if it redirected: the store
+        // may only ever make a run faster, so an unprovable input surface is never shared.
+        std::fs::write(&config, "[patch.crates-io\ngnr8 = {").unwrap();
+        assert!(
+            super::redirects_a_dependency(&config),
+            "a config that does not parse is never proven"
+        );
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    /// The one decision both store directions are taken from says no while a redirect is in reach.
+    ///
+    /// A cargo config is not part of any checkout, so `.gnr8/` is byte-identical either side of one,
+    /// lockfile included — the fingerprint cannot move to record it, and the only sound answer is to
+    /// take the build out of the store entirely. Removing the config restores the answer, which is
+    /// what makes it the config and not the workspace that decided it.
+    #[test]
+    fn a_cargo_config_that_redirects_a_dependency_takes_the_build_out_of_the_store() {
+        let root = temp_project("cargo-redirect");
+        write_manifest(&root, CURRENT);
+        let workspace = validate_workspace(&root).unwrap();
+        let files = workspace_input_files(&workspace.dir).unwrap();
+        let decided = || super::inputs_are_the_same_from_every_checkout(&workspace, &files);
+        let fingerprint = |workspace: &super::Workspace| {
+            let files = workspace_input_files(&workspace.dir).unwrap();
+            super::fingerprints_of(workspace, "host-hash", &files)
+                .unwrap()
+                .complete
+        };
+
+        // This machine's own cargo configuration is part of this answer, so what the clean
+        // direction proves is that the config below is what MOVED it — on a machine that already
+        // patches a crate globally, a gnr8 developer's for instance, the build is genuinely
+        // unshareable and there is nothing else to prove.
+        let without = decided();
+        let before = fingerprint(&workspace);
+
+        let config = root.join(".cargo/config.toml");
+        std::fs::create_dir_all(config.parent().unwrap()).unwrap();
+        std::fs::write(
+            &config,
+            "[patch.crates-io]\ngnr8 = { path = \"/elsewhere/gnr8-sdk\" }\n",
+        )
+        .unwrap();
+        assert!(
+            !decided(),
+            "a config that sends the SDK elsewhere must take the build out of the store"
+        );
+        assert_eq!(
+            fingerprint(&workspace),
+            before,
+            "the config sits outside everything the fingerprint hashes, which is the whole reason \
+             this is decided separately rather than keyed"
+        );
+
+        std::fs::remove_file(&config).unwrap();
+        assert_eq!(
+            decided(),
+            without,
+            "removing it must restore whatever this machine's own configuration already said"
         );
         let _ = std::fs::remove_dir_all(root);
     }
