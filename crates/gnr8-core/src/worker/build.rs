@@ -1094,6 +1094,36 @@ mod tests {
         assert!(WorkerPolicy::default().allow_build);
     }
 
+    /// A checkout whose lockfile differs asks a different question, so it can never restore this
+    /// build — while an edit cargo itself may make during a build does not move the authored surface.
+    #[test]
+    fn the_lockfile_is_part_of_the_fingerprint_a_store_entry_is_filed_under() {
+        let root = temp_project("lockfile");
+        write_manifest(&root, CURRENT);
+        std::fs::write(root.join(".gnr8/Cargo.lock"), "version = 4\n").unwrap();
+        let workspace = validate_workspace(&root).unwrap();
+        let files = workspace_input_files(&workspace.dir).unwrap();
+        let before = super::fingerprints_of(&workspace, "host-hash", &files).unwrap();
+
+        std::fs::write(
+            root.join(".gnr8/Cargo.lock"),
+            "version = 4\n# resolved elsewhere\n",
+        )
+        .unwrap();
+        let files = workspace_input_files(&workspace.dir).unwrap();
+        let after = super::fingerprints_of(&workspace, "host-hash", &files).unwrap();
+
+        assert_ne!(
+            before.complete, after.complete,
+            "a different lockfile must be a different store key"
+        );
+        assert_eq!(
+            before.authored, after.authored,
+            "the lockfile is not part of the concurrent-edit bracket"
+        );
+        let _ = std::fs::remove_dir_all(root);
+    }
+
     /// Publish a worker entry the way a real build does, then hand back what it recorded.
     fn publish_fake_worker(
         store: &crate::store::Store,

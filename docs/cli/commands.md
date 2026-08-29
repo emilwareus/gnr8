@@ -86,8 +86,8 @@ protected. Any protected output makes the command exit non-zero after reporting 
   ownership manifest records. It never deletes unrelated files merely because they share an output
   directory.
 
-JSON includes changed-file groups, counts, timings, diagnostics, whether the worker was `built` or
-`reused` for this run, and input/output counts.
+JSON includes changed-file groups, counts, timings, diagnostics, how the worker was obtained for this
+run (`built`, `reused` from this checkout's stamp, or `restored` from the machine-global store), and input/output counts.
 
 ## `watch`
 

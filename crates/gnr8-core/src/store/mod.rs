@@ -461,6 +461,72 @@ mod tests {
         let _ = std::fs::remove_dir_all(dir);
     }
 
+    #[test]
+    fn concurrent_publishers_converge_and_leave_nothing_half_written() {
+        let root = temp_store("concurrent");
+        let store = Store::at(&root);
+        let source = root.join("source.bin");
+        std::fs::write(&source, b"blob bytes").unwrap();
+        let hash = crate::manifest::blake3_hex(b"blob bytes");
+
+        // Eight writers over three keys and one blob, the shape two worktrees generating at once
+        // produce: every entry is either absent or whole, because each is renamed into place.
+        std::thread::scope(|scope| {
+            for index in 0..8 {
+                let store = &store;
+                let source = &source;
+                let hash = &hash;
+                scope.spawn(move || {
+                    let key = format!("{:02x}{}", index % 3, "ab".repeat(31));
+                    store.publish(Namespace::Worker, &key, b"recorded");
+                    store.publish_blob(hash, source);
+                    store.publish(Namespace::GoGinSource, &key, b"recorded");
+                });
+            }
+        });
+
+        for index in 0..3 {
+            let key = format!("{:02x}{}", index, "ab".repeat(31));
+            assert_eq!(
+                store.read(Namespace::Worker, &key).as_deref(),
+                Some(b"recorded".as_slice())
+            );
+            assert_eq!(
+                store.read(Namespace::GoGinSource, &key).as_deref(),
+                Some(b"recorded".as_slice())
+            );
+        }
+        let blob = store.blob_path(&hash).unwrap();
+        assert_eq!(std::fs::read(&blob).unwrap(), b"blob bytes");
+        assert!(
+            temporary_files(&root).is_empty(),
+            "no half-written entry may be left behind: {:?}",
+            temporary_files(&root)
+        );
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    /// Every `.<name>.<pid>.tmp` still under `dir`, which must be none once publishing has finished.
+    fn temporary_files(dir: &Path) -> Vec<PathBuf> {
+        let mut out = Vec::new();
+        let Ok(entries) = std::fs::read_dir(dir) else {
+            return out;
+        };
+        for entry in entries.flatten() {
+            let path = entry.path();
+            if path.is_dir() {
+                out.extend(temporary_files(&path));
+            } else if path
+                .file_name()
+                .and_then(|name| name.to_str())
+                .is_some_and(|name| std::path::Path::new(name).extension() == Some("tmp".as_ref()))
+            {
+                out.push(path);
+            }
+        }
+        out
+    }
+
     #[cfg(unix)]
     #[test]
     fn the_directories_gnr8_creates_are_private_to_the_user() {

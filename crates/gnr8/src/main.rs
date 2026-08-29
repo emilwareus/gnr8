@@ -1434,6 +1434,7 @@ fn run_doctor(policy: WorkerPolicy, output: Output) -> Result<()> {
         .as_ref()
         .map(|run| collect_sdk_readiness(&run.outcome))
         .unwrap_or_default();
+    let cache_store = cache_store().map(|store| store.root().to_string_lossy().into_owned());
     let drift = match run.as_ref() {
         Some(run) => match gnr8_engine::lifecycle::plan_only(&root, &run.outcome.artifacts) {
             Ok(plan) => Some(plan),
@@ -1465,6 +1466,7 @@ fn run_doctor(policy: WorkerPolicy, output: Output) -> Result<()> {
                     .to_string_lossy()
                     .into_owned(),
             ),
+            cache_store,
             output_anchors,
         },
         doctor::DoctorTimings {

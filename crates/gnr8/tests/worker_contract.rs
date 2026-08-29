@@ -541,7 +541,8 @@ fn a_worker_binary_reached_through_a_symlinked_target_dir_is_refused() {
 ///
 /// The build fingerprint names inputs and nothing else, so a second checkout holding the same
 /// `.gnr8/` — the same manifest, the same lockfile, the same sources — asks the same question and
-/// gets the answer the first checkout already paid for.
+/// gets the answer the first checkout already paid for. Neither directory here is a git repository,
+/// which is the point: nothing in this chain reads git, so a "checkout" is only ever a directory.
 #[cfg(unix)]
 #[test]
 fn a_second_checkout_restores_the_worker_the_first_one_built() {
