@@ -9,6 +9,18 @@ must move the minor version.
 
 ## Unreleased
 
+## 0.10.2 — 2026-09-02
+
+### Changed
+
+- **Ownership references now name `oaiz-io`.** The repository moved to the OAIZ
+  organisation. `scripts/install.sh` defaults to `GNR8_REPO=oaiz-io/gnr8`, so piping the
+  installer no longer reaches the old owner through a redirect, and the crate metadata
+  crates.io renders points at the new repository.
+- Documentation matches the OAIZ Labs baseline: a security policy with a private
+  reporting route, a conduct section in the contribution guide, and issue and pull
+  request templates.
+
 ## 0.10.1 — 2026-08-29
 
 ### Added
