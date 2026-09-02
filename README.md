@@ -1,102 +1,93 @@
 # gnr8
 
-**One tool for the whole loop between your API code and OpenAPI + client SDKs, end to end.**
+[![CI](https://github.com/oaiz-io/gnr8/actions/workflows/ci.yml/badge.svg)](https://github.com/oaiz-io/gnr8/actions/workflows/ci.yml)
+[![Crates.io](https://img.shields.io/crates/v/gnr8.svg)](https://crates.io/crates/gnr8)
+[![License: MIT](https://img.shields.io/badge/license-MIT-blue.svg)](LICENSE)
 
-`gnr8` reads your service code, builds a language- and router-agnostic model of its API, and generates
-an **OpenAPI 3.1** document and a client **SDK** from it. The generation lifecycle is **configured in
-code**, so you, or an AI agent, can adapt exactly how it parses and generates for your project.
-gnr8 owns this pipeline end to end while using focused open-source libraries for commodity concerns;
-the generated Go, Python, and TypeScript SDKs use only their standard libraries.
+**Generate OpenAPI 3.1 and typed client SDKs from your API source code.**
 
-> Status: **early release candidate.** Supported frontends are **Go + Gin**, **Python FastAPI**,
-> **Python Flask typed-envelope**, and **TypeScript NestJS class DTOs**, with OpenAPI 3.1 plus
-> Go/Python/TypeScript SDK generation.
+gnr8 reads routes, handlers, and types from a service. It builds one language-neutral API graph and
+uses that graph to generate an OpenAPI document and client SDKs. A local Rust crate in `.gnr8/`
+defines the pipeline. There is no YAML, TOML, or JSON configuration file.
 
-> **Agents using gnr8 in an application repo:** start with the task-routed
-> [`docs/agents/index.md`](https://github.com/oaiz-io/gnr8/blob/main/docs/agents/index.md)
-> or run `gnr8 guide`. The [single-page guide](docs/AGENT-USAGE.md) remains an onboarding summary.
+gnr8 is an open-source [OAIZ](https://github.com/oaiz-io) Labs project. Emil Wåreus created the
+project and donated it to OAIZ in 2026. OAIZ now maintains it as part of OAIZ Labs.
 
-> **Full reference (CLI, config, type mapping, recipes):** [`docs/USAGE.md`](docs/USAGE.md).
+> **Status:** Early release candidate. The current source frontends are Go with Gin, Python with
+> FastAPI or Flask typed envelopes, and TypeScript with NestJS class DTOs.
 
----
+## Why gnr8
 
-## Why I built it
-
-- **One tool, both directions, end to end.** Generate OpenAPI from your code, and generate code (client
-  SDKs) from that, in one place, one pass, instead of stitching a chain of tools together.
-- **Fast.** A native binary with no warm-up.
-- **Incremental.** It regenerates only what actually changed; built for a save-and-see loop, not full
-  rebuilds.
-- **Local and inspectable.** The CLI and project-local Rust pipeline run on your machine or CI; there
-  is no hosted control plane to operate.
-- **Configured by code, not YAML, and built for AI agents.** The customization surface is *code*, not a
-  config file with a handful of human-friendly flags. The point isn't minimal-config "ease of use" for
-  humans; it's that an AI agent can write code to adapt the entire parse-and-generate lifecycle to your
-  project by extending the framework directly.
-- **Modern SDKs, easy to shape.** Generate SDKs that follow modern idioms for each target, and change
-  *how* they're generated through that same configuration-as-code model.
-
----
+- **One pipeline:** Source extraction, the API graph, OpenAPI generation, and SDK generation use one
+  owned contract.
+- **Code is the source of truth:** gnr8 reads native routes and types. It does not require a separate
+  annotation dialect.
+- **Code-based configuration:** Edit ordinary Rust in `.gnr8/src/main.rs` to select sources,
+  transforms, targets, and post-processors.
+- **Deterministic output:** Identical input produces byte-identical output. Incremental generation
+  writes only changed artifacts.
+- **Local operation:** The CLI and pipeline run on your machine or in CI. There is no hosted control
+  plane.
 
 ## How it works
 
-```
-your API code
-   │  read the routes, handlers, and types directly; your code is the source of truth
-   ▼
-internal API model   ── language- & router-agnostic: methods, paths, params, schemas, provenance
-   │
-   ├─▶ OpenAPI 3.1 document
-   └─▶ client SDK   (typed client + models + errors; it compiles)
-```
-
-The first supported frontend reads **Go + Gin** via `go/types`; Python and TypeScript frontends use
-static sidecars for FastAPI, Flask, and NestJS. A native engine builds a deterministic
-model (identical input → byte-identical output) and generates the OpenAPI document and SDKs. The
-generation lifecycle is **a Rust crate at `.gnr8/`** — `gnr8 init` scaffolds it, and `gnr8 generate`
-compiles and runs it, so adapting how your code is parsed and generated is just editing code. That
-crate depends on a deliberately thin SDK: the built-in stages you compose are declarations the
-installed CLI executes, so only the stages you write yourself are compiled into your project. That
-same `.gnr8/` workspace tracks what it generated (so it never overwrites your edits), regenerates only
-what changed, can watch for source edits, and a `doctor` command reports anything it couldn't
-represent.
-
----
-
-## Quick look
-
-A small Gin service (the first supported frontend): [`examples/bookstore/`](examples/bookstore/):
-
-```go
-func registerRoutes(r *gin.Engine) {
-    books := r.Group("/books")
-    books.POST("",     createBook)
-    books.GET("",      listBooks)   // ?genre= filter
-    books.GET("/:id",  getBook)
-    books.PUT("/:id",  updateBook)
-    books.DELETE("/:id", deleteBook)
-}
-
-type Book struct {
-    ID          string    `json:"id"`
-    Title       string    `json:"title"`
-    Genre       Genre     `json:"genre"`              // a code-defined enum → OpenAPI enum
-    Price       float64   `json:"price"`
-    PublishedAt time.Time `json:"publishedAt"`
-    Subtitle    *string   `json:"subtitle,omitempty"` // optional
-    Publisher   Publisher `json:"publisher"`          // nested → $ref
-    Tags        []string  `json:"tags"`
-}
+```text
+service source
+    │  routes, handlers, types, and native documentation
+    ▼
+language-neutral API graph
+    ├──► OpenAPI 3.1
+    ├──► Go SDK
+    ├──► Python SDK
+    └──► TypeScript SDK
 ```
 
-Run it:
+The graph is the source of truth. OpenAPI documents and SDKs are output artifacts. Facts that the
+source cannot express, such as a service-wide security scheme, come from transforms in the `.gnr8/`
+crate.
+
+## Supported inputs and outputs
+
+| Source | Static input | Required toolchain |
+|---|---|---|
+| Go + Gin | routes, handlers, structs, and enums | Go |
+| Python + FastAPI | routes, type hints, models, enums, and unions | Python 3 |
+| Python + Flask | typed route envelopes and Python types | Python 3 |
+| TypeScript + NestJS | controllers, typed parameters, DTO classes, enums, and unions | Node and the project’s TypeScript package |
+| OpenAPI | an OpenAPI document used as a neutral source | none beyond gnr8 |
+
+Targets include OpenAPI 3.1 YAML and typed Go, Python, and TypeScript SDKs. Go uses `net/http`.
+TypeScript uses the built-in `fetch` API. Python uses `urllib`; its models use Pydantic v2 by default
+or standard-library dataclasses when selected in the pipeline.
+
+## Install
+
+Install the latest CLI release:
 
 ```bash
-gnr8 init        # scaffold the .gnr8/ Rust crate (this is your config)
+curl -fsSL https://raw.githubusercontent.com/oaiz-io/gnr8/main/scripts/install.sh | bash
 ```
 
-`gnr8 init` writes `.gnr8/src/main.rs` — the lifecycle, in code. Edit the `Pipeline` to say how your
-API is parsed and generated (no TOML, no flags file):
+The release archive contains the CLI and its extractor resources. You also need:
+
+- Rust and Cargo, because gnr8 compiles the local `.gnr8/` crate.
+- The toolchain for the source language that gnr8 analyzes.
+- Access to the Cargo registry for the first build, unless the required crates are already cached.
+
+The crates.io package named `gnr8` is the Rust SDK used by the `.gnr8/` crate. It is not the CLI.
+See [the install guide](docs/install.md) for release layouts, local installation, and resource
+discovery.
+
+## Quick start
+
+From the root of a Go and Gin service:
+
+```bash
+gnr8 init --source go-gin --sdk go
+```
+
+This command creates `.gnr8/src/main.rs`. Edit the generated pipeline when you need different inputs,
+metadata, outputs, or custom stages:
 
 ```rust
 use gnr8::sdk::prelude::*;
@@ -115,74 +106,32 @@ fn main() -> std::process::ExitCode {
 }
 ```
 
-```bash
-gnr8 generate    # build (once) + run .gnr8/, write openapi.yaml + the client SDK
-```
-
-Out comes OpenAPI 3.1:
-
-```yaml
-paths:
-  '/books/':
-    get:
-      operationId: listBooks
-      parameters:
-        - { name: genre, in: query, required: false, schema: { type: string } }
-      responses:
-        '200': { content: { application/json: { schema: { $ref: '#/components/schemas/BookList' } } } }
-```
-
-…and an SDK you can call:
-
-```go
-func (c *Client) CreateBook(ctx context.Context, in CreateBookRequest) (Book, error)
-func (c *Client) GetBook(ctx context.Context, id string) (Book, error)
-```
-
-The full input **and** the real generated output are committed in
-[`examples/bookstore/`](examples/bookstore/) - see [its README](examples/bookstore/README.md) for the
-side-by-side.
-
----
-
-## Try the example
-
-### Prerequisites
-
-The release archive provides the `gnr8` CLI and extractor source resources, but generation is not a
-standalone-binary workflow. You need:
-
-- Rust and Cargo, because `gnr8 generate` compiles the project-local `.gnr8` configuration crate.
-- The analyzed service's toolchain: Go for Gin, Python 3 for FastAPI/Flask, or Node plus that project's
-  own `typescript` package for NestJS.
-- Access to Cargo's registry on the first build unless the required Rust crates are already cached.
-
-gnr8 statically recognizes the documented framework patterns; dynamic or unresolved code produces a
-diagnostic or an explicit failure. Review the exact envelope in [docs/USAGE.md](docs/USAGE.md).
-
-Install the CLI from the GitHub release archive:
+Generate and check the artifacts:
 
 ```bash
-curl -fsSL https://raw.githubusercontent.com/oaiz-io/gnr8/main/scripts/install.sh | bash
+gnr8 generate
+gnr8 doctor
+gnr8 check
 ```
 
-The crates.io package named `gnr8` is the thin code-as-config SDK a `.gnr8/` crate depends on; it is
-not the CLI install path. Generated `.gnr8/Cargo.toml` files use the matching SDK source bundled in
-the complete release archive, alongside the extractor resources `gnr8 generate` needs.
+Use `gnr8 init --source fastapi --sdk python`, `--source flask --sdk python`, or
+`--source nestjs --sdk typescript` for the other source stacks.
 
-For local development from this checkout:
+## Main commands
 
-```bash
-cargo build --release -p gnr8-cli
-cd examples/bookstore
-../../target/release/gnr8 generate
-# see generated/openapi.yaml and generated/sdk/
-```
+| Command | Purpose |
+|---|---|
+| `gnr8 init` | Create the required `.gnr8/` pipeline crate. |
+| `gnr8 generate` | Generate all configured artifacts. |
+| `gnr8 check` | Fail when generated artifacts are stale or changed by hand. |
+| `gnr8 watch` | Regenerate after source or pipeline changes. |
+| `gnr8 doctor` | Report toolchain, extraction, and output problems. |
+| `gnr8 inspect routes\|schemas\|graph` | Inspect facts from the pipeline or an explicit source path. |
+| `gnr8 guide` | Print a short agent-oriented guide. |
 
 ## GitHub Action
 
-Use the official action to fail CI when generated OpenAPI, SDKs, CLIs, or other `.gnr8` artifacts are
-stale:
+The official Action runs `gnr8 check` and fails when committed artifacts are stale:
 
 ```yaml
 name: gnr8
@@ -194,74 +143,41 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v7
-      - uses: oaiz-io/gnr8@v0.1.21 # pin an exact released tag
+      - uses: oaiz-io/gnr8@v0.10.1
         with:
-          setup-go: "true" # for Go/Gin projects; use setup-python/setup-node for other source stacks
+          setup-go: "true"
 ```
 
-For multiple `.gnr8` projects in one repo:
+Pin an exact released tag. For Python and TypeScript sources, use the matching setup input. See
+[Artifacts and CI](docs/operations/artifacts-and-ci.md) for all inputs and multi-project examples.
 
-```yaml
-- uses: oaiz-io/gnr8@v0.1.21 # pin an exact released tag
-  with:
-    working-directories: |
-      services/api
-      services/admin-api
-```
+## Trust and analysis limits
 
-The action restores and saves `.gnr8/cache` plus `.gnr8/target`, so repeated `gnr8 check` runs can use
-gnr8's verified no-op path. `gnr8 check` exits non-zero if a fresh generation would write different
-artifacts.
+`gnr8 generate` compiles and runs Rust code from `.gnr8/` with your user permissions. Review this
+code before you run it. `--no-build` prevents a build, and `--no-execute` prevents both build and
+execution.
 
----
+Source extraction is static. gnr8 does not import or run the analyzed service. Dynamic or unresolved
+routes and types produce a diagnostic or an explicit error.
 
-## Status
+## Documentation
 
-**Today:** Go + Gin, FastAPI, Flask typed-envelope, and NestJS class-DTO sources work end to end →
-OpenAPI 3.1 plus compiling/typechecked Go, Python, and TypeScript client SDKs; the `.gnr8/` lifecycle
-(`init` / `generate` / `check` / `watch` / `doctor`), incremental regeneration, and edit-protection.
+- [Install](docs/install.md) — release archives, local installation, and toolchains.
+- [Agent documentation index](docs/agents/index.md) — task-based routes for coding agents.
+- [CLI reference](docs/cli/commands.md) — commands, flags, output, and exit behavior.
+- [Pipeline configuration](docs/pipeline/configuration.md) — built-in stages and custom Rust stages.
+- [Source extraction](docs/extraction/sources.md) — supported patterns and limits.
+- [SDK generation](docs/sdk/generation.md) — Go, Python, and TypeScript targets.
+- [Full reference](docs/USAGE.md) — detailed behavior and type mapping.
+- [Examples](examples/) — complete inputs and committed generated output.
 
-**Configuration is code.** `gnr8 init` scaffolds a small Rust crate at `.gnr8/` that drives the
-lifecycle — there is **no TOML/YAML config file**. You (or an agent) edit `.gnr8/src/main.rs`: it builds
-a `Pipeline` of a source, transforms, targets, and post-processors, and `gnr8 generate` compiles and
-runs it. Built-ins cover the common cases (`GoGin`, `SetBasePath`/`SetTitle`/`ApplySecurity`,
-`OpenApi31`, `GoSdk`); anything else is ordinary Rust — implement a trait and compose it with
-`Custom(...)`.
+## Contributing
 
-Building and running `.gnr8/` executes Rust from your repository with your privileges, and is not
-sandboxed. `gnr8 --no-build` refuses to invoke cargo; `gnr8 --no-execute` refuses to build or run.
+Contributions are welcome. Read [CONTRIBUTING.md](CONTRIBUTING.md) and the
+[engineering invariants](AGENTS.md) before you open a pull request. Run `make check` before you submit
+a change.
 
-**By design, additive:** the internal model is language- and router-agnostic, so additional source
-frameworks and SDK targets extend it rather than reshape it — a new source or target is a Rust type that
-implements one trait and composes into the same pipeline.
+## License
 
----
-
-## Principles (see [`CLAUDE.md`](CLAUDE.md))
-
-1. Everything is derived from **your code and your config**: one deterministic source per fact.
-2. **Explicit prerequisites:** required compiler/toolchain and static-analysis limits are reported,
-   never hidden behind a silent recovery path.
-3. **Deterministic:** identical input → byte-identical output.
-4. **Extensible in code:** adapt the lifecycle by extending the framework, not by toggling flags.
-
----
-
-## Repo layout
-
-| Path | What |
-|------|------|
-| `crates/gnr8-sdk/` | the published `gnr8` crate: the API graph, the four stage traits, the built-in declarations, the worker protocol |
-| `crates/gnr8-core/` | the host engine: extraction, OpenAPI lowering, SDK generation, lifecycle, diagnostics |
-| `crates/gnr8/` | the `gnr8` CLI (`init`, `guide`, `generate`, `check`, `inspect`, `watch`, `doctor`) |
-| `goextract/` | the Go frontend that reads Gin source via `go/types` |
-| `examples/bookstore/` | a runnable example + its real generated output (the basic `.gnr8/` lifecycle) |
-| `examples/taskflow/` | a richer example: a custom `Transform` + a custom `Target` (writes `API.md`) in `.gnr8/` |
-| `fixtures/goalservice/` | the test fixture (a realistic Gin service) driving the contract tests |
-| `docs/agents/index.md` | task-routed agent reference for commands, configuration, features, and operations |
-| `docs/AGENT-USAGE.md` | single-page agent onboarding and recovery guide |
-| `docs/USAGE.md` | full reference: CLI, config, patterns, type mapping, recipes |
-| `llms.txt` / `llms-full.txt` | agent-readable docs index and compact full-context export |
-| `docs/` | `demo.md` (walkthrough), `evidence.md` (what's verified) |
-
-Build & verify: `make check` (format, lint, tests) · `make gates` (the full contract suite).
+gnr8 is available under the [MIT License](LICENSE). The license keeps the original author notice and
+records OAIZ as the current project steward.

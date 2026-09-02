@@ -55,7 +55,7 @@ Packaged `gnr8 init` writes:
 
 ```toml
 [dependencies]
-gnr8 = "=0.1.23"   # exact published crate version
+gnr8 = "=0.10.1"   # exact published crate version for this release
 ```
 
 The crates.io package provides the Rust API. Sidecars (`goextract`, `pyextract`, `tsextract`) come

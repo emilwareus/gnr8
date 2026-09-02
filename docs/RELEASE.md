@@ -1,6 +1,6 @@
 # Release
 
-The release process is intentionally shaped like `exlint`:
+The release process uses focused CI jobs and one manual release workflow:
 
 - `Release dry-run` runs on pull requests and pushes to `main`. Separate jobs exercise crates.io
   packaging, per-platform CLI archives, and an unpacked Linux archive.
@@ -69,8 +69,9 @@ before users of that archive can build their generator crate. Only in-repo build
 dependency.
 
 The CLI and engine use focused open-source dependencies for commodity concerns such as serialization,
-CLI parsing, and file watching. gnr8 owns the source-to-OpenAPI-to-SDK pipeline itself; generated SDKs
-remain standard-library-only.
+CLI parsing, and file watching. gnr8 owns the source-to-OpenAPI-to-SDK pipeline itself. Generated Go
+and TypeScript SDKs use platform libraries. Generated Python clients use `urllib`; their models use
+Pydantic v2 by default or standard-library dataclasses when selected.
 
 ## GitHub Release
 
