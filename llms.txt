@@ -4,6 +4,8 @@
 > typed Go/Python/TypeScript SDKs from Go Gin, FastAPI, Flask typed-envelope, and NestJS class DTO
 > source code. Configuration lives in `.gnr8/src/main.rs`.
 
+gnr8 is an open-source OAIZ Labs project maintained by OAIZ.
+
 Start here when using gnr8 from an AI coding agent:
 
 - [Task-Routed Agent Docs](docs/agents/index.md): choose one focused page instead of loading the full

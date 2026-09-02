@@ -27,8 +27,8 @@ applied to code↔OpenAPI↔SDK generation.
 
 ## Reference implementation: `polint` (a.k.a. exlint) — the proven pattern
 
-`polint` (`/Users/emilwareus/Development/exlint`) already ships this exact model for *linting*. We adopt
-its mechanics wholesale and change only two things (below). Verified mechanics worth copying:
+`polint` already uses this model for linting. This design borrows its process mechanics and changes
+the two product-specific parts below. The useful mechanics are:
 
 - **Process boundary = `cargo run --manifest-path` + JSON-on-stdout + exit code. No FFI, no dylib, no
   plugin ABI.** The user crate is an ordinary Rust **binary**. `polint check` runs

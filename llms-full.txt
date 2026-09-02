@@ -2,6 +2,7 @@
 
 gnr8 reads service source code, builds a language-neutral API graph, and generates OpenAPI 3.1 plus
 typed SDKs. The main users are coding agents and developers working inside application repositories.
+It is an open-source OAIZ Labs project maintained by OAIZ.
 
 ## Install
 
