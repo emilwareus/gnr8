@@ -107,7 +107,7 @@ remain standard-library-only.
 Users can install the latest archive with:
 
 ```bash
-curl -fsSL https://raw.githubusercontent.com/emilwareus/gnr8/main/scripts/install.sh | bash
+curl -fsSL https://raw.githubusercontent.com/oaiz-io/gnr8/main/scripts/install.sh | bash
 ```
 
 Environment overrides:

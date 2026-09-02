@@ -13,7 +13,7 @@ the generated Go, Python, and TypeScript SDKs use only their standard libraries.
 > Go/Python/TypeScript SDK generation.
 
 > **Agents using gnr8 in an application repo:** start with the task-routed
-> [`docs/agents/index.md`](https://github.com/emilwareus/gnr8/blob/main/docs/agents/index.md)
+> [`docs/agents/index.md`](https://github.com/oaiz-io/gnr8/blob/main/docs/agents/index.md)
 > or run `gnr8 guide`. The [single-page guide](docs/AGENT-USAGE.md) remains an onboarding summary.
 
 > **Full reference (CLI, config, type mapping, recipes):** [`docs/USAGE.md`](docs/USAGE.md).
@@ -163,7 +163,7 @@ diagnostic or an explicit failure. Review the exact envelope in [docs/USAGE.md](
 Install the CLI from the GitHub release archive:
 
 ```bash
-curl -fsSL https://raw.githubusercontent.com/emilwareus/gnr8/main/scripts/install.sh | bash
+curl -fsSL https://raw.githubusercontent.com/oaiz-io/gnr8/main/scripts/install.sh | bash
 ```
 
 The crates.io package named `gnr8` is the thin code-as-config SDK a `.gnr8/` crate depends on; it is
@@ -194,7 +194,7 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v7
-      - uses: emilwareus/gnr8@v0.1.21 # pin an exact released tag
+      - uses: oaiz-io/gnr8@v0.1.21 # pin an exact released tag
         with:
           setup-go: "true" # for Go/Gin projects; use setup-python/setup-node for other source stacks
 ```
@@ -202,7 +202,7 @@ jobs:
 For multiple `.gnr8` projects in one repo:
 
 ```yaml
-- uses: emilwareus/gnr8@v0.1.21 # pin an exact released tag
+- uses: oaiz-io/gnr8@v0.1.21 # pin an exact released tag
   with:
     working-directories: |
       services/api

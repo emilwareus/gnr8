@@ -35,7 +35,7 @@ needs `python3`, a NestJS service needs `node` + the project's own `typescript` 
 The CLI install path is the GitHub release archive:
 
 ```bash
-curl -fsSL https://raw.githubusercontent.com/emilwareus/gnr8/main/scripts/install.sh | bash
+curl -fsSL https://raw.githubusercontent.com/oaiz-io/gnr8/main/scripts/install.sh | bash
 ```
 
 The crates.io package named `gnr8` is the thin code-as-config SDK a `.gnr8/` crate depends on — not a

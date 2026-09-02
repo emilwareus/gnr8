@@ -35,7 +35,7 @@
 //! generator inside every project that uses it.
 //!
 //! For agent-facing CLI workflows, run `gnr8 guide` or start with the
-//! <https://github.com/emilwareus/gnr8/blob/main/docs/agents/index.md> task index.
+//! <https://github.com/oaiz-io/gnr8/blob/main/docs/agents/index.md> task index.
 
 pub mod error;
 pub use error::Error;

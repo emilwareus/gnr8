@@ -8,7 +8,7 @@ typed SDKs. The main users are coding agents and developers working inside appli
 Install the CLI from GitHub release assets:
 
 ```bash
-curl -fsSL https://raw.githubusercontent.com/emilwareus/gnr8/main/scripts/install.sh | bash
+curl -fsSL https://raw.githubusercontent.com/oaiz-io/gnr8/main/scripts/install.sh | bash
 ```
 
 The crates.io package named `gnr8` exposes the public Rust API. Generated `.gnr8/Cargo.toml` files use
