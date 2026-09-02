@@ -10,8 +10,7 @@ gnr8 reads routes, handlers, and types from a service. It builds one language-ne
 uses that graph to generate an OpenAPI document and client SDKs. A local Rust crate in `.gnr8/`
 defines the pipeline. There is no YAML, TOML, or JSON configuration file.
 
-gnr8 is an open-source [OAIZ](https://github.com/oaiz-io) Labs project. Emil Wåreus created the
-project and donated it to OAIZ in 2026. OAIZ now maintains it as part of OAIZ Labs.
+gnr8 is an [OAIZ Labs](https://oaiz.io/) open-source project maintained by OAIZ.
 
 > **Status:** Early release candidate. The current source frontends are Go with Gin, Python with
 > FastAPI or Flask typed envelopes, and TypeScript with NestJS class DTOs.
@@ -162,20 +161,21 @@ routes and types produce a diagnostic or an explicit error.
 
 ## Documentation
 
-- [Install](docs/install.md) — release archives, local installation, and toolchains.
-- [Agent documentation index](docs/agents/index.md) — task-based routes for coding agents.
-- [CLI reference](docs/cli/commands.md) — commands, flags, output, and exit behavior.
-- [Pipeline configuration](docs/pipeline/configuration.md) — built-in stages and custom Rust stages.
-- [Source extraction](docs/extraction/sources.md) — supported patterns and limits.
-- [SDK generation](docs/sdk/generation.md) — Go, Python, and TypeScript targets.
-- [Full reference](docs/USAGE.md) — detailed behavior and type mapping.
-- [Examples](examples/) — complete inputs and committed generated output.
+- [Install](docs/install.md): release archives, local installation, and toolchains.
+- [Agent documentation index](docs/agents/index.md): task-based routes for coding agents.
+- [CLI reference](docs/cli/commands.md): commands, flags, output, and exit behavior.
+- [Pipeline configuration](docs/pipeline/configuration.md): built-in stages and custom Rust stages.
+- [Source extraction](docs/extraction/sources.md): supported patterns and limits.
+- [SDK generation](docs/sdk/generation.md): Go, Python, and TypeScript targets.
+- [Full reference](docs/USAGE.md): detailed behavior and type mapping.
+- [Examples](examples/): complete inputs and committed generated output.
 
-## Contributing
+## Contributing and support
 
-Contributions are welcome. Read [CONTRIBUTING.md](CONTRIBUTING.md) and the
-[engineering invariants](AGENTS.md) before you open a pull request. Run `make check` before you submit
-a change.
+gnr8 is under active development. Issues and pull requests are welcome. Read the
+[contribution guide](CONTRIBUTING.md) and the [engineering invariants](AGENTS.md) before you submit a
+change, and run `make check`. Report security problems as described in the
+[security policy](SECURITY.md).
 
 ## License
 
