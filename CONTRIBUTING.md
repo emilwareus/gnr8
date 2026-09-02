@@ -80,6 +80,15 @@ Keep each pull request focused. Explain:
 All required checks must pass before merge. A maintainer can ask for changes when a proposal conflicts
 with the engineering invariants, even when its tests pass.
 
+## Conduct
+
+Be respectful and constructive. Focus reviews on the work, give clear reasons for requested changes,
+and assume good intent. Harassment and discriminatory behavior are not accepted.
+
+## Reporting a vulnerability
+
+Do not open a public issue. See [SECURITY.md](SECURITY.md).
+
 ## License
 
 By submitting a contribution, you agree that it is licensed under the repository’s
