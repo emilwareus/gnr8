@@ -244,7 +244,7 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
-      - uses: emilwareus/gnr8@v0.1.21 # pin an exact released Action tag
+      - uses: oaiz-io/gnr8@v0.1.21 # pin an exact released Action tag
         with:
           working-directories: |
             services/books

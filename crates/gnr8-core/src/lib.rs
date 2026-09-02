@@ -18,7 +18,7 @@
 //! runs in their worker process instead, reached through [`pipeline::StageRunner`].
 //!
 //! For agent-facing CLI workflows, run `gnr8 guide` or start with the
-//! <https://github.com/emilwareus/gnr8/blob/main/docs/agents/index.md> task index.
+//! <https://github.com/oaiz-io/gnr8/blob/main/docs/agents/index.md> task index.
 
 // Existing module docs intentionally link some private implementation seams. Keep docs.rs builds
 // warning-free while the public crate root and SDK prelude remain the stable entry points.

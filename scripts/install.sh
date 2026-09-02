@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-repo="${GNR8_REPO:-emilwareus/gnr8}"
+repo="${GNR8_REPO:-oaiz-io/gnr8}"
 tag="${GNR8_RELEASE_TAG:-latest}"
 local_archive="${GNR8_ARCHIVE:-}"
 install_root="${GNR8_INSTALL_ROOT:-$HOME/.local/gnr8}"

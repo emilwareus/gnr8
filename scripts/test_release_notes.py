@@ -32,7 +32,7 @@ class ReleaseNotesTests(unittest.TestCase):
 """
 
         section = release_notes.release_section(text, "0.5.0")
-        body = release_notes.render_body(section, "emilwareus/gnr8")
+        body = release_notes.render_body(section, "oaiz-io/gnr8")
 
         self.assertEqual(section.date, "2026-08-10")
         self.assertIn("### Added\n\n- Safe output adoption.", body)
