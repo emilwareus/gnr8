@@ -341,9 +341,10 @@ fn build_paths(
     // The graph sorts operations by (path, method); joining the base path preserves that order, so a
     // simple ordered accumulator keeps the output deterministic without re-sorting.
     let mut paths: Vec<(String, PathItem)> = Vec::new();
+    let effective_tags = crate::graph::EffectiveOperationTags::new(graph);
     for op in &graph.operations {
         let abs_path = join_base(base_path, &op.path)?;
-        let tags = crate::graph::effective_operation_tags(graph, op);
+        let tags = effective_tags.resolve(op);
         let operation = lower_operation(
             op,
             operation_docs_policy(graph, &op.id),

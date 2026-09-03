@@ -15,6 +15,38 @@ pub(crate) mod projection;
 
 pub use gnr8::graph::*;
 
+use std::collections::BTreeMap;
+
+/// Indexed resolver for the standard tags that classify operations in one graph.
+pub(crate) struct EffectiveOperationTags<'a> {
+    policies: BTreeMap<&'a str, &'a [String]>,
+}
+
+impl<'a> EffectiveOperationTags<'a> {
+    /// Index the graph's non-empty explicit tag policies once.
+    #[must_use]
+    pub(crate) fn new(graph: &'a ApiGraph) -> Self {
+        let mut policies = BTreeMap::new();
+        for policy in &graph.operation_docs {
+            if !policy.tags.is_empty() {
+                policies
+                    .entry(policy.operation_id.as_str())
+                    .or_insert(policy.tags.as_slice());
+            }
+        }
+        Self { policies }
+    }
+
+    /// Resolve one operation as explicit policy tags, its singleton group, or no tags.
+    #[must_use]
+    pub(crate) fn resolve(&self, operation: &'a Operation) -> &'a [String] {
+        self.policies
+            .get(operation.id.as_str())
+            .copied()
+            .unwrap_or(operation.group.as_slice())
+    }
+}
+
 /// Resolve the standard tags that classify one operation.
 ///
 /// A non-empty documentation policy is authoritative. Otherwise the operation's singular source
@@ -23,19 +55,15 @@ pub use gnr8::graph::*;
 /// analysis one canonical answer.
 #[must_use]
 pub fn effective_operation_tags<'a>(graph: &'a ApiGraph, operation: &'a Operation) -> &'a [String] {
-    if let Some(policy) = graph
-        .operation_docs
-        .iter()
-        .find(|policy| policy.operation_id == operation.id && !policy.tags.is_empty())
-    {
-        return &policy.tags;
-    }
-    operation.group.as_slice()
+    EffectiveOperationTags::new(graph).resolve(operation)
 }
 
 #[cfg(test)]
 mod tests {
-    use super::{effective_operation_tags, ApiGraph, Operation, OperationDocsPolicy, SourceSpan};
+    use super::{
+        effective_operation_tags, ApiGraph, EffectiveOperationTags, Operation, OperationDocsPolicy,
+        SourceSpan,
+    };
 
     fn operation(group: Option<&str>) -> Operation {
         Operation {
@@ -102,5 +130,11 @@ mod tests {
             ..ApiGraph::default()
         };
         assert!(effective_operation_tags(&ungrouped, &ungrouped.operations[0]).is_empty());
+
+        let indexed = EffectiveOperationTags::new(&with_policy);
+        assert_eq!(
+            indexed.resolve(&with_policy.operations[0]),
+            ["internal", "partner"]
+        );
     }
 }

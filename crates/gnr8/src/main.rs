@@ -19,6 +19,7 @@ use clap::Parser;
 use cli::{Cli, Commands, GuideTopic, InspectAction, SdkPreset, SourcePreset};
 use gnr8_engine::store::Store;
 use gnr8_engine::worker::WorkerPolicy;
+use std::io::Write as _;
 use std::path::{Component, Path, PathBuf};
 use std::process::{Command, ExitCode};
 use std::time::{Duration, Instant, UNIX_EPOCH};
@@ -102,6 +103,7 @@ fn run_changes(
         output.verbose(format!("total: {}", fmt_duration(total_start.elapsed())));
     }
     if report.is_gating() {
+        std::io::stdout().flush()?;
         std::process::exit(1);
     }
     Ok(())

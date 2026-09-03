@@ -68,6 +68,13 @@ routes <path>` analyzes a source tree without touching `.gnr8/`.
 Artifacts stay sorted by path. Every transition records the prior and new producer. A target should
 normally create; a post-processor should rewrite. Collisions or missing overlay/rewrite targets fail.
 
+Every successful pipeline also creates `generated/gnr8.graph.json`. This always-on, projected graph
+snapshot is written after transforms and post-processors and participates in the same ownership,
+protected-edit, stale-file, and `gnr8 check` lifecycle as target output. Its envelope currently has
+`schema_version: 1`; readers reject any other version. Commit it with the other generated artifacts:
+`gnr8 changes --base <ref>` reads this exact file from the named Git revision and never executes that
+revision's pipeline.
+
 ## Host write safety
 
 gnr8 stores last-written path/hash records in `.gnr8/cache/manifest.json` (gitignored). The planner
@@ -123,6 +130,7 @@ an explicit script/program that performs discovery.
 | Path | Purpose | Commit? |
 |---|---|---:|
 | `.gnr8/Cargo.lock` | exact generator dependency graph | yes |
+| `generated/gnr8.graph.json` | versioned projected graph used by API change analysis | yes |
 | `.gnr8/target/` | compiled project-local generator | no |
 | `.gnr8/cache/manifest.json` | generated ownership hashes | no |
 | `.gnr8/cache/sources/` | source analysis cache | no |

@@ -334,16 +334,9 @@ runs:
         REPORT_PATH: ${{ steps.api-changes.outputs.combined-report }}
       run: |
         set -euo pipefail
-        if ! gh pr comment "$PR_NUMBER" --body-file "$REPORT_PATH" --edit-last --create-if-none; then
+        if ! gh pr comment "$PR_NUMBER" --body-file "$REPORT_PATH"; then
           echo "::warning::gnr8 action could not comment on the pull request; the step summary and artifacts contain the report"
         fi
-
-    - name: Enforce API change gate
-      if: ${{ inputs.report-api-changes == 'true' && steps.api-changes.outputs.gating == 'true' }}
-      shell: bash
-      run: |
-        echo "gnr8 action: checked breaking API changes were found" >&2
-        exit 1
 
     - name: Run gnr8 check
       shell: bash
@@ -373,3 +366,10 @@ runs:
           (cd "$dir" && "$GNR8_BIN" check $EXTRA_ARGS)
           echo "::endgroup::"
         done
+
+    - name: Enforce API change gate
+      if: ${{ always() && inputs.report-api-changes == 'true' && steps.api-changes.outputs.gating == 'true' }}
+      shell: bash
+      run: |
+        echo "gnr8 action: checked breaking API changes were found" >&2
+        exit 1

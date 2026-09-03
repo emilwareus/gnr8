@@ -231,6 +231,7 @@ fn append_reference_diagnostics(text: &mut String, ir: &ApiGraph) {
 /// no policy entry at all and would otherwise be skipped. The policy is joined in for the
 /// facts that genuinely are policy — tags, deprecation, and examples.
 fn append_reference_operation_docs(text: &mut String, ir: &ApiGraph) {
+    let effective_tags = crate::graph::EffectiveOperationTags::new(ir);
     let documented: Vec<(&crate::graph::Operation, Option<&OperationDocsPolicy>)> = ir
         .operations
         .iter()
@@ -249,13 +250,13 @@ fn append_reference_operation_docs(text: &mut String, ir: &ApiGraph) {
     text.push_str("\n## Operation Documentation\n\n");
     for (op, policy) in documented {
         let _ = writeln!(text, "### `{}`\n", op.id);
-        append_operation_docs_body(text, ir, op, policy);
+        append_operation_docs_body(text, &effective_tags, op, policy);
     }
 }
 
 fn append_operation_docs_body(
     text: &mut String,
-    ir: &ApiGraph,
+    effective_tags: &crate::graph::EffectiveOperationTags<'_>,
     op: &crate::graph::Operation,
     policy: Option<&OperationDocsPolicy>,
 ) {
@@ -270,7 +271,7 @@ fn append_operation_docs_body(
     // boundary during this refactor.
     let tags = policy
         .filter(|policy| !policy.tags.is_empty())
-        .map(|_| crate::graph::effective_operation_tags(ir, op));
+        .map(|_| effective_tags.resolve(op));
     if let Some(tags) = tags {
         let joined = tags
             .iter()

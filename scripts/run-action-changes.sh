@@ -63,6 +63,7 @@ for dir in "${dirs[@]}"; do
 
   python3 - "$json" "$markdown" "$dir" <<'PY'
 import json
+import html
 import pathlib
 import sys
 
@@ -70,19 +71,26 @@ source, destination, project = sys.argv[1:]
 report = json.loads(pathlib.Path(source).read_text(encoding="utf-8"))
 summary = report["summary"]
 tags = report["policy"]["exempt_tags"]
-lines = [f"## `{project}`", ""]
+def one_line(value):
+    return " ".join(str(value).splitlines())
+
+lines = ["<!-- gnr8-api-changes -->", f"## API changes for {html.escape(one_line(project))}", ""]
 lines.append(
-    "Base: `{} -> {}`".format(report["base"]["ref"], report["base"]["resolved"])
+    "Base: <code>{}</code> → <code>{}</code>".format(
+        html.escape(one_line(report["base"]["ref"])),
+        html.escape(one_line(report["base"]["resolved"])),
+    )
 )
-lines.extend(["", "Exempt tags: " + (", ".join(f"`{tag}`" for tag in tags) or "none"), ""])
+tag_list = ", ".join(f"<code>{html.escape(one_line(tag))}</code>" for tag in tags)
+lines.extend(["", "Exempt tags: " + (tag_list or "none"), ""])
 lines.append(
     "Summary: {} breaking, {} additive, {} doc-only, {} gating.".format(
         summary["breaking"], summary["additive"], summary["doc_only"], summary["gating"]
     )
 )
-lines.extend(["", "```text"])
+lines.append("")
 if not report["changes"]:
-    lines.append("No API changes.")
+    lines.append("    No API changes.")
 for change in report["changes"]:
     kind = change["kind"].upper().replace("_", "-")
     operation = change.get("operation", "-")
@@ -96,8 +104,10 @@ for change in report["changes"]:
             suffix = "  (exempt on base side; not gating)"
         elif base is None and current is True:
             suffix = "  (exempt on current side; not gating)"
-    lines.append(f"{kind:<9} {operation:<19} {change['message']}{suffix}")
-lines.extend(["```", ""])
+    safe_operation = one_line(operation)
+    safe_message = one_line(change["message"])
+    lines.append(f"    {kind:<9} {safe_operation:<19} {safe_message}{suffix}")
+lines.append("")
 pathlib.Path(destination).write_text("\n".join(lines), encoding="utf-8")
 PY
 

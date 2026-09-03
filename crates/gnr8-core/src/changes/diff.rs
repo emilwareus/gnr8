@@ -5,7 +5,10 @@ use std::collections::{BTreeMap, BTreeSet};
 use crate::graph::direction::{
     directions_of, schema_consumers, schema_directions, SchemaConsumers, SchemaDirections,
 };
-use crate::graph::{ApiGraph, Field, Operation, Param, Response, Schema, SourceSpan, Type};
+use crate::graph::{
+    ApiGraph, Field, OpenApiMetadataPolicy, Operation, Param, Response, Schema, SecurityScheme,
+    SourceSpan, Type,
+};
 
 /// Classification of one observable API change.
 #[derive(
@@ -114,31 +117,51 @@ struct Scope {
     current_span: Option<SourceSpan>,
 }
 
+impl Scope {
+    fn at(&self, current_span: Option<SourceSpan>) -> Self {
+        let mut scope = self.clone();
+        scope.current_span = current_span;
+        scope
+    }
+}
+
 struct GraphIndex<'a> {
     graph: &'a ApiGraph,
     consumers: SchemaConsumers<'a>,
     directions: BTreeMap<&'a str, SchemaDirections>,
-    exempt_tags: &'a BTreeSet<String>,
+    operation_gates: BTreeMap<&'a str, (&'a [String], bool)>,
 }
 
 impl<'a> GraphIndex<'a> {
     fn new(graph: &'a ApiGraph, exempt_tags: &'a BTreeSet<String>) -> Self {
+        let resolver = crate::graph::EffectiveOperationTags::new(graph);
+        let operation_gates = graph
+            .operations
+            .iter()
+            .map(|operation| {
+                let tags = resolver.resolve(operation);
+                let exempt = tags.iter().any(|tag| exempt_tags.contains(tag));
+                (operation.id.as_str(), (tags, exempt))
+            })
+            .collect();
         Self {
             graph,
             consumers: schema_consumers(graph),
             directions: schema_directions(graph),
-            exempt_tags,
+            operation_gates,
         }
     }
 
-    fn operation_tags(&self, operation: &Operation) -> Vec<String> {
-        crate::graph::effective_operation_tags(self.graph, operation).to_vec()
+    fn operation_tags(&self, operation: &Operation) -> &[String] {
+        self.operation_gates
+            .get(operation.id.as_str())
+            .map_or(&[], |(tags, _)| *tags)
     }
 
     fn operation_exempt(&self, operation: &Operation) -> bool {
-        crate::graph::effective_operation_tags(self.graph, operation)
-            .iter()
-            .any(|tag| self.exempt_tags.contains(tag))
+        self.operation_gates
+            .get(operation.id.as_str())
+            .is_some_and(|(_, exempt)| *exempt)
     }
 
     fn schema_side(&self, schema_id: &str) -> (Vec<String>, bool, Vec<&Operation>) {
@@ -152,7 +175,7 @@ impl<'a> GraphIndex<'a> {
             .collect();
         let mut tags = BTreeSet::new();
         for operation in &operations {
-            tags.extend(self.operation_tags(operation));
+            tags.extend(self.operation_tags(operation).iter().cloned());
         }
         let has_non_http = self.consumers.non_http.contains(schema_id);
         let checked = has_non_http
@@ -167,7 +190,7 @@ impl<'a> GraphIndex<'a> {
         let mut tags = BTreeSet::new();
         let mut checked = false;
         for operation in &self.graph.operations {
-            tags.extend(self.operation_tags(operation));
+            tags.extend(self.operation_tags(operation).iter().cloned());
             checked |= !self.operation_exempt(operation);
         }
         (tags.into_iter().collect(), !checked)
@@ -273,7 +296,11 @@ fn compare_document(base: &GraphIndex<'_>, current: &GraphIndex<'_>, out: &mut C
             "document title changed".to_string(),
         );
     }
-    if base.graph.openapi_metadata != current.graph.openapi_metadata {
+    let mut base_metadata = base.graph.openapi_metadata.clone();
+    let mut current_metadata = current.graph.openapi_metadata.clone();
+    base_metadata.servers.clear();
+    current_metadata.servers.clear();
+    if base_metadata != current_metadata {
         out.push(
             &scope,
             ChangeKind::DocOnly,
@@ -282,19 +309,17 @@ fn compare_document(base: &GraphIndex<'_>, current: &GraphIndex<'_>, out: &mut C
             "document metadata changed".to_string(),
         );
     }
+    compare_servers(
+        &base.graph.openapi_metadata,
+        &current.graph.openapi_metadata,
+        &scope,
+        out,
+    );
     compare_security_schemes(base, current, &scope, out);
-    if base.graph.security_requirements != current.graph.security_requirements {
-        let kind = if base.graph.security_requirements.is_empty()
-            && !current.graph.security_requirements.is_empty()
-        {
-            ChangeKind::Breaking
-        } else if !base.graph.security_requirements.is_empty()
-            && current.graph.security_requirements.is_empty()
-        {
-            ChangeKind::Additive
-        } else {
-            ChangeKind::Breaking
-        };
+    let base_security = document_security_alternatives(base.graph);
+    let current_security = document_security_alternatives(current.graph);
+    if base_security != current_security {
+        let kind = security_change_kind(&base_security, &current_security);
         out.push(
             &scope,
             kind,
@@ -302,6 +327,54 @@ fn compare_document(base: &GraphIndex<'_>, current: &GraphIndex<'_>, out: &mut C
             None,
             "global security requirements changed".to_string(),
         );
+    }
+}
+
+fn compare_servers(
+    base: &OpenApiMetadataPolicy,
+    current: &OpenApiMetadataPolicy,
+    scope: &Scope,
+    out: &mut Collector,
+) {
+    let base_servers: BTreeMap<&str, Option<&str>> = base
+        .servers
+        .iter()
+        .map(|server| (server.url.as_str(), server.description.as_deref()))
+        .collect();
+    let current_servers: BTreeMap<&str, Option<&str>> = current
+        .servers
+        .iter()
+        .map(|server| (server.url.as_str(), server.description.as_deref()))
+        .collect();
+    for (url, description) in &base_servers {
+        match current_servers.get(url) {
+            None => out.push(
+                &scope.at(None),
+                ChangeKind::Breaking,
+                "document.server.removed",
+                Some((*url).to_string()),
+                format!("server `{url}` removed"),
+            ),
+            Some(current_description) if description != current_description => out.push(
+                scope,
+                ChangeKind::DocOnly,
+                "document.server.description.changed",
+                Some((*url).to_string()),
+                format!("server `{url}` description changed"),
+            ),
+            Some(_) => {}
+        }
+    }
+    for url in current_servers.keys() {
+        if !base_servers.contains_key(url) {
+            out.push(
+                scope,
+                ChangeKind::Additive,
+                "document.server.added",
+                Some((*url).to_string()),
+                format!("server `{url}` added"),
+            );
+        }
     }
 }
 
@@ -326,19 +399,23 @@ fn compare_security_schemes(
     for (id, scheme) in &base_schemes {
         match current_schemes.get(id) {
             None => out.push(
-                scope,
+                &scope.at(None),
                 ChangeKind::Breaking,
                 "security.scheme.removed",
                 Some((*id).to_string()),
                 format!("security scheme `{id}` removed"),
             ),
-            Some(current_scheme) if scheme != current_scheme => out.push(
-                scope,
-                ChangeKind::Breaking,
-                "security.scheme.changed",
-                Some((*id).to_string()),
-                format!("security scheme `{id}` changed"),
-            ),
+            Some(current_scheme)
+                if security_scheme_shape(scheme) != security_scheme_shape(current_scheme) =>
+            {
+                out.push(
+                    scope,
+                    ChangeKind::Breaking,
+                    "security.scheme.changed",
+                    Some((*id).to_string()),
+                    format!("security scheme `{id}` changed"),
+                );
+            }
             Some(_) => {}
         }
     }
@@ -353,6 +430,10 @@ fn compare_security_schemes(
             );
         }
     }
+}
+
+fn security_scheme_shape(scheme: &SecurityScheme) -> (&str, &str, &str) {
+    (&scheme.kind, &scheme.location, &scheme.name)
 }
 
 fn compare_operations(base: &GraphIndex<'_>, current: &GraphIndex<'_>, out: &mut Collector) {
@@ -378,9 +459,19 @@ fn compare_operations(base: &GraphIndex<'_>, current: &GraphIndex<'_>, out: &mut
             )
         })
         .collect();
+    let current_by_id: BTreeMap<&str, &Operation> = current
+        .graph
+        .operations
+        .iter()
+        .map(|operation| (operation.id.as_str(), operation))
+        .collect();
+    let mut moved_ids = BTreeSet::new();
     for (route, operation) in &base_operations {
         if let Some(current_operation) = current_operations.get(route) {
             compare_operation(base, current, operation, current_operation, out);
+        } else if let Some(current_operation) = current_by_id.get(operation.id.as_str()) {
+            moved_ids.insert(operation.id.as_str());
+            compare_moved_operation(base, current, operation, current_operation, out);
         } else {
             let scope = operation_scope(base, current, Some(operation), None);
             out.push(
@@ -393,7 +484,7 @@ fn compare_operations(base: &GraphIndex<'_>, current: &GraphIndex<'_>, out: &mut
         }
     }
     for (route, operation) in &current_operations {
-        if !base_operations.contains_key(route) {
+        if !base_operations.contains_key(route) && !moved_ids.contains(operation.id.as_str()) {
             let scope = operation_scope(base, current, None, Some(operation));
             out.push(
                 &scope,
@@ -404,6 +495,42 @@ fn compare_operations(base: &GraphIndex<'_>, current: &GraphIndex<'_>, out: &mut
             );
         }
     }
+}
+
+fn compare_moved_operation(
+    base_index: &GraphIndex<'_>,
+    current_index: &GraphIndex<'_>,
+    base: &Operation,
+    current: &Operation,
+    out: &mut Collector,
+) {
+    let scope = operation_scope(base_index, current_index, Some(base), Some(current));
+    if base.path != current.path {
+        out.push(
+            &scope,
+            ChangeKind::Breaking,
+            "operation.path.changed",
+            None,
+            format!(
+                "operation path changed from `{}` to `{}`",
+                join_path(&base_index.graph.base_path, &base.path),
+                join_path(&current_index.graph.base_path, &current.path)
+            ),
+        );
+    }
+    if base.method != current.method {
+        out.push(
+            &scope,
+            ChangeKind::Breaking,
+            "operation.method.changed",
+            None,
+            format!(
+                "operation method changed from `{}` to `{}`",
+                base.method, current.method
+            ),
+        );
+    }
+    compare_operation(base_index, current_index, base, current, out);
 }
 
 fn compare_operation(
@@ -517,7 +644,7 @@ fn compare_parameters(base: &Operation, current: &Operation, scope: &Scope, out:
         let subject = format!("{} {}", parameter.location, parameter.name);
         match current_params.get(key) {
             None => out.push(
-                scope,
+                &scope.at(None),
                 ChangeKind::Breaking,
                 "request.parameter.removed",
                 Some(subject),
@@ -527,7 +654,13 @@ fn compare_parameters(base: &Operation, current: &Operation, scope: &Scope, out:
                 ),
             ),
             Some(current_parameter) => {
-                compare_existing_parameter(parameter, current_parameter, &subject, scope, out);
+                compare_existing_parameter(
+                    parameter,
+                    current_parameter,
+                    &subject,
+                    &scope.at(Some(current_parameter.provenance.clone())),
+                    out,
+                );
             }
         }
     }
@@ -544,7 +677,7 @@ fn compare_parameters(base: &Operation, current: &Operation, scope: &Scope, out:
                 "request.parameter.added"
             };
             out.push(
-                scope,
+                &scope.at(Some(parameter.provenance.clone())),
                 kind,
                 code,
                 Some(format!("{} {}", parameter.location, parameter.name)),
@@ -603,11 +736,16 @@ fn compare_existing_parameter(
             format!("parameter `{}` default changed", base.name),
         );
     }
+    let base_openapi = parameter_openapi_value(base);
+    let current_openapi = parameter_openapi_value(current);
+    let mut base_structural = base_openapi.clone();
+    let mut current_structural = current_openapi.clone();
+    strip_documentation(&mut base_structural);
+    strip_documentation(&mut current_structural);
     if base.style != current.style
         || base.explode != current.explode
         || base.allow_reserved != current.allow_reserved
-        || base.openapi_content != current.openapi_content
-        || base.openapi_fields != current.openapi_fields
+        || base_structural != current_structural
     {
         out.push(
             scope,
@@ -616,6 +754,39 @@ fn compare_existing_parameter(
             Some(subject.to_string()),
             format!("parameter `{}` serialization changed", base.name),
         );
+    } else if base_openapi != current_openapi {
+        out.push(
+            scope,
+            ChangeKind::DocOnly,
+            "request.parameter.documentation.changed",
+            Some(subject.to_string()),
+            format!("parameter `{}` documentation changed", base.name),
+        );
+    }
+}
+
+fn parameter_openapi_value(parameter: &Param) -> serde_json::Value {
+    let fields: serde_json::Map<String, serde_json::Value> =
+        parameter.openapi_fields.iter().cloned().collect();
+    serde_json::json!({ "content": parameter.openapi_content, "fields": fields })
+}
+
+fn strip_documentation(value: &mut serde_json::Value) {
+    match value {
+        serde_json::Value::Object(fields) => {
+            for key in ["deprecated", "description", "example", "examples", "title"] {
+                fields.remove(key);
+            }
+            for child in fields.values_mut() {
+                strip_documentation(child);
+            }
+        }
+        serde_json::Value::Array(values) => {
+            for child in values {
+                strip_documentation(child);
+            }
+        }
+        _ => {}
     }
 }
 
@@ -629,7 +800,7 @@ fn compare_request_body(
 ) {
     match (&base.request_body, &current.request_body) {
         (Some(_), None) => out.push(
-            scope,
+            &scope.at(None),
             ChangeKind::Breaking,
             "request.body.removed",
             None,
@@ -717,7 +888,7 @@ fn compare_responses(base: &Operation, current: &Operation, scope: &Scope, out: 
         let subject = status.to_string();
         match current_responses.get(status) {
             None => out.push(
-                scope,
+                &scope.at(None),
                 ChangeKind::Breaking,
                 "response.status.removed",
                 Some(subject),
@@ -726,7 +897,7 @@ fn compare_responses(base: &Operation, current: &Operation, scope: &Scope, out: 
             Some(current_response) => {
                 match (&response.body, &current_response.body) {
                     (Some(_), None) => out.push(
-                        scope,
+                        &scope.at(None),
                         ChangeKind::Breaking,
                         "response.body.removed",
                         Some(subject.clone()),
@@ -734,7 +905,7 @@ fn compare_responses(base: &Operation, current: &Operation, scope: &Scope, out: 
                     ),
                     (None, Some(_)) => out.push(
                         scope,
-                        ChangeKind::Additive,
+                        ChangeKind::Breaking,
                         "response.body.added",
                         Some(subject.clone()),
                         format!("response body for status {status} added"),
@@ -796,33 +967,95 @@ fn compare_operation_security(
     scope: &Scope,
     out: &mut Collector,
 ) {
-    let base_security =
-        crate::sdk::emit_common::operation_security_alternatives(base_index.graph, base);
-    let current_security =
-        crate::sdk::emit_common::operation_security_alternatives(current_index.graph, current);
+    let base_security = normalized_security_groups(
+        crate::sdk::emit_common::operation_security_alternatives(base_index.graph, base),
+    );
+    let current_security = normalized_security_groups(
+        crate::sdk::emit_common::operation_security_alternatives(current_index.graph, current),
+    );
     if base_security == current_security {
         return;
     }
-    let (kind, code, message) = if base_security.is_empty() {
+    let kind = security_change_kind(&base_security, &current_security);
+    let (code, message) = if security_is_public(&base_security) {
         (
-            ChangeKind::Breaking,
             "security.operation.added",
             "operation now requires security",
         )
-    } else if current_security.is_empty() {
+    } else if security_is_public(&current_security) {
         (
-            ChangeKind::Additive,
             "security.operation.removed",
             "operation no longer requires security",
         )
     } else {
         (
-            ChangeKind::Breaking,
             "security.operation.changed",
             "operation security requirements changed",
         )
     };
     out.push(scope, kind, code, None, message.to_string());
+}
+
+fn document_security_alternatives(graph: &ApiGraph) -> Vec<Vec<String>> {
+    let groups = if graph.security_requirements.is_empty() {
+        let schemes: Vec<String> = graph
+            .security
+            .iter()
+            .filter(|scheme| scheme.global)
+            .map(|scheme| scheme.id.clone())
+            .collect();
+        if schemes.is_empty() {
+            Vec::new()
+        } else {
+            vec![schemes]
+        }
+    } else {
+        graph
+            .security_requirements
+            .iter()
+            .map(|group| group.schemes.clone())
+            .collect()
+    };
+    normalized_security_groups(groups)
+}
+
+fn normalized_security_groups(mut groups: Vec<Vec<String>>) -> Vec<Vec<String>> {
+    for group in &mut groups {
+        group.sort();
+        group.dedup();
+    }
+    groups.sort();
+    groups.dedup();
+    if groups.is_empty() || groups.iter().any(Vec::is_empty) {
+        vec![Vec::new()]
+    } else {
+        groups
+    }
+}
+
+fn security_change_kind(base: &[Vec<String>], current: &[Vec<String>]) -> ChangeKind {
+    if security_is_public(base) {
+        return ChangeKind::Breaking;
+    }
+    if security_is_public(current) {
+        return ChangeKind::Additive;
+    }
+    let current_is_at_least_as_permissive = base.iter().all(|base_group| {
+        current.iter().any(|current_group| {
+            current_group
+                .iter()
+                .all(|scheme| base_group.binary_search(scheme).is_ok())
+        })
+    });
+    if current_is_at_least_as_permissive {
+        ChangeKind::Additive
+    } else {
+        ChangeKind::Breaking
+    }
+}
+
+fn security_is_public(groups: &[Vec<String>]) -> bool {
+    groups.iter().any(Vec::is_empty)
 }
 
 fn compare_schemas(base: &GraphIndex<'_>, current: &GraphIndex<'_>, out: &mut Collector) {
@@ -875,6 +1108,17 @@ fn compare_schemas(base: &GraphIndex<'_>, current: &GraphIndex<'_>, out: &mut Co
                     &scope,
                     out,
                 );
+                if schema.enum_source_order != current_schema.enum_source_order
+                    || enum_order_changed(&schema.body, &current_schema.body)
+                {
+                    out.push(
+                        &scope,
+                        ChangeKind::DocOnly,
+                        "schema.enum.order.changed",
+                        Some((*id).to_string()),
+                        format!("schema `{}` enum declaration order changed", schema.name),
+                    );
+                }
             }
         }
     }
@@ -889,6 +1133,16 @@ fn compare_schemas(base: &GraphIndex<'_>, current: &GraphIndex<'_>, out: &mut Co
                 format!("schema `{}` added", schema.name),
             );
         }
+    }
+}
+
+fn enum_order_changed(base: &Type, current: &Type) -> bool {
+    match (base, current) {
+        (Type::Enum(base), Type::Enum(current)) => {
+            base != current
+                && base.iter().collect::<BTreeSet<_>>() == current.iter().collect::<BTreeSet<_>>()
+        }
+        _ => false,
     }
 }
 
@@ -912,6 +1166,10 @@ impl TypeDirections {
 
     fn response(self) -> bool {
         self.base.response || self.current.response
+    }
+
+    fn unconsumed(self) -> bool {
+        !self.base.request && !self.current.request && !self.base.response && !self.current.response
     }
 
     fn prefix(self, prefer_request: bool) -> &'static str {
@@ -1011,7 +1269,7 @@ fn compare_fields(
             None => {
                 let prefix = directions.prefix(true);
                 out.push(
-                    scope,
+                    &scope.at(None),
                     ChangeKind::Breaking,
                     property_code(prefix, "removed"),
                     Some(subject),
@@ -1088,11 +1346,12 @@ fn compare_field_axes(
     let current_required = required_on(current, directions.current);
     if base_required != current_required {
         let added = current_required;
-        let breaking = if added {
-            directions.request_or_unconsumed()
-        } else {
-            directions.response()
-        };
+        let breaking = directions.unconsumed()
+            || if added {
+                directions.request_or_unconsumed()
+            } else {
+                directions.response()
+            };
         let prefix = directions.prefix(added);
         out.push(
             scope,
@@ -1129,11 +1388,12 @@ fn compare_field_axes(
     let current_nullable = nullable_on(current, directions.current);
     if base_nullable != current_nullable {
         let added = current_nullable;
-        let breaking = if added {
-            directions.response()
-        } else {
-            directions.request_or_unconsumed()
-        };
+        let breaking = directions.unconsumed()
+            || if added {
+                directions.response()
+            } else {
+                directions.request_or_unconsumed()
+            };
         let prefix = directions.prefix(!added);
         out.push(
             scope,
@@ -1177,7 +1437,7 @@ fn compare_enum(
         let breaking = directions.request_or_unconsumed();
         let prefix = directions.prefix(true);
         out.push(
-            scope,
+            &scope.at(None),
             if breaking {
                 ChangeKind::Breaking
             } else {
@@ -1189,11 +1449,7 @@ fn compare_enum(
         );
     }
     for value in current.difference(&base) {
-        let unconsumed = !directions.base.request
-            && !directions.current.request
-            && !directions.base.response
-            && !directions.current.response;
-        let breaking = directions.response() || unconsumed;
+        let breaking = directions.response() || directions.unconsumed();
         let prefix = directions.prefix(false);
         out.push(
             scope,
@@ -1271,7 +1527,7 @@ fn compare_string_sets(
 ) {
     for value in base.difference(current) {
         out.push(
-            scope,
+            &scope.at(None),
             removed_kind,
             removed_code,
             Some(value.clone()),
@@ -1354,8 +1610,8 @@ fn operation_scope(
     base: Option<&Operation>,
     current: Option<&Operation>,
 ) -> Scope {
-    let base_tags = base.map(|operation| base_index.operation_tags(operation));
-    let current_tags = current.map(|operation| current_index.operation_tags(operation));
+    let base_tags = base.map(|operation| base_index.operation_tags(operation).to_vec());
+    let current_tags = current.map(|operation| current_index.operation_tags(operation).to_vec());
     let base_exempt = base.map(|operation| base_index.operation_exempt(operation));
     let current_exempt = current.map(|operation| current_index.operation_exempt(operation));
     Scope {
@@ -2017,19 +2273,164 @@ mod tests {
     }
 
     #[test]
-    fn method_or_path_change_is_a_deterministic_remove_and_add() {
+    fn method_or_path_change_has_explicit_taxonomy() {
         let base = graph_with_tags(&[]);
         let mut current = graph_with_tags(&[]);
         current.operations[0].method = "POST".to_string();
         current.operations[0].path = "/volumes".to_string();
         let report = diff_graphs(&base, &current, &BTreeSet::new());
         assert_eq!(
-            change(&report, "operation.removed").kind,
+            change(&report, "operation.method.changed").kind,
             ChangeKind::Breaking
         );
         assert_eq!(
-            change(&report, "operation.added").kind,
+            change(&report, "operation.path.changed").kind,
+            ChangeKind::Breaking
+        );
+        assert_eq!(report.changes.len(), 2);
+    }
+
+    #[test]
+    fn response_status_is_additive_but_body_shape_addition_is_breaking() {
+        let mut base = graph_with_tags(&[]);
+        let mut current = base.clone();
+        current.operations[0].responses.push(Response {
+            status: 200,
+            body: Some(SchemaRef {
+                ref_id: "Book".to_string(),
+            }),
+            body_kind: "json".to_string(),
+            content_type: Some("application/json".to_string()),
+            content_types: Vec::new(),
+        });
+        assert_eq!(
+            change(
+                &diff_graphs(&base, &current, &BTreeSet::new()),
+                "response.status.added"
+            )
+            .kind,
             ChangeKind::Additive
         );
+
+        base.operations[0].responses = vec![Response {
+            status: 204,
+            body: None,
+            body_kind: "empty".to_string(),
+            content_type: None,
+            content_types: Vec::new(),
+        }];
+        current = base.clone();
+        current.operations[0].responses[0].body = Some(SchemaRef {
+            ref_id: "Book".to_string(),
+        });
+        assert_eq!(
+            change(
+                &diff_graphs(&base, &current, &BTreeSet::new()),
+                "response.body.added"
+            )
+            .kind,
+            ChangeKind::Breaking
+        );
+    }
+
+    #[test]
+    fn unconsumed_schema_axis_changes_are_breaking_for_generated_models() {
+        let mut optional = field("value");
+        optional.deserializer_accepts_absent = true;
+        let required = field("value");
+        let base = ApiGraph {
+            schemas: vec![schema("Standalone", vec![required.clone()])],
+            ..ApiGraph::default()
+        };
+        let current = ApiGraph {
+            schemas: vec![schema("Standalone", vec![optional])],
+            ..ApiGraph::default()
+        };
+        assert_eq!(
+            change(
+                &diff_graphs(&base, &current, &BTreeSet::new()),
+                "schema.property.required.removed"
+            )
+            .kind,
+            ChangeKind::Breaking
+        );
+
+        let mut nullable = required.clone();
+        nullable.deserializer_accepts_null = true;
+        let current = ApiGraph {
+            schemas: vec![schema("Standalone", vec![nullable])],
+            ..ApiGraph::default()
+        };
+        assert_eq!(
+            change(
+                &diff_graphs(&base, &current, &BTreeSet::new()),
+                "schema.property.nullability.added"
+            )
+            .kind,
+            ChangeKind::Breaking
+        );
+    }
+
+    #[test]
+    fn operation_security_distinguishes_looser_and_stricter_alternatives() {
+        let mut base = graph_with_tags(&[]);
+        base.operations[0].security_overrides_global = true;
+        base.operations[0].security = vec!["Bearer".to_string(), "Key".to_string()];
+        let mut looser = base.clone();
+        looser.operations[0].security = vec!["Bearer".to_string()];
+        assert_eq!(
+            change(
+                &diff_graphs(&base, &looser, &BTreeSet::new()),
+                "security.operation.changed"
+            )
+            .kind,
+            ChangeKind::Additive
+        );
+        assert_eq!(
+            change(
+                &diff_graphs(&looser, &base, &BTreeSet::new()),
+                "security.operation.changed"
+            )
+            .kind,
+            ChangeKind::Breaking
+        );
+    }
+
+    #[test]
+    fn parameter_documentation_is_doc_only_and_uses_parameter_location() {
+        let mut base = graph_with_tags(&[]);
+        base.operations[0].params.push(parameter(false));
+        let mut current = base.clone();
+        current.operations[0].params[0].provenance = span("query.rs");
+        current.operations[0].params[0]
+            .openapi_fields
+            .push(("description".to_string(), serde_json::json!("Page size")));
+        let report = diff_graphs(&base, &current, &BTreeSet::new());
+        let finding = change(&report, "request.parameter.documentation.changed");
+        assert_eq!(finding.kind, ChangeKind::DocOnly);
+        assert_eq!(finding.file.as_deref(), Some("query.rs"));
+
+        let removed = diff_graphs(&base, &graph_with_tags(&[]), &BTreeSet::new());
+        assert!(change(&removed, "request.parameter.removed").span.is_none());
+    }
+
+    #[test]
+    fn enum_declaration_order_is_reported_without_value_churn() {
+        let base = ApiGraph {
+            schemas: vec![Schema {
+                id: "State".to_string(),
+                name: "State".to_string(),
+                body: Type::Enum(vec!["active".to_string(), "paused".to_string()]),
+                enum_source_order: Vec::new(),
+                provenance: span("models.rs"),
+            }],
+            ..ApiGraph::default()
+        };
+        let mut current = base.clone();
+        current.schemas[0].body = Type::Enum(vec!["paused".to_string(), "active".to_string()]);
+        let report = diff_graphs(&base, &current, &BTreeSet::new());
+        assert_eq!(report.changes.len(), 1);
+        assert_eq!(report.changes[0].code, "schema.enum.order.changed");
+        assert_eq!(report.changes[0].kind, ChangeKind::DocOnly);
     }
 }

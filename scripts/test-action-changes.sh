@@ -23,7 +23,7 @@ cat <<'JSON'
     "tags": {"base": ["books"], "current": null},
     "exempt": {"base": false, "current": null},
     "gating": true,
-    "message": "operation removed"
+    "message": "operation removed\n## injected heading"
   }]
 }
 JSON
@@ -51,7 +51,11 @@ FAKE_LOG="$log" \
 
 grep -Fx 'gating=true' "$output" >/dev/null
 grep -F 'artifact-name=gnr8-api-changes-test-' "$output" >/dev/null
-grep -F 'BREAKING  DELETE /books/{id}  operation removed' "$summary" >/dev/null
+grep -F 'BREAKING  DELETE /books/{id}  operation removed ## injected heading' "$summary" >/dev/null
+if grep -E '^## injected heading$|^```' "$summary" >/dev/null; then
+  echo "report content escaped its indented code block" >&2
+  exit 1
+fi
 grep -F -- '--exempt-tag internal --exempt-tag internal' "$log" >/dev/null
 report_root="$(sed -n 's/^report-root=//p' "$output")"
 test -s "$report_root/001/report.json"
