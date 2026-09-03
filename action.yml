@@ -22,6 +22,18 @@ inputs:
     description: Extra arguments passed to `gnr8 check`.
     required: false
     default: ""
+  report-api-changes:
+    description: Run gnr8 changes, publish reports, and gate on checked breaking changes.
+    required: false
+    default: "false"
+  base-ref:
+    description: Git revision containing the committed base graph artifact.
+    required: false
+    default: "origin/main"
+  exempt-tags:
+    description: Newline-separated exact operation tags exempted from the API change gate.
+    required: false
+    default: ""
   cache:
     description: Restore and save .gnr8/cache plus .gnr8/target for fast repeated checks.
     required: false
@@ -84,6 +96,8 @@ runs:
         INPUT_BINARY: ${{ inputs.gnr8-binary }}
         INSTALL_METHOD: ${{ inputs.install-method }}
         REQUESTED_VERSION: ${{ inputs.version }}
+        REPORT_API_CHANGES: ${{ inputs.report-api-changes }}
+        BASE_REF: ${{ inputs.base-ref }}
         SETUP_GO: ${{ inputs.setup-go }}
         SETUP_NODE: ${{ inputs.setup-node }}
         SETUP_PYTHON: ${{ inputs.setup-python }}
@@ -101,10 +115,16 @@ runs:
         }
 
         validate_boolean cache "$CACHE_ENABLED"
+        validate_boolean report-api-changes "$REPORT_API_CHANGES"
         validate_boolean setup-go "$SETUP_GO"
         validate_boolean setup-node "$SETUP_NODE"
         validate_boolean setup-python "$SETUP_PYTHON"
         validate_boolean setup-rust "$SETUP_RUST"
+
+        if [[ "$REPORT_API_CHANGES" == "true" && -z "$BASE_REF" ]]; then
+          echo "gnr8 action: base-ref must not be empty when report-api-changes is true" >&2
+          exit 2
+        fi
 
         if [[ -z "$INPUT_BINARY" ]]; then
           case "$INSTALL_METHOD" in
@@ -278,6 +298,52 @@ runs:
         fi
         echo "path=$bin" >> "$GITHUB_OUTPUT"
         "$bin" --version
+
+    - name: Report API changes
+      id: api-changes
+      if: ${{ inputs.report-api-changes == 'true' }}
+      shell: bash
+      env:
+        BASE_REF: ${{ inputs.base-ref }}
+        EXEMPT_TAGS: ${{ inputs.exempt-tags }}
+        GNR8_BIN: ${{ steps.binary.outputs.path }}
+        INPUT_BINARY: ${{ inputs.gnr8-binary }}
+        INSTALL_METHOD: ${{ inputs.install-method }}
+        WORKING_DIRECTORIES: ${{ inputs.working-directories }}
+      run: |
+        set -euo pipefail
+        if [[ -z "$INPUT_BINARY" && "$INSTALL_METHOD" == "source" ]]; then
+          export GNR8_RESOURCE_DIR="$GITHUB_ACTION_PATH"
+        fi
+        "$GITHUB_ACTION_PATH/scripts/run-action-changes.sh"
+
+    - name: Upload API change reports
+      if: ${{ always() && inputs.report-api-changes == 'true' && steps.api-changes.outputs.report-root != '' }}
+      uses: actions/upload-artifact@v6
+      with:
+        name: ${{ steps.api-changes.outputs.artifact-name }}
+        path: ${{ steps.api-changes.outputs.report-root }}
+        if-no-files-found: error
+
+    - name: Comment API changes on pull request
+      if: ${{ always() && inputs.report-api-changes == 'true' && github.event_name == 'pull_request' && steps.api-changes.outputs.combined-report != '' }}
+      shell: bash
+      env:
+        GH_TOKEN: ${{ github.token }}
+        PR_NUMBER: ${{ github.event.pull_request.number }}
+        REPORT_PATH: ${{ steps.api-changes.outputs.combined-report }}
+      run: |
+        set -euo pipefail
+        if ! gh pr comment "$PR_NUMBER" --body-file "$REPORT_PATH" --edit-last --create-if-none; then
+          echo "::warning::gnr8 action could not comment on the pull request; the step summary and artifacts contain the report"
+        fi
+
+    - name: Enforce API change gate
+      if: ${{ inputs.report-api-changes == 'true' && steps.api-changes.outputs.gating == 'true' }}
+      shell: bash
+      run: |
+        echo "gnr8 action: checked breaking API changes were found" >&2
+        exit 1
 
     - name: Run gnr8 check
       shell: bash
