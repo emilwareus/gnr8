@@ -23,7 +23,6 @@ gnr8 init --source go-gin --sdk go
 gnr8 generate
 gnr8 doctor
 gnr8 check
-gnr8 changes --base origin/main
 ```
 
 Use explicit presets:
