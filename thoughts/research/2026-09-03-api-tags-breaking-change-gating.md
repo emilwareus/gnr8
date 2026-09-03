@@ -286,3 +286,143 @@ non-exempt operation reaches a schema, a breaking change to that schema is in ga
 must be computed separately on the base and current graphs so a retagged consumer cannot rewrite its
 past scope.
 
+---
+
+## 3. Prior art
+
+### 3.1 OpenAPI standardizes the carrier, not the gate
+
+OpenAPI 3.1.2 defines an Operation Object's `tags` as an optional list used for API documentation
+control and says the values may group operations by resources or any other qualifier
+([Operation Object](https://spec.openapis.org/oas/v3.1.2.html#operation-object)). That breadth is why
+`internal`, `beta`, `partner`, and domain labels such as `books` are all valid standard tags. The
+specification does **not** assign any of those strings audience, stability, visibility, inclusion,
+exemption, or breaking-change semantics.
+
+At the document root, `tags` is an optional ordered list of Tag Objects. Declared names must be
+unique; their order may guide tooling; and an operation tag need not be declared there, in which case
+tools may organize it arbitrarily
+([OpenAPI Object](https://spec.openapis.org/oas/v3.1.2.html#openapi-object)). A Tag Object requires a
+`name` and may add `description` and `externalDocs`; defining one for every operation tag remains
+optional ([Tag Object](https://spec.openapis.org/oas/v3.1.2.html#tag-object)). Connections between
+operation tag strings and Tag Objects are by name
+([resolving implicit connections](https://spec.openapis.org/oas/v3.1.2.html#resolving-implicit-connections)).
+
+The precise conclusion is:
+
+> Tags are the standard, interoperable **classification carrier**. “This configured tag exempts a
+> breaking change from gnr8's exit gate” is gnr8 policy layered on that carrier, not a promise made by
+> OpenAPI.
+
+That distinction satisfies the owner decision without claiming that every OpenAPI consumer will
+interpret the tag the same way.
+
+### 3.2 Diff engines surveyed do not filter their gate by standard tags
+
+#### oasdiff
+
+oasdiff's documented endpoint filters are path regular expressions (`--match-path`,
+`--unmatch-path`) and a vendor-extension-name regular expression (`--filter-extension`); its filter
+page exposes no standard `tags` selector
+([oasdiff endpoint filtering](https://github.com/oasdiff/oasdiff/blob/main/docs/FILTERING-ENDPOINTS.md)).
+That page also warns that a filter matching an endpoint on only one input makes the result appear as
+an addition or deletion. This is evidence against pre-filtering either side of gnr8's diff.
+
+oasdiff separately supports lifecycle thresholds through `x-stability-level`. Missing values are
+treated as stable, and `--stability-level` chooses the minimum level to check
+([oasdiff stability levels](https://github.com/oasdiff/oasdiff/blob/main/docs/STABILITY.md)). Its
+transition check evaluates a stability decrease against the level being left, so changing the
+revision to a lower level does not erase that transition; the implementation distinguishes that
+transition from ordinary modification/deletion checks
+([checker source at `c2c2013`](https://github.com/oasdiff/oasdiff/blob/c2c20134a353b920b7137021770f6b3a5d0c5531/checker/check_api_stability_level.go#L75-L193)).
+This is useful evidence for base-sensitive policy evaluation, but it is not standard-tag filtering
+and gnr8 must not read that extension.
+
+oasdiff compares tag changes themselves as `api-tag-added` and `api-tag-removed`, both informational,
+not as endpoint-scope selectors
+([oasdiff rule catalog](https://www.oasdiff.com/docs/breaking-changes)). That supports treating an
+ordinary tag-list edit as documentation metadata while separately detecting whether the edit narrows
+gnr8's protected set.
+
+#### Buf
+
+Buf is not an OpenAPI tool and its word “annotation” names an internal checker finding, not a source
+comment directive. Its public breaking configuration scopes ignores by files/directories, rule ids,
+and unstable package suffixes
+([Buf v2 configuration](https://buf.build/docs/configuration/v2/buf-yaml/#breaking)); its CLI compares
+a current input against `--against`
+([`buf breaking`](https://buf.build/docs/reference/cli/buf/breaking/)).
+
+The relevant implementation pattern is that `ignoreAnnotation` inspects both the finding's current
+`FileLocation` and its `AgainstFileLocation`
+([Buf source at `92aa508`](https://github.com/bufbuild/buf/blob/92aa50832784bad3c0e2920670d79dc1ab2d4e86/private/bufpkg/bufcheck/client.go#L750-L811)).
+Buf's ignore predicate suppresses when either applicable location matches; gnr8's safe tag predicate
+has the inverse polarity—gate when either extant side is **not** exempt. The reusable lesson is the
+same: policy must inspect both sides, including base-only subjects, rather than classify a diagnostic
+from the revision alone. Buf's regression suite includes a base-only ignore case
+([breaking test](https://github.com/bufbuild/buf/blob/92aa50832784bad3c0e2920670d79dc1ab2d4e86/private/bufpkg/bufcheck/breaking_test.go#L877-L884)).
+
+#### OpenAPITools/openapi-diff
+
+OpenAPITools/openapi-diff's official CLI documents source/target inputs, output formats, state,
+failure modes, config, auth, and logging, but no path or standard-tag operation filter
+([official README and CLI reference](https://github.com/OpenAPITools/openapi-diff)). The current CLI
+declaration confirms that option set
+([source at `63850d8`](https://github.com/OpenAPITools/openapi-diff/blob/63850d8074452f5761ce7e7e460307f0f127647a/cli/src/main/java/org/openapitools/openapidiff/cli/Main.java#L35-L146)).
+Its configuration can alter comparison behavior; it does not document an Operation Object tag gate.
+
+**Survey result:** neither oasdiff nor OpenAPITools/openapi-diff currently offers the feature proposed
+here. This is a bounded result about the named tools and cited surfaces, not a claim that no OpenAPI
+diff implementation anywhere can be customized around tags.
+
+### 3.3 Documentation and SDK tools already give standard tags visible consequences
+
+The absence in diff engines does not mean tags are inert:
+
+- Redocly orders and groups API-reference operations by standard tags, putting root-declared tags in
+  declaration order and undeclared ones afterward
+  ([Redocly tags reference](https://redocly.com/learn/openapi/openapi-visual-reference/tags)). Its
+  `filter-out` decorator can remove Operation Objects whose `tags` property matches configured values,
+  with `any`/`all` matching
+  ([Redocly `filter-out`](https://redocly.com/docs/cli/decorators/filter-out)); `filter-in` provides the
+  inverse property selection
+  ([Redocly `filter-in`](https://redocly.com/docs/cli/decorators/filter-in)). `x-tagGroups` adds a
+  vendor-specific navigation layer, which is prior art gnr8 should not read or emit
+  ([Redocly `x-tagGroups`](https://redocly.com/docs/realm/content/api-docs/openapi-extensions/x-tag-groups)).
+- Speakeasy creates one SDK namespace per standard tag by default, puts an operation with several
+  tags into several namespaces, and leaves an untagged operation on the root client
+  ([Speakeasy namespaces](https://www.speakeasy.com/docs/sdks/customize/structure/namespaces)). Its
+  documented OpenAPI transformation filter selects by operation id or path/method rather than by
+  standard tag
+  ([Speakeasy transformations](https://www.speakeasy.com/docs/sdks/prep-openapi/transformations)).
+- Fern derives SDK group names from standard operation tags unless tag grouping is disabled
+  ([Fern method names and groups](https://buildwithfern.com/learn/api-definitions/openapi/extensions/method-names)).
+  Fern's element exclusion and audience selection use its own extensions instead
+  ([Fern ignoring elements](https://buildwithfern.com/learn/api-definitions/openapi/extensions/ignoring-elements),
+  [Fern audiences](https://buildwithfern.com/learn/api-definitions/openapi/extensions/audiences)); those
+  spellings are evidence about Fern only and are forbidden inputs for gnr8.
+- OpenAPI Generator uses tags to organize generated API classes/files, and its OpenAPI Normalizer's
+  `FILTER` can select operations by a `tag:<name>` expression before generation
+  ([OpenAPI Generator customization and normalizer](https://openapi-generator.tech/docs/customization/#openapi-normalizer)).
+  That is generator selection, not a two-revision breaking-change policy.
+- Zalando's Zally rules require operations to have root-defined, used, described tags so generated
+  documentation groups reliably; they assign no lifecycle or breaking-gate meaning to those tags
+  ([Zally rule M011](https://github.com/zalando/zally/blob/main/server/rules.md#zallyruleset)).
+
+This prior art establishes both sides of the trade: standard tags are broadly portable, but they can
+change navigation, namespaces, duplicated method placement, or generated file layout. gnr8 must keep
+its own native SDK grouping distinction (§1.6), report tag changes, and avoid claiming uniform
+downstream behavior.
+
+### 3.4 What prior art actually decides
+
+Three conclusions are strong enough to carry into the design:
+
+1. Use the standard Operation Object `tags` array; do not invent an audience enum or emit/read a
+   vendor extension ([OpenAPI Operation Object](https://spec.openapis.org/oas/v3.1.2.html#operation-object)).
+2. Do not pre-filter either input; compare first, then apply policy to both graph-side subjects
+   ([oasdiff endpoint filtering](https://github.com/oasdiff/oasdiff/blob/main/docs/FILTERING-ENDPOINTS.md)).
+3. Treat two-sided exemption semantics as a gnr8 contract. Existing tools supply analogies, not an
+   off-the-shelf rule.
+
+---
