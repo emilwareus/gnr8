@@ -1166,3 +1166,137 @@ is a smaller *document*; the SDKs are generated from the graph, not from the doc
 (`GoSdk`/`PySdk`/`TsSdk` are `Target`s over the frozen `ApiGraph`), so filtering the OpenAPI target
 does not touch them. If a user feeds the reduced document back in as an `OpenApi` source for a second
 pipeline, they get the reduced surface — explicitly, because they wired it.
+
+### 6.11 Schemas and global facts: derived, never stored
+
+Issue #75 lists schemas, required fields, nullability, enums, and security as change categories. None
+of those belongs to one operation, so each needs an audience derived rather than declared. Storing a
+second audience table for schemas would be two sources for one fact.
+
+**A schema's audience is the most public audience among the operations that transitively reach it.**
+`Public` wins over `Internal`: a schema reachable from even one customer-facing operation is part of
+the customer contract, whatever else also uses it. Removing a field from it breaks public consumers
+regardless of the debug endpoint that happens to share it.
+
+This is not new machinery. `graph::direction::schema_directions`
+(`crates/gnr8-core/src/graph/direction.rs:83-128`) already performs exactly this walk for a different
+question: it collects request roots and response roots from every operation's body, params, preserved
+`OpenAPI` fragments, and `graph.schema_uses`, then calls `reachable_schemas` over each root set and
+returns a `BTreeMap`. Audience is the same walk with the roots partitioned by audience instead of by
+direction. Three consequences follow directly:
+
+- **Split ids inherit.** `graph::projection` mints `::input` / `::output` variants
+  (`projection.rs:21-24`); each inherits the audience of the schema it was split from, because the walk
+  runs on the projected graph (§1.2).
+- **`schema_uses` roots are `Public`.** A non-HTTP root (`graph.rs:151`) has no operation and therefore
+  no audience of its own; the safe default applies, consistent with §6.5.
+- **Graph-level facts are `Public` if any public operation exists.** `base_path`, `title`, `security`,
+  and `security_requirements` (`graph.rs:69-82`) are document-wide. `operation_security`
+  (`graph.rs:85`) is per-operation and takes that operation's audience.
+
+The derivation is a pure function of `(graph, operation_audience)` and uses `BTreeMap`/`BTreeSet`
+throughout, exactly as `direction.rs` does, so it is deterministic.
+
+---
+
+## 7. Alternatives considered and rejected
+
+1. **A marker in the handler's doc comment** — `// internal`, a magic first word, an `x-internal:`
+   line. Rejected outright by CLAUDE.md 0.1 ("no directive syntax, no marker prefix, and no key/value
+   grammar inside the comment — not `@Summary`, not `gnr8:summary`, not anything") and by 0.5, which
+   says such a change "must be rejected in review". It would also break rule 3: `summary`/
+   `description` already have exactly one source per operation, and content-branching inside the same
+   comment would make the comment mean two things.
+2. **A gnr8-invented struct tag or decorator** (`gnr8:"internal"`). Same rule. CLAUDE.md's own
+   "Known inconsistency" note about the existing `description:` / `example:` tag grammar states
+   explicitly that it "is not a licence to add more".
+3. **A magic route-group or tag name** — treat `group == "internal"` as the classification. This is
+   the most tempting rejected option, because route grouping *is* legitimate source structure. Two
+   problems. First, it makes gnr8 invent a convention users must comply with, which is rule 0 pointed
+   inward. Second, `Operation::group` drives SDK file layout (`layout.rs:73-77`, `:192`, §4), so a
+   team that wanted an "internal" *file* in their SDK would silently change their CI gating, and vice
+   versa. Route groups stay **evidence a rule may match on**, never the classification itself.
+4. **Built-in path-prefix inference** (`/internal`, `/_debug` are internal by default). Rejected: a
+   silent semantic whose wrong-guess failure mode is a shipped breaking change, and it needs a config
+   override to express exceptions, which is the "derive it, unless config overrides" dual-source
+   pattern rule 3 forbids by name.
+5. **A `bool` instead of an enum.** Rejected on the evidence in §5.1/§5.2: LoopBack rejected exactly
+   this in code review for `x-visibility`, Zalando needed five values, and Google's labels are open
+   strings. Two variants today, room for a third, no call-site churn when it arrives.
+6. **A field on `Operation` rather than a side-table.** Rejected: `Operation`'s doc comment reserves
+   it for facts "derived PURELY from source code" (`graph.rs:485-492`). Audience is a rule-4 config
+   fact and belongs where the other four config side-tables live.
+7. **Rules in `.gnr8/` only, recomputed against the base graph.** Rejected in §3 — recomputation
+   applies today's policy to yesterday's API, so relabelling an endpoint would retroactively claim it
+   was always internal, defeating §2.4 completely.
+8. **Most-specific-wins precedence.** Rejected in §6.4 — no natural total order across
+   `PathPrefix` / `Middleware` / `Methods` / `OperationId`, and any invented ranking needs an invented
+   tiebreak. Declaration order is the repo's existing answer for the identically-shaped
+   `GroupOperations`.
+9. **Emitting `x-internal`.** Rejected in §6.10 — compliance under rule 0, and OpenAPI Generator
+   silently drops such operations from downstream SDKs by default.
+10. **Filtering internal operations out of the OpenAPI document by default.** Rejected: adopting
+    classification would then change generated bytes, which `make examples-check` treats as a
+    regression to review and which users would reasonably fear. Filtering stays an explicit,
+    per-target opt-in.
+11. **Keeping `DropDebugRoutes`-style deletion as the answer.** Rejected in §1.7 — it removes the
+    operation from the SDK, which is precisely the capability Emil needs to keep.
+12. **A third audience value now** (`Partner`, `Beta`, …). Not rejected on principle — the enum exists
+    so it can arrive — but out of scope. Note that stability (`draft`/`alpha`/`beta`/`stable`, §5.4)
+    is a *different axis* from audience and should not be folded into this enum if it is ever wanted.
+
+---
+
+## 8. Open decisions
+
+1. **How `--base <ref>` materialises the base graph.** §3 lays out three shapes with different
+   meanings and costs, and the capability-digest constraint
+   (`crates/gnr8-core/src/worker/mod.rs:298-303`) rules out the obvious one whenever the base ref pins
+   a different `gnr8` version. The committed-graph-artifact shape is the only one that is both cheap
+   and correct, and it is the only one that fits the five-minute CI budget
+   (`scripts/check-ci-budget.py:13`) comfortably. It also needs the classification to live on the
+   graph, which §3 shows is required anyway. **Whichever shape is chosen must be the only shape** —
+   "read the committed artifact, otherwise re-run the pipeline" is a fallback chain.
+2. **Whether a graph artifact target should exist, and where it writes.** If (1) resolves to the
+   committed artifact, gnr8 needs a target that emits the projected graph as JSON. `ApiGraph` is
+   already `Serialize`/`Deserialize` with a byte-identical round-trip proven by
+   `crates/gnr8-core/tests/determinism.rs:91` (`a_graph_survives_the_worker_frame_without_losing_a_field`),
+   so the emitter is trivial; the questions are the file's path, whether it is on by default, and
+   whether committing it is a requirement or a recommendation. All three are `changes` decisions, not
+   classification decisions.
+3. **Whether `changes` needs an "undecidable" tier.** Four of the six tools surveyed have one —
+   oasdiff `WARN` ("changes where the definition genuinely does not contain enough information to
+   decide"), Atlassian `Unclassified`, OpenAPITools `UNKNOWN`. Issue #75's vocabulary has three
+   values and no such slot. gnr8 has less undecidability than a general OpenAPI differ because it
+   diffs its own typed graph, but not none: `Type::Any {}` (`facts.rs:349`) is explicitly lossy, and
+   `Response::body_kind` (`graph.rs:598`) can record a dynamic body. Adding a fourth kind is a
+   vocabulary change to issue #75 and should be decided there, not here.
+4. **A blanket allowance for a deliberate breaking release.** `--allow <id>` is right for one approved
+   break; a major-version release that breaks twenty things is a different scenario, and enumerating
+   twenty ids is busywork that will get scripted into a blanket anyway. No recommendation — the
+   options are a `--strict=false`-style global off switch (bad: invisible), tying the allowance to an
+   `info.version` major bump (interesting: Zalando and Microsoft both make versioning the sanctioned
+   escape, and `OpenApiMetadataPolicy::version` already exists at `graph.rs:163`), or nothing.
+5. **`RequireOperationDocs` gaining an audience filter.** Its doc comment already explains that it
+   must run after public-surface filtering because "gnr8 has no built-in operation-exclusion
+   transform" (`crates/gnr8-sdk/src/sdk/builtins.rs:377-381`). Once audience exists, "require prose on
+   customer contracts only" is the obvious next step. Deliberately not recommended here — one feature
+   at a time.
+6. **Whether an audience extension is ever emitted, and whether `OpenApi` source reads it back.**
+   §6.10 recommends emitting nothing now. If that changes, note the rule-3 shape carefully: gnr8 could
+   legitimately read its own emitted key for `OpenApi`-imported operations while using pipeline rules
+   for source-extracted ones — that is exactly the one-source-per-operation structure `Operation`'s
+   `summary` already uses (`graph.rs:508-514`). It is defensible, but it is a second code path for one
+   fact and should not be built speculatively. Also note oasdiff's `--attributes x-audience` copies an
+   extension's value into its JSON output without acting on it (§5.4), so even a consumer that wanted
+   this would get annotation, not behaviour.
+7. **Whether `Audience` should be `PartialOrd`/`Ord` by publicness.** §6.11's "most public wins" and
+   §6.7's "public in either graph" both read naturally as a max over an ordered enum, and deriving
+   `Ord` on `Public < Internal` (declaration order) would give the *wrong* direction. Either declare
+   `Public` last, or write the join explicitly. A small decision, but exactly the kind that silently
+   inverts a safety property.
+8. **Windows and non-git checkouts.** Everything in §3 and §6.8 assumes `git` on `PATH` and a
+   repository with history. gnr8 has no git dependency today (§1.1); `gnr8 changes` would add the
+   first. What `changes` does outside a git repository, in a shallow clone, or with a `<ref>` that
+   does not resolve should be a typed error naming the cause — never a silent empty diff, which would
+   report "no changes" and exit `0`.
