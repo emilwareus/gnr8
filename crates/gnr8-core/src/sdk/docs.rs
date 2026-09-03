@@ -227,9 +227,9 @@ fn append_reference_diagnostics(text: &mut String, ir: &ApiGraph) {
 /// Render the "Operation Documentation" section.
 ///
 /// Iteration is over OPERATIONS, not over `operation_docs`: prose lives on the operation
-/// (CLAUDE.md rule 3), so an operation documented purely by its handler's doc comment has
-/// no policy entry at all and would otherwise be skipped. The policy is joined in for the
-/// facts that genuinely are policy — tags, deprecation, and examples.
+/// (CLAUDE.md rule 3), and effective tags can come from the operation's group without a policy
+/// entry. The policy is joined in for the facts that genuinely are policy — deprecation and
+/// examples.
 fn append_reference_operation_docs(text: &mut String, ir: &ApiGraph) {
     let effective_tags = crate::graph::EffectiveOperationTags::new(ir);
     let documented: Vec<(&crate::graph::Operation, Option<&OperationDocsPolicy>)> = ir
@@ -242,7 +242,12 @@ fn append_reference_operation_docs(text: &mut String, ir: &ApiGraph) {
                 .find(|policy| policy.operation_id == op.id);
             (op, policy)
         })
-        .filter(|(op, policy)| op.summary.is_some() || op.description.is_some() || policy.is_some())
+        .filter(|(op, policy)| {
+            op.summary.is_some()
+                || op.description.is_some()
+                || policy.is_some()
+                || !effective_tags.resolve(op).is_empty()
+        })
         .collect();
     if documented.is_empty() {
         return;
@@ -266,13 +271,8 @@ fn append_operation_docs_body(
     if policy.is_some_and(|policy| policy.deprecated) {
         text.push_str("- Deprecated: yes\n");
     }
-    // The reference has historically rendered a Tags line only for explicit documentation
-    // policy. Resolve the value canonically once that line exists, while preserving that output
-    // boundary during this refactor.
-    let tags = policy
-        .filter(|policy| !policy.tags.is_empty())
-        .map(|_| effective_tags.resolve(op));
-    if let Some(tags) = tags {
+    let tags = effective_tags.resolve(op);
+    if !tags.is_empty() {
         let joined = tags
             .iter()
             .map(|tag| format!("`{tag}`"))
@@ -418,11 +418,14 @@ mod tests {
     }
 
     #[test]
-    fn reference_uses_canonical_tags_for_its_existing_policy_tag_line() {
+    fn reference_uses_canonical_tags_for_policy_group_and_empty_results() {
+        let mut grouped = operation("grouped", Some("Books"));
+        grouped.summary = None;
         let graph = ApiGraph {
             operations: vec![
-                operation("grouped", Some("Books")),
+                grouped,
                 operation("classified", Some("Reports")),
+                operation("untagged", None),
             ],
             operation_docs: vec![OperationDocsPolicy {
                 operation_id: "classified".to_string(),
@@ -437,12 +440,15 @@ mod tests {
         };
 
         let reference = sdk_reference("Go", "example.com/sdk", &graph);
-        assert!(!reference.contains("- Tags: `Books`"), "{reference}");
+        assert!(reference.contains("- Tags: `Books`"), "{reference}");
         assert!(
             reference.contains("- Tags: `internal`, `partner`"),
             "{reference}"
         );
         assert!(!reference.contains("- Tags: `Reports`"), "{reference}");
+        assert!(reference.contains("### `untagged`"), "{reference}");
+        let untagged = reference.split("### `untagged`").nth(1).unwrap_or_default();
+        assert!(!untagged.contains("- Tags:"), "{untagged}");
     }
 
     /// A diagnostic about the analyzed module is exactly what this section is for: it tells an
