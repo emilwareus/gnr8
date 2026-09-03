@@ -17,6 +17,10 @@ must move the minor version.
 - **`RenameOperation` now controls generated SDK method names in every built-in SDK target.** The
   transform already changed the canonical graph id and operation file names; Go, Python, and
   TypeScript emitters now use that same id instead of retaining the original handler symbol.
+- **Execution and configuration failures now exit with status 2.** Status 1 is reserved for a
+  command's domain gate: generated drift, actionable doctor findings, or checked breaking API
+  changes. This aligns the executable with the documented distinction between gate and command
+  failure.
 
 ### Added
 
