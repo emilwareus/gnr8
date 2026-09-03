@@ -187,7 +187,7 @@ merges. Those are the only two states available today, and neither is the wanted
   loudly because "baseline" is the word every other diff tool in §4 uses.
 - **`unsafe_code = "forbid"`, `unwrap_used`/`expect_used`/`panic` denied** in production
   (`Cargo.toml:27`, `:33-37`).
-- **`--json` is a global flag** (`crates/gnr8/src/cli.rs:23`), and the established CI-gate exit
+- **`--json` is a global flag** (`crates/gnr8/src/cli.rs:22`), and the established CI-gate exit
   convention is `std::process::exit(1)` after printing (`crates/gnr8/src/main.rs:584` for `check`,
   `:1487` for `doctor`), with the comment "Deliberate non-zero exit so `gnr8 check` is a usable CI
   gate".
@@ -912,7 +912,7 @@ SDK, not `API.md`. Three reasons, and they compound:
 **Command surface.** `gnr8 changes --base <ref>`, exactly as issue #75 spells it. Note that
 `--baseline` would fail `make invariants` (`scripts/check-invariants.sh:108` forbids
 `--(compat|legacy|migration|baseline)\b`); `--base` passes. The global `--json` and `-v` already exist
-(`crates/gnr8/src/cli.rs:23`, `:27`).
+(`crates/gnr8/src/cli.rs:22`, `:26`).
 
 **Exit codes stay binary**, because `docs/cli/commands.md:148-155` documents exactly two meanings —
 `0` "command completed and its gate passed", `1` "generated drift or an actionable doctor finding",
