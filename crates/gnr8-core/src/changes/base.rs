@@ -1,0 +1,307 @@
+//! Load the historical projected graph from its one authoritative source: a committed artifact.
+
+use std::ffi::OsStr;
+use std::path::Path;
+use std::process::{Command, Output};
+
+use crate::graph::ApiGraph;
+use crate::graph_artifact::{GraphArtifact, GRAPH_ARTIFACT_PATH, GRAPH_ARTIFACT_SCHEMA_VERSION};
+use crate::CoreError;
+
+/// A historical graph together with the exact commit Git resolved.
+#[derive(Debug, Clone, PartialEq)]
+pub struct BaseGraph {
+    /// User-provided base revision expression.
+    pub reference: String,
+    /// Full commit object id resolved before reading the artifact.
+    pub commit: String,
+    /// Projected graph committed by that revision.
+    pub graph: ApiGraph,
+}
+
+/// Load the projected graph committed at `reference`.
+///
+/// This function never checks out the revision and never runs its pipeline. The committed artifact
+/// is the sole historical source, which keeps base materialization deterministic and single-path.
+///
+/// # Errors
+///
+/// Returns a typed error when Git is unavailable, `project_root` is not a checkout, the ref cannot
+/// be resolved, the artifact is absent or corrupt, or its schema version is unsupported.
+pub fn load_base_graph(project_root: &Path, reference: &str) -> Result<BaseGraph, CoreError> {
+    load_base_graph_with(
+        project_root,
+        reference,
+        GRAPH_ARTIFACT_PATH,
+        OsStr::new("git"),
+    )
+}
+
+fn load_base_graph_with(
+    project_root: &Path,
+    reference: &str,
+    artifact_path: &str,
+    git: &OsStr,
+) -> Result<BaseGraph, CoreError> {
+    ensure_git_checkout(project_root, git)?;
+    let commit = resolve_commit(project_root, reference, git)?;
+    let object = format!("{commit}:{artifact_path}");
+    let output = run_git(
+        project_root,
+        git,
+        ["show", "--no-ext-diff", "--no-textconv", object.as_str()],
+    )?;
+    if !output.status.success() {
+        return Err(CoreError::BaseGraphMissing {
+            reference: reference.to_string(),
+            path: artifact_path.to_string(),
+        });
+    }
+    let graph = parse_base_artifact(reference, artifact_path, &output.stdout)?;
+    Ok(BaseGraph {
+        reference: reference.to_string(),
+        commit,
+        graph,
+    })
+}
+
+fn ensure_git_checkout(project_root: &Path, git: &OsStr) -> Result<(), CoreError> {
+    if !project_root.is_dir() {
+        return Err(CoreError::NotGitCheckout {
+            path: project_root.display().to_string(),
+        });
+    }
+    let output = run_git(project_root, git, ["rev-parse", "--is-inside-work-tree"])?;
+    if !output.status.success() || String::from_utf8_lossy(&output.stdout).trim() != "true" {
+        return Err(CoreError::NotGitCheckout {
+            path: project_root.display().to_string(),
+        });
+    }
+    Ok(())
+}
+
+fn resolve_commit(project_root: &Path, reference: &str, git: &OsStr) -> Result<String, CoreError> {
+    let commit_expression = format!("{reference}^{{commit}}");
+    let output = run_git(
+        project_root,
+        git,
+        [
+            "rev-parse",
+            "--verify",
+            "--end-of-options",
+            commit_expression.as_str(),
+        ],
+    )?;
+    let commit = String::from_utf8_lossy(&output.stdout).trim().to_string();
+    if !output.status.success()
+        || !(40..=64).contains(&commit.len())
+        || !commit.bytes().all(|byte| byte.is_ascii_hexdigit())
+    {
+        return Err(CoreError::BaseRefUnresolvable {
+            reference: reference.to_string(),
+            detail: git_detail(&output),
+        });
+    }
+    Ok(commit)
+}
+
+fn parse_base_artifact(
+    reference: &str,
+    artifact_path: &str,
+    bytes: &[u8],
+) -> Result<ApiGraph, CoreError> {
+    let value: serde_json::Value =
+        serde_json::from_slice(bytes).map_err(|error| CoreError::BaseGraphCorrupt {
+            reference: reference.to_string(),
+            path: artifact_path.to_string(),
+            detail: error.to_string(),
+        })?;
+    let version = value
+        .get("schema_version")
+        .ok_or_else(|| CoreError::BaseGraphCorrupt {
+            reference: reference.to_string(),
+            path: artifact_path.to_string(),
+            detail: "missing integer field 'schema_version'".to_string(),
+        })?;
+    let version_number = version
+        .as_u64()
+        .ok_or_else(|| CoreError::BaseGraphCorrupt {
+            reference: reference.to_string(),
+            path: artifact_path.to_string(),
+            detail: "field 'schema_version' must be a non-negative integer".to_string(),
+        })?;
+    if version_number != u64::from(GRAPH_ARTIFACT_SCHEMA_VERSION) {
+        return Err(CoreError::BaseGraphSchemaVersion {
+            reference: reference.to_string(),
+            path: artifact_path.to_string(),
+            expected: GRAPH_ARTIFACT_SCHEMA_VERSION,
+            found: version_number.to_string(),
+        });
+    }
+    let artifact: GraphArtifact =
+        serde_json::from_value(value).map_err(|error| CoreError::BaseGraphCorrupt {
+            reference: reference.to_string(),
+            path: artifact_path.to_string(),
+            detail: error.to_string(),
+        })?;
+    Ok(artifact.graph)
+}
+
+fn run_git<I, S>(project_root: &Path, git: &OsStr, args: I) -> Result<Output, CoreError>
+where
+    I: IntoIterator<Item = S>,
+    S: AsRef<OsStr>,
+{
+    Command::new(git)
+        .args(args)
+        .current_dir(project_root)
+        .output()
+        .map_err(|source| CoreError::GitToolchainMissing { source })
+}
+
+fn git_detail(output: &Output) -> String {
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    let detail = stderr.trim();
+    if detail.is_empty() {
+        format!("git exited with status {:?}", output.status.code())
+    } else {
+        detail.to_string()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    #![allow(clippy::expect_used, clippy::unwrap_used)]
+
+    use std::ffi::OsStr;
+    use std::path::{Path, PathBuf};
+    use std::process::Command;
+
+    use super::{load_base_graph_with, parse_base_artifact};
+    use crate::graph_artifact::{GraphArtifact, GRAPH_ARTIFACT_PATH};
+    use crate::CoreError;
+
+    const FIXTURE_ARTIFACT_PATH: &str = "examples/bookstore/generated/gnr8.graph.json";
+
+    fn unique_temp_dir(label: &str) -> PathBuf {
+        let nanos = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let root = std::env::temp_dir().join(format!(
+            "gnr8-base-graph-{label}-{}-{nanos}",
+            std::process::id()
+        ));
+        std::fs::create_dir_all(&root).unwrap();
+        root
+    }
+
+    fn repository_root() -> PathBuf {
+        Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("../..")
+            .canonicalize()
+            .expect("canonical repository root")
+    }
+
+    fn real_git_fixture() -> PathBuf {
+        let fixture = unique_temp_dir("repository");
+        let status = Command::new("git")
+            .args(["clone", "--quiet", "--no-hardlinks"])
+            .arg(repository_root())
+            .arg(&fixture)
+            .status()
+            .expect("clone local repository");
+        assert!(status.success());
+        fixture
+    }
+
+    #[test]
+    fn loads_the_committed_graph_from_a_real_git_fixture() {
+        let fixture = real_git_fixture();
+        let loaded =
+            load_base_graph_with(&fixture, "HEAD", FIXTURE_ARTIFACT_PATH, OsStr::new("git"))
+                .expect("load committed graph");
+        assert_eq!(loaded.reference, "HEAD");
+        assert_eq!(loaded.commit.len(), 40);
+        assert!(!loaded.graph.operations.is_empty());
+        std::fs::remove_dir_all(fixture).unwrap();
+    }
+
+    #[test]
+    fn reports_non_git_checkout_and_missing_git_separately() {
+        let non_git = unique_temp_dir("not-git");
+        let error = load_base_graph_with(&non_git, "HEAD", GRAPH_ARTIFACT_PATH, OsStr::new("git"))
+            .unwrap_err();
+        assert!(matches!(error, CoreError::NotGitCheckout { .. }));
+
+        let error = load_base_graph_with(
+            &non_git,
+            "HEAD",
+            GRAPH_ARTIFACT_PATH,
+            OsStr::new("/definitely/missing/gnr8-git"),
+        )
+        .unwrap_err();
+        assert!(matches!(error, CoreError::GitToolchainMissing { .. }));
+        std::fs::remove_dir_all(non_git).unwrap();
+    }
+
+    #[test]
+    fn reports_unresolvable_ref_and_missing_artifact_separately() {
+        let fixture = real_git_fixture();
+        let error = load_base_graph_with(
+            &fixture,
+            "refs/heads/does-not-exist",
+            GRAPH_ARTIFACT_PATH,
+            OsStr::new("git"),
+        )
+        .unwrap_err();
+        assert!(matches!(error, CoreError::BaseRefUnresolvable { .. }));
+
+        let error = load_base_graph_with(
+            &fixture,
+            "HEAD",
+            "generated/does-not-exist.json",
+            OsStr::new("git"),
+        )
+        .unwrap_err();
+        assert!(matches!(error, CoreError::BaseGraphMissing { .. }));
+        assert!(error
+            .to_string()
+            .contains("run `gnr8 generate` and commit it"));
+        std::fs::remove_dir_all(fixture).unwrap();
+    }
+
+    #[test]
+    fn rejects_corrupt_and_wrong_version_artifacts_explicitly() {
+        let corrupt = parse_base_artifact("main", GRAPH_ARTIFACT_PATH, b"{not json").unwrap_err();
+        assert!(matches!(corrupt, CoreError::BaseGraphCorrupt { .. }));
+
+        let text = GraphArtifact::new(crate::graph::ApiGraph::default())
+            .to_json()
+            .expect("serialize current artifact")
+            .replace("\"schema_version\": 1", "\"schema_version\": 99");
+        let mismatch =
+            parse_base_artifact("main", GRAPH_ARTIFACT_PATH, text.as_bytes()).unwrap_err();
+        assert!(matches!(
+            mismatch,
+            CoreError::BaseGraphSchemaVersion {
+                expected: 1,
+                ref found,
+                ..
+            } if found == "99"
+        ));
+    }
+
+    #[test]
+    fn ref_text_is_an_argument_not_a_shell_expression() {
+        let fixture = real_git_fixture();
+        let marker = fixture.join("must-not-exist");
+        let reference = format!("HEAD;touch {}", marker.display());
+        let error =
+            load_base_graph_with(&fixture, &reference, GRAPH_ARTIFACT_PATH, OsStr::new("git"))
+                .unwrap_err();
+        assert!(matches!(error, CoreError::BaseRefUnresolvable { .. }));
+        assert!(!marker.exists());
+        std::fs::remove_dir_all(fixture).unwrap();
+    }
+}

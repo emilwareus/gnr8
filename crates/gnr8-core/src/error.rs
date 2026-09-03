@@ -190,6 +190,67 @@ pub enum CoreError {
         message: String,
     },
 
+    /// Git could not be spawned while resolving a committed graph artifact.
+    #[error("Git executable not available (is `git` installed and on PATH?): {source}")]
+    GitToolchainMissing {
+        /// The underlying process-spawn error.
+        #[source]
+        source: std::io::Error,
+    },
+
+    /// The requested project directory is not inside a Git work tree.
+    #[error("'{path}' is not a Git checkout; `gnr8 changes` requires committed graph history")]
+    NotGitCheckout {
+        /// Project directory checked by Git.
+        path: String,
+    },
+
+    /// Git could not resolve the requested base revision.
+    #[error("base ref '{reference}' cannot be resolved to a commit: {detail}")]
+    BaseRefUnresolvable {
+        /// User-provided revision expression.
+        reference: String,
+        /// Bounded Git failure detail.
+        detail: String,
+    },
+
+    /// The resolved base revision does not commit the generated graph artifact.
+    #[error(
+        "base ref '{reference}' has no committed gnr8 graph artifact at '{path}'; run `gnr8 generate` and commit it"
+    )]
+    BaseGraphMissing {
+        /// User-provided revision expression.
+        reference: String,
+        /// Stable project-relative graph artifact path.
+        path: String,
+    },
+
+    /// The committed base graph artifact is not valid JSON in the expected envelope shape.
+    #[error("base graph artifact at '{reference}:{path}' is corrupt: {detail}")]
+    BaseGraphCorrupt {
+        /// User-provided revision expression.
+        reference: String,
+        /// Stable project-relative graph artifact path.
+        path: String,
+        /// Parse failure detail.
+        detail: String,
+    },
+
+    /// The committed base graph artifact uses a different on-disk schema.
+    #[error(
+        "base graph artifact at '{reference}:{path}' has schema version {found}; expected {expected}"
+    )]
+    BaseGraphSchemaVersion {
+        /// User-provided revision expression.
+        reference: String,
+        /// Stable project-relative graph artifact path.
+        path: String,
+        /// Supported schema version.
+        expected: u32,
+        /// Version found in the committed artifact.
+        found: String,
+    },
+
     /// A configured diagnostic policy denied one or more structured diagnostics.
     #[error("diagnostic policy denied: {codes:?}")]
     DiagnosticsDenied {

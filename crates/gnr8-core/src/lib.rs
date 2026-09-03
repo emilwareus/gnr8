@@ -28,6 +28,7 @@ pub mod error;
 pub use error::CoreError;
 
 pub mod analyze;
+pub mod changes;
 pub mod diagnostics;
 pub mod gosdk;
 pub mod graph;
