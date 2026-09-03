@@ -68,6 +68,15 @@ fn cargo_available() -> bool {
         .is_ok()
 }
 
+fn git_available() -> bool {
+    Command::new("git")
+        .arg("--version")
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .status()
+        .is_ok()
+}
+
 fn unique_dir(label: &str) -> PathBuf {
     let nanos = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
@@ -98,6 +107,20 @@ paths:
                 type: array
                 items:
                   type: string
+";
+
+const TAGGED_OPENAPI_SOURCE: &str = r"openapi: 3.0.3
+info:
+  title: Fixture
+  version: 1.0.0
+paths:
+  /things:
+    get:
+      operationId: listThings
+      tags: [internal]
+      responses:
+        '200':
+          description: ok
 ";
 
 /// Write a project whose worker pipeline is `pipeline_body`, with the given extra items.
@@ -900,5 +923,90 @@ fn a_worker_run_by_hand_reports_that_it_is_not_a_standalone_program() {
         "{}",
         combined(&output)
     );
+    let _ = std::fs::remove_dir_all(root);
+}
+
+#[test]
+fn changes_uses_exit_one_only_for_a_gating_break() {
+    if !cargo_available() || !git_available() {
+        eprintln!("skipping worker_contract: cargo or git unavailable");
+        return;
+    }
+    let root = unique_dir("changes-exit");
+    write_project(&root, "", OPENAPI_PIPELINE);
+    std::fs::write(root.join("openapi.yaml"), TAGGED_OPENAPI_SOURCE).unwrap();
+    assert!(gnr8(&root, &["generate"], None).status.success());
+
+    let git = |args: &[&str]| {
+        Command::new("git")
+            .args(args)
+            .current_dir(&root)
+            .env("GIT_AUTHOR_NAME", "gnr8 test")
+            .env("GIT_AUTHOR_EMAIL", "gnr8-test@example.invalid")
+            .env("GIT_COMMITTER_NAME", "gnr8 test")
+            .env("GIT_COMMITTER_EMAIL", "gnr8-test@example.invalid")
+            .output()
+            .expect("run git fixture command")
+    };
+    assert!(git(&["init", "--quiet"]).status.success());
+    assert!(git(&[
+        "add",
+        ".gnr8/Cargo.toml",
+        ".gnr8/Cargo.lock",
+        ".gnr8/src/main.rs",
+        "openapi.yaml",
+        "generated/gnr8.graph.json",
+        "generated/openapi.yaml",
+    ])
+    .status
+    .success());
+    assert!(git(&[
+        "-c",
+        "commit.gpgsign=false",
+        "commit",
+        "--quiet",
+        "-m",
+        "base",
+    ])
+    .status
+    .success());
+
+    std::fs::write(
+        root.join("openapi.yaml"),
+        "openapi: 3.0.3\ninfo:\n  title: Fixture\n  version: 1.0.0\npaths: {}\n",
+    )
+    .unwrap();
+
+    let gating = gnr8(&root, &["--json", "changes", "--base", "HEAD"], None);
+    assert_eq!(gating.status.code(), Some(1), "{}", combined(&gating));
+    let report: serde_json::Value =
+        serde_json::from_slice(&gating.stdout).expect("gating report is JSON");
+    assert_eq!(report["summary"]["breaking"], 1);
+    assert_eq!(report["summary"]["gating"], 1);
+    assert_eq!(report["changes"][0]["code"], "operation.removed");
+
+    let exempt = gnr8(
+        &root,
+        &[
+            "--json",
+            "changes",
+            "--base",
+            "HEAD",
+            "--exempt-tag",
+            "internal",
+        ],
+        None,
+    );
+    assert!(exempt.status.success(), "{}", combined(&exempt));
+    let report: serde_json::Value =
+        serde_json::from_slice(&exempt.stdout).expect("exempt report is JSON");
+    assert_eq!(report["summary"]["breaking"], 1);
+    assert_eq!(report["summary"]["gating"], 0);
+    assert_eq!(report["changes"][0]["exempt"]["base"], true);
+    assert_eq!(
+        report["changes"][0]["exempt"]["current"],
+        serde_json::Value::Null
+    );
+
     let _ = std::fs::remove_dir_all(root);
 }
