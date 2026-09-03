@@ -62,7 +62,7 @@ inputs:
     required: false
     default: "stable"
   setup-python:
-    description: Install Python before running gnr8 check.
+    description: Install Python before running gnr8 check. API change reporting always installs it.
     required: false
     default: "false"
   python-version:
@@ -185,7 +185,7 @@ runs:
         check-latest: true
 
     - name: Set up Python
-      if: ${{ inputs.setup-python == 'true' }}
+      if: ${{ inputs.setup-python == 'true' || inputs.report-api-changes == 'true' }}
       uses: actions/setup-python@v6
       with:
         python-version: ${{ inputs.python-version }}
