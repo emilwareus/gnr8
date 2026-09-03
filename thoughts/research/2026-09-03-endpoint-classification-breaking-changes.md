@@ -858,7 +858,7 @@ Three rules, in this order, and nothing else:
    defect, and picking a winner between them is the same defect with extra steps (CLAUDE.md rule 3).
    Like that check, the scan runs over every matched operation **before** any mutation, so a failing
    transform leaves the graph exactly as it found it and the error never depends on operation order
-   (`:2176-2179`).
+   (`:2171-2174`).
 
 **No "most-specific-wins".** Specificity across `PathPrefix`, `Middleware`, `Methods`, and
 `OperationId` has no natural total order — ranking them is an invented metric, and any metric needs a
