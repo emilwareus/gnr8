@@ -465,35 +465,74 @@ fn compare_operations(base: &GraphIndex<'_>, current: &GraphIndex<'_>, out: &mut
         .iter()
         .map(|operation| (operation.id.as_str(), operation))
         .collect();
-    let mut moved_ids = BTreeSet::new();
+    let mut matched_base = BTreeSet::new();
+    let mut matched_current = BTreeSet::new();
+
+    // Preserve exact operation identity first. The later phases then correlate moves by stable id,
+    // same-route handler renames, and finally unmatched removals/additions without ever consuming a
+    // current operation twice.
     for (route, operation) in &base_operations {
-        if let Some(current_operation) = current_operations.get(route) {
+        if let Some(current_operation) = current_operations
+            .get(route)
+            .filter(|current_operation| current_operation.id == operation.id)
+        {
             compare_operation(base, current, operation, current_operation, out);
-        } else if let Some(current_operation) = current_by_id.get(operation.id.as_str()) {
-            moved_ids.insert(operation.id.as_str());
-            compare_moved_operation(base, current, operation, current_operation, out);
-        } else {
-            let scope = operation_scope(base, current, Some(operation), None);
-            out.push(
-                &scope,
-                ChangeKind::Breaking,
-                "operation.removed",
-                None,
-                "operation removed".to_string(),
-            );
+            matched_base.insert(*route);
+            matched_current.insert(*route);
         }
     }
-    for (route, operation) in &current_operations {
-        if !base_operations.contains_key(route) && !moved_ids.contains(operation.id.as_str()) {
-            let scope = operation_scope(base, current, None, Some(operation));
-            out.push(
-                &scope,
-                ChangeKind::Additive,
-                "operation.added",
-                None,
-                "operation added".to_string(),
-            );
+    for (route, operation) in &base_operations {
+        if matched_base.contains(route) {
+            continue;
         }
+        if let Some(current_operation) = current_by_id.get(operation.id.as_str()) {
+            let current_route = (
+                current_operation.method.as_str(),
+                current_operation.path.as_str(),
+            );
+            if matched_current.contains(&current_route) {
+                continue;
+            }
+            compare_moved_operation(base, current, operation, current_operation, out);
+            matched_base.insert(*route);
+            matched_current.insert(current_route);
+        }
+    }
+    for (route, operation) in &base_operations {
+        if matched_base.contains(route) || matched_current.contains(route) {
+            continue;
+        }
+        if let Some(current_operation) = current_operations.get(route) {
+            compare_operation(base, current, operation, current_operation, out);
+            matched_base.insert(*route);
+            matched_current.insert(*route);
+        }
+    }
+    for (route, operation) in &base_operations {
+        if matched_base.contains(route) {
+            continue;
+        }
+        let scope = operation_scope(base, current, Some(operation), None);
+        out.push(
+            &scope,
+            ChangeKind::Breaking,
+            "operation.removed",
+            None,
+            "operation removed".to_string(),
+        );
+    }
+    for (route, operation) in &current_operations {
+        if matched_current.contains(route) {
+            continue;
+        }
+        let scope = operation_scope(base, current, None, Some(operation));
+        out.push(
+            &scope,
+            ChangeKind::Additive,
+            "operation.added",
+            None,
+            "operation added".to_string(),
+        );
     }
 }
 
@@ -977,12 +1016,14 @@ fn compare_operation_security(
         return;
     }
     let kind = security_change_kind(&base_security, &current_security);
-    let (code, message) = if security_is_public(&base_security) {
+    let base_public = security_is_public(&base_security);
+    let current_public = security_is_public(&current_security);
+    let (code, message) = if base_public && !current_public {
         (
             "security.operation.added",
             "operation now requires security",
         )
-    } else if security_is_public(&current_security) {
+    } else if !base_public && current_public {
         (
             "security.operation.removed",
             "operation no longer requires security",
@@ -1024,21 +1065,27 @@ fn normalized_security_groups(mut groups: Vec<Vec<String>>) -> Vec<Vec<String>> 
         group.sort();
         group.dedup();
     }
-    groups.sort();
-    groups.dedup();
-    if groups.is_empty() || groups.iter().any(Vec::is_empty) {
-        vec![Vec::new()]
-    } else {
-        groups
+    let mut seen = BTreeSet::new();
+    groups.retain(|group| seen.insert(group.clone()));
+    groups.sort_by_key(Vec::is_empty);
+    if groups.is_empty() {
+        groups.push(Vec::new());
     }
+    groups
 }
 
 fn security_change_kind(base: &[Vec<String>], current: &[Vec<String>]) -> ChangeKind {
-    if security_is_public(base) {
+    let base_public = security_is_public(base);
+    let current_public = security_is_public(current);
+    if base_public && !current_public {
         return ChangeKind::Breaking;
     }
-    if security_is_public(current) {
+    if !base_public && current_public {
         return ChangeKind::Additive;
+    }
+    if base.iter().collect::<BTreeSet<_>>() == current.iter().collect::<BTreeSet<_>>() {
+        // Alternative order is generated-client credential preference, not presentation order.
+        return ChangeKind::Breaking;
     }
     let current_is_at_least_as_permissive = base.iter().all(|base_group| {
         current.iter().any(|current_group| {
@@ -1727,8 +1774,9 @@ mod tests {
     use super::{diff_graphs, ChangeKind};
     use crate::analyze::facts::FieldMeta;
     use crate::graph::{
-        ApiGraph, Field, Operation, OperationDocsPolicy, Param, Prim, Response, Schema, SchemaRef,
-        SchemaUse, SchemaUseRoot, SecurityScheme, SourceSpan, Type,
+        ApiGraph, Field, Operation, OperationDocsPolicy, OperationSecurityPolicy, Param, Prim,
+        Response, Schema, SchemaRef, SchemaUse, SchemaUseRoot, SecurityRequirementGroup,
+        SecurityScheme, SourceSpan, Type,
     };
 
     fn span(file: &str) -> SourceSpan {
@@ -2291,6 +2339,35 @@ mod tests {
     }
 
     #[test]
+    fn moved_operation_cannot_consume_the_same_current_route_twice() {
+        let mut first = operation();
+        first.id = "first".to_string();
+        first.path = "/first".to_string();
+        let mut second = operation();
+        second.id = "second".to_string();
+        second.path = "/second".to_string();
+        let base = ApiGraph {
+            operations: vec![first.clone(), second],
+            ..ApiGraph::default()
+        };
+        first.path = "/second".to_string();
+        let current = ApiGraph {
+            operations: vec![first],
+            ..ApiGraph::default()
+        };
+
+        let report = diff_graphs(&base, &current, &BTreeSet::new());
+        assert_eq!(
+            report
+                .changes
+                .iter()
+                .map(|change| change.code.as_str())
+                .collect::<BTreeSet<_>>(),
+            BTreeSet::from(["operation.path.changed", "operation.removed"])
+        );
+    }
+
+    #[test]
     fn response_status_is_additive_but_body_shape_addition_is_breaking() {
         let mut base = graph_with_tags(&[]);
         let mut current = base.clone();
@@ -2393,6 +2470,50 @@ mod tests {
             )
             .kind,
             ChangeKind::Breaking
+        );
+
+        let policy = |alternatives: &[&str]| OperationSecurityPolicy {
+            operation_id: "listBooks".to_string(),
+            alternatives: alternatives
+                .iter()
+                .map(|scheme| SecurityRequirementGroup {
+                    schemes: vec![(*scheme).to_string()],
+                })
+                .collect(),
+        };
+        let mut first_preference = graph_with_tags(&[]);
+        first_preference.operation_security = vec![policy(&["Bearer", "Key"])];
+        let mut second_preference = graph_with_tags(&[]);
+        second_preference.operation_security = vec![policy(&["Key", "Bearer"])];
+        assert_eq!(
+            change(
+                &diff_graphs(&first_preference, &second_preference, &BTreeSet::new()),
+                "security.operation.changed"
+            )
+            .kind,
+            ChangeKind::Breaking
+        );
+
+        let public = graph_with_tags(&[]);
+        let mut optional_auth = graph_with_tags(&[]);
+        optional_auth.operation_security = vec![OperationSecurityPolicy {
+            operation_id: "listBooks".to_string(),
+            alternatives: vec![
+                SecurityRequirementGroup {
+                    schemes: vec!["Bearer".to_string()],
+                },
+                SecurityRequirementGroup {
+                    schemes: Vec::new(),
+                },
+            ],
+        }];
+        assert_eq!(
+            change(
+                &diff_graphs(&public, &optional_auth, &BTreeSet::new()),
+                "security.operation.changed"
+            )
+            .kind,
+            ChangeKind::Additive
         );
     }
 
