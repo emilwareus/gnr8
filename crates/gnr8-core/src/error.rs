@@ -225,7 +225,7 @@ pub enum CoreError {
         path: String,
     },
 
-    /// The committed base graph artifact is not valid JSON in the expected envelope shape.
+    /// The committed base graph artifact is not valid JSON in the expected projected envelope.
     #[error("base graph artifact at '{reference}:{path}' is corrupt: {detail}")]
     BaseGraphCorrupt {
         /// User-provided revision expression.

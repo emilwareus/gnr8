@@ -152,6 +152,23 @@ fn parse_base_artifact(
             path: artifact_path.to_string(),
             detail: error.to_string(),
         })?;
+    match crate::graph::projection::for_generation(&artifact.graph) {
+        Ok(std::borrow::Cow::Borrowed(_)) => {}
+        Ok(std::borrow::Cow::Owned(_)) => {
+            return Err(CoreError::BaseGraphCorrupt {
+                reference: reference.to_string(),
+                path: artifact_path.to_string(),
+                detail: "embedded graph is not generation-projected".to_string(),
+            });
+        }
+        Err(error) => {
+            return Err(CoreError::BaseGraphCorrupt {
+                reference: reference.to_string(),
+                path: artifact_path.to_string(),
+                detail: format!("embedded graph cannot be generation-projected: {error}"),
+            });
+        }
+    }
     Ok(artifact.graph)
 }
 
@@ -173,8 +190,18 @@ fn git_detail(output: &Output) -> String {
     if detail.is_empty() {
         format!("git exited with status {:?}", output.status.code())
     } else {
-        detail.to_string()
+        bounded_git_detail(detail)
     }
+}
+
+fn bounded_git_detail(detail: &str) -> String {
+    const MAX_CHARS: usize = 512;
+    let mut chars = detail.chars();
+    let mut bounded = chars.by_ref().take(MAX_CHARS).collect::<String>();
+    if chars.next().is_some() {
+        bounded.push('…');
+    }
+    bounded
 }
 
 #[cfg(test)]
@@ -185,7 +212,11 @@ mod tests {
     use std::path::{Path, PathBuf};
     use std::process::Command;
 
-    use super::{load_base_graph_with, parse_base_artifact};
+    use super::{bounded_git_detail, load_base_graph_with, parse_base_artifact};
+    use crate::analyze::facts::FieldMeta;
+    use crate::graph::{
+        ApiGraph, Field, Operation, Prim, Response, Schema, SchemaRef, SourceSpan, Type,
+    };
     use crate::graph_artifact::{GraphArtifact, GRAPH_ARTIFACT_PATH};
     use crate::CoreError;
 
@@ -307,6 +338,84 @@ mod tests {
                 ..
             } if found == "99"
         ));
+    }
+
+    #[test]
+    fn rejects_an_artifact_that_was_not_generation_projected() {
+        let provenance = SourceSpan {
+            file: "api.rs".to_string(),
+            start_line: 1,
+            end_line: 1,
+        };
+        let mut operation = Operation {
+            id: "roundTrip".to_string(),
+            method: "POST".to_string(),
+            path: "/round-trip".to_string(),
+            handler: "roundTrip".to_string(),
+            summary: None,
+            description: None,
+            group: None,
+            middleware: Vec::new(),
+            params: Vec::new(),
+            request_body: Some(SchemaRef {
+                ref_id: "Payload".to_string(),
+            }),
+            request_body_required: true,
+            request_body_content_type: None,
+            responses: Vec::new(),
+            security: Vec::new(),
+            security_overrides_global: false,
+            provenance: provenance.clone(),
+        };
+        operation.responses.push(Response {
+            status: 200,
+            body: Some(SchemaRef {
+                ref_id: "Payload".to_string(),
+            }),
+            body_kind: "json".to_string(),
+            content_type: Some("application/json".to_string()),
+            content_types: Vec::new(),
+        });
+        let graph = ApiGraph {
+            operations: vec![operation],
+            schemas: vec![Schema {
+                id: "Payload".to_string(),
+                name: "Payload".to_string(),
+                body: Type::Object(vec![Field {
+                    json_name: "value".to_string(),
+                    serializer_may_omit: false,
+                    deserializer_accepts_absent: true,
+                    deserializer_accepts_null: false,
+                    serializer_may_emit_null: false,
+                    validator_requires_presence: false,
+                    validator_rejects_null: false,
+                    schema: Type::Primitive(Prim::String),
+                    description: None,
+                    example: None,
+                    meta: FieldMeta::default(),
+                }]),
+                enum_source_order: Vec::new(),
+                provenance,
+            }],
+            ..ApiGraph::default()
+        };
+        let text = GraphArtifact::new(graph)
+            .to_json()
+            .expect("serialize unprojected fixture");
+
+        let error = parse_base_artifact("main", GRAPH_ARTIFACT_PATH, text.as_bytes())
+            .expect_err("unprojected graph must fail");
+        assert!(matches!(error, CoreError::BaseGraphCorrupt { .. }));
+        assert!(error.to_string().contains("not generation-projected"));
+    }
+
+    #[test]
+    fn bounds_git_failure_detail_on_unicode_boundaries() {
+        let detail = "é".repeat(600);
+        let bounded = bounded_git_detail(&detail);
+        assert_eq!(bounded.chars().count(), 513);
+        assert!(bounded.ends_with('…'));
+        assert_eq!(bounded_git_detail("short detail"), "short detail");
     }
 
     #[test]
