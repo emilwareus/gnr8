@@ -347,18 +347,7 @@ impl SdkModel {
                 .operation_docs
                 .iter()
                 .find(|policy| policy.operation_id == op.id);
-            let tags = docs_policy
-                .filter(|policy| !policy.tags.is_empty())
-                .map_or_else(
-                    || {
-                        if service == "default" {
-                            Vec::new()
-                        } else {
-                            vec![service.clone()]
-                        }
-                    },
-                    |policy| policy.tags.clone(),
-                );
+            let tags = crate::graph::effective_operation_tags(graph, op).to_vec();
             operation_docs.push(SdkOperationDocs {
                 operation_id: op.id.clone(),
                 service: service.clone(),

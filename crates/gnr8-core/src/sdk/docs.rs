@@ -249,12 +249,13 @@ fn append_reference_operation_docs(text: &mut String, ir: &ApiGraph) {
     text.push_str("\n## Operation Documentation\n\n");
     for (op, policy) in documented {
         let _ = writeln!(text, "### `{}`\n", op.id);
-        append_operation_docs_body(text, op, policy);
+        append_operation_docs_body(text, ir, op, policy);
     }
 }
 
 fn append_operation_docs_body(
     text: &mut String,
+    ir: &ApiGraph,
     op: &crate::graph::Operation,
     policy: Option<&OperationDocsPolicy>,
 ) {
@@ -264,9 +265,12 @@ fn append_operation_docs_body(
     if policy.is_some_and(|policy| policy.deprecated) {
         text.push_str("- Deprecated: yes\n");
     }
+    // The reference has historically rendered a Tags line only for explicit documentation
+    // policy. Resolve the value canonically once that line exists, while preserving that output
+    // boundary during this refactor.
     let tags = policy
-        .map(|policy| policy.tags.as_slice())
-        .filter(|tags| !tags.is_empty());
+        .filter(|policy| !policy.tags.is_empty())
+        .map(|_| crate::graph::effective_operation_tags(ir, op));
     if let Some(tags) = tags {
         let joined = tags
             .iter()
@@ -346,7 +350,9 @@ mod tests {
     #![allow(clippy::unwrap_used)]
 
     use super::{sdk_reference, SdkDocs};
-    use crate::graph::{ApiGraph, Diagnostic, DiagnosticCategory, SourceSpan};
+    use crate::graph::{
+        ApiGraph, Diagnostic, DiagnosticCategory, Operation, OperationDocsPolicy, SourceSpan,
+    };
 
     #[test]
     fn bool_conversion_maps_true_to_reference_and_false_to_none() {
@@ -383,6 +389,59 @@ mod tests {
             diagnostics,
             ..ApiGraph::default()
         }
+    }
+
+    fn operation(id: &str, group: Option<&str>) -> Operation {
+        Operation {
+            id: id.to_string(),
+            method: "GET".to_string(),
+            path: format!("/{id}"),
+            handler: id.to_string(),
+            summary: Some(format!("Document {id}.")),
+            description: None,
+            group: group.map(str::to_string),
+            middleware: Vec::new(),
+            params: Vec::new(),
+            request_body: None,
+            request_body_required: true,
+            request_body_content_type: None,
+            responses: Vec::new(),
+            security: Vec::new(),
+            security_overrides_global: false,
+            provenance: SourceSpan {
+                file: "books.rs".to_string(),
+                start_line: 1,
+                end_line: 1,
+            },
+        }
+    }
+
+    #[test]
+    fn reference_uses_canonical_tags_for_its_existing_policy_tag_line() {
+        let graph = ApiGraph {
+            operations: vec![
+                operation("grouped", Some("Books")),
+                operation("classified", Some("Reports")),
+            ],
+            operation_docs: vec![OperationDocsPolicy {
+                operation_id: "classified".to_string(),
+                openapi_operation_id: None,
+                deprecated: false,
+                tags: vec!["internal".to_string(), "partner".to_string()],
+                request_examples: Vec::new(),
+                request_content_types: Vec::new(),
+                responses: Vec::new(),
+            }],
+            ..ApiGraph::default()
+        };
+
+        let reference = sdk_reference("Go", "example.com/sdk", &graph);
+        assert!(!reference.contains("- Tags: `Books`"), "{reference}");
+        assert!(
+            reference.contains("- Tags: `internal`, `partner`"),
+            "{reference}"
+        );
+        assert!(!reference.contains("- Tags: `Reports`"), "{reference}");
     }
 
     /// A diagnostic about the analyzed module is exactly what this section is for: it tells an

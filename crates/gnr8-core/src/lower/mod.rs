@@ -343,10 +343,12 @@ fn build_paths(
     let mut paths: Vec<(String, PathItem)> = Vec::new();
     for op in &graph.operations {
         let abs_path = join_base(base_path, &op.path)?;
+        let tags = crate::graph::effective_operation_tags(graph, op);
         let operation = lower_operation(
             op,
             operation_docs_policy(graph, &op.id),
             operation_security_policy(graph, &op.id),
+            tags,
             ref_to_name,
             global_security,
         )?;
@@ -408,6 +410,7 @@ fn lower_operation(
     op: &GraphOp,
     docs: Option<&OperationDocsPolicy>,
     exact_security: Option<&crate::graph::OperationSecurityPolicy>,
+    tags: &[String],
     ref_to_name: &BTreeMap<&str, &str>,
     global_security: &[String],
 ) -> Result<Operation, crate::CoreError> {
@@ -509,7 +512,7 @@ fn lower_operation(
         summary: op.summary.clone(),
         description: op.description.clone(),
         deprecated: docs.is_some_and(|policy| policy.deprecated),
-        tags: operation_tags(op, docs),
+        tags: tags.to_vec(),
         security: operation_security,
         security_explicit: exact_security.is_some()
             || op.security_overrides_global
@@ -755,13 +758,6 @@ fn operation_security_policy<'a>(
         .operation_security
         .iter()
         .find(|policy| policy.operation_id == operation_id)
-}
-
-fn operation_tags(op: &GraphOp, docs: Option<&OperationDocsPolicy>) -> Vec<String> {
-    docs.filter(|policy| !policy.tags.is_empty()).map_or_else(
-        || op.group.clone().into_iter().collect(),
-        |policy| policy.tags.clone(),
-    )
 }
 
 fn media_examples_for_content_types(

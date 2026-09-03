@@ -1131,8 +1131,8 @@ pub struct ApplySecurity {
     pub selectors: Vec<OperationSelector>,
 }
 
-/// Reusable operation selector for transforms that need to match routes by path, method, middleware,
-/// or boolean composition.
+/// Reusable operation selector for transforms that need to match routes by path, method, source
+/// file, middleware, or boolean composition.
 #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub enum OperationSelector {
     /// Match one operation id exactly.
@@ -1141,6 +1141,8 @@ pub enum OperationSelector {
     Route { method: String, path: String },
     /// Match operations whose graph path, or base-path-joined path, starts with this prefix.
     PathPrefix(String),
+    /// Match operations whose source provenance file starts with this prefix.
+    SourcePrefix(String),
     /// Match operations whose HTTP method is one of these uppercase method names.
     Methods(Vec<String>),
     /// Match operations carrying this source middleware symbol.
@@ -1201,6 +1203,12 @@ impl OperationSelector {
     #[must_use]
     pub fn path_prefix(prefix: impl Into<String>) -> Self {
         Self::PathPrefix(prefix.into())
+    }
+
+    /// Match operations whose source provenance file starts with `prefix`.
+    #[must_use]
+    pub fn source_prefix(prefix: impl Into<String>) -> Self {
+        Self::SourcePrefix(prefix.into())
     }
 
     /// Match operations whose HTTP method is in `methods`.
