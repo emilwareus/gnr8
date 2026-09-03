@@ -4,4 +4,7 @@ mod base;
 mod diff;
 
 pub use base::{load_base_graph, BaseGraph};
-pub use diff::{diff_graphs, Change, ChangeKind, ChangePolicy, ChangeReport, ChangeSummary, Sides};
+pub use diff::{
+    diff_graphs, AffectedOperation, Change, ChangeKind, ChangePolicy, ChangeReport, ChangeSummary,
+    Sides,
+};

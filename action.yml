@@ -331,10 +331,11 @@ runs:
       env:
         GH_TOKEN: ${{ github.token }}
         PR_NUMBER: ${{ github.event.pull_request.number }}
+        REPOSITORY: ${{ github.repository }}
         REPORT_PATH: ${{ steps.api-changes.outputs.combined-report }}
       run: |
         set -euo pipefail
-        if ! gh pr comment "$PR_NUMBER" --body-file "$REPORT_PATH"; then
+        if ! "$GITHUB_ACTION_PATH/scripts/upsert-action-comment.sh"; then
           echo "::warning::gnr8 action could not comment on the pull request; the step summary and artifacts contain the report"
         fi
 

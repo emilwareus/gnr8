@@ -139,7 +139,8 @@ their most checked transitive consumer on each graph side.
 
 JSON contains the requested and resolved base revision, sorted exempt-tag policy, summary counts,
 and deterministically sorted changes with stable dotted codes, effective tags and exemption state
-for both graph sides, the derived `gating` result, and current source locations where available.
+for both graph sides, the derived `gating` result, affected SDK operations on both extant sides, and
+current source locations where available.
 
 The dotted codes are a stable machine-facing taxonomy:
 

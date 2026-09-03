@@ -20,10 +20,19 @@ cat <<'JSON'
     "kind": "breaking",
     "code": "operation.removed",
     "operation": "DELETE /books/{id}",
+    "affected_operations": {
+      "base": [
+        {"operation": "DELETE /books/{id}", "operation_id": "deleteBook"},
+        {"operation": "GET /books", "operation_id": "listBooks"}
+      ],
+      "current": null
+    },
     "tags": {"base": ["books"], "current": null},
     "exempt": {"base": false, "current": null},
     "gating": true,
-    "message": "operation removed\n## injected heading"
+    "message": "operation removed\n## injected heading",
+    "file": "handlers/<books>.go",
+    "line": 42
   }]
 }
 JSON
@@ -52,6 +61,8 @@ FAKE_LOG="$log" \
 grep -Fx 'gating=true' "$output" >/dev/null
 grep -F 'artifact-name=gnr8-api-changes-test-' "$output" >/dev/null
 grep -F 'BREAKING  DELETE /books/{id}  operation removed ## injected heading' "$summary" >/dev/null
+grep -F 'SDK operations: deleteBook (DELETE /books/{id}), listBooks (GET /books)' "$summary" >/dev/null
+grep -F 'Source: handlers/<books>.go:42' "$summary" >/dev/null
 if grep -E '^## injected heading$|^```' "$summary" >/dev/null; then
   echo "report content escaped its indented code block" >&2
   exit 1

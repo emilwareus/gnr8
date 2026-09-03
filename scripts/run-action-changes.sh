@@ -107,6 +107,22 @@ for change in report["changes"]:
     safe_operation = one_line(operation)
     safe_message = one_line(change["message"])
     lines.append(f"    {kind:<9} {safe_operation:<19} {safe_message}{suffix}")
+    affected = {
+        (item["operation_id"], item["operation"])
+        for side in ("base", "current")
+        for item in (change.get("affected_operations", {}).get(side) or [])
+    }
+    if affected:
+        rendered = ", ".join(
+            f"{one_line(operation_id)} ({one_line(operation)})"
+            for operation_id, operation in sorted(affected)
+        )
+        lines.append(f"        SDK operations: {rendered}")
+    if change.get("file"):
+        location = one_line(change["file"])
+        if change.get("line") is not None:
+            location += f":{change['line']}"
+        lines.append(f"        Source: {location}")
 lines.append("")
 pathlib.Path(destination).write_text("\n".join(lines), encoding="utf-8")
 PY

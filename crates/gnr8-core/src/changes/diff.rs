@@ -53,6 +53,15 @@ pub struct ChangeSummary {
     pub gating: usize,
 }
 
+/// One generated SDK operation affected by a finding.
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, serde::Serialize, serde::Deserialize)]
+pub struct AffectedOperation {
+    /// HTTP method and absolute path.
+    pub operation: String,
+    /// Generated SDK operation id.
+    pub operation_id: String,
+}
+
 /// One stable, auditable API change finding.
 #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct Change {
@@ -69,6 +78,8 @@ pub struct Change {
     /// Parameter, field, status, schema, or other narrow subject.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub subject: Option<String>,
+    /// All generated SDK operations affected on each extant graph side.
+    pub affected_operations: Sides<Vec<AffectedOperation>>,
     /// Effective standard operation tags on each extant side.
     pub tags: Sides<Vec<String>>,
     /// Whether every known consumer is exempt on each extant side.
@@ -111,6 +122,7 @@ impl ChangeReport {
 struct Scope {
     operation: Option<String>,
     operation_id: Option<String>,
+    affected_operations: Sides<Vec<AffectedOperation>>,
     tags: Sides<Vec<String>>,
     exempt: Sides<bool>,
     checked: bool,
@@ -217,6 +229,7 @@ impl Collector {
             operation: scope.operation.clone(),
             operation_id: scope.operation_id.clone(),
             subject,
+            affected_operations: scope.affected_operations.clone(),
             tags: scope.tags.clone(),
             exempt: scope.exempt.clone(),
             gating: kind == ChangeKind::Breaking && scope.checked,
@@ -580,32 +593,50 @@ fn compare_operation(
     out: &mut Collector,
 ) {
     let scope = operation_scope(base_index, current_index, Some(base), Some(current));
-    if effective_operation_name(base_index.graph, base)
-        != effective_operation_name(current_index.graph, current)
-    {
+    let base_openapi_name = effective_operation_name(base_index.graph, base);
+    let current_openapi_name = effective_operation_name(current_index.graph, current);
+    let sdk_name_changed = base.id != current.id;
+    let openapi_name_changed = base_openapi_name != current_openapi_name;
+    if sdk_name_changed || openapi_name_changed {
+        let message = if sdk_name_changed && openapi_name_changed {
+            if base.id == base_openapi_name && current.id == current_openapi_name {
+                format!(
+                    "operation name changed from `{}` to `{}`",
+                    base.id, current.id
+                )
+            } else {
+                format!(
+                    "SDK operation name changed from `{}` to `{}`; OpenAPI operationId changed from `{base_openapi_name}` to `{current_openapi_name}`",
+                    base.id, current.id
+                )
+            }
+        } else if sdk_name_changed {
+            format!(
+                "SDK operation name changed from `{}` to `{}`",
+                base.id, current.id
+            )
+        } else {
+            format!(
+                "OpenAPI operationId changed from `{base_openapi_name}` to `{current_openapi_name}`"
+            )
+        };
         out.push(
             &scope,
             ChangeKind::Breaking,
             "operation.name.changed",
             None,
-            format!(
-                "operation name changed from `{}` to `{}`",
-                effective_operation_name(base_index.graph, base),
-                effective_operation_name(current_index.graph, current)
-            ),
+            message,
         );
     }
-    if base.group != current.group {
+    let base_group = base.group.as_deref().unwrap_or("default");
+    let current_group = current.group.as_deref().unwrap_or("default");
+    if base_group != current_group {
         out.push(
             &scope,
             ChangeKind::Breaking,
             "sdk.group.changed",
             None,
-            format!(
-                "SDK group changed from `{}` to `{}`",
-                base.group.as_deref().unwrap_or("default"),
-                current.group.as_deref().unwrap_or("default")
-            ),
+            format!("SDK group changed from `{base_group}` to `{current_group}`"),
         );
     }
     compare_operation_tags(base_index, current_index, base, current, &scope, out);
@@ -1155,8 +1186,10 @@ fn compare_schemas(base: &GraphIndex<'_>, current: &GraphIndex<'_>, out: &mut Co
                     &scope,
                     out,
                 );
-                if schema.enum_source_order != current_schema.enum_source_order
-                    || enum_order_changed(&schema.body, &current_schema.body)
+                if enum_source_order_changed(
+                    &schema.enum_source_order,
+                    &current_schema.enum_source_order,
+                ) || enum_order_changed(&schema.body, &current_schema.body)
                 {
                     out.push(
                         &scope,
@@ -1193,6 +1226,11 @@ fn enum_order_changed(base: &Type, current: &Type) -> bool {
     }
 }
 
+fn enum_source_order_changed(base: &[String], current: &[String]) -> bool {
+    base != current
+        && base.iter().collect::<BTreeSet<_>>() == current.iter().collect::<BTreeSet<_>>()
+}
+
 #[derive(Clone, Copy)]
 struct TypeDirections {
     base: SchemaDirections,
@@ -1224,6 +1262,8 @@ impl TypeDirections {
             "request"
         } else if self.response() {
             "response"
+        } else if self.base.request || self.current.request {
+            "request"
         } else {
             "schema"
         }
@@ -1344,7 +1384,31 @@ fn compare_fields(
                         format!("field `{name}` documentation changed"),
                     );
                 }
-                if field.meta != current_field.meta {
+                compare_enum(
+                    &field.meta.constraints.enum_values,
+                    &current_field.meta.constraints.enum_values,
+                    &subject,
+                    directions,
+                    scope,
+                    out,
+                );
+                if enum_source_order_changed(
+                    &field.meta.constraints.enum_values,
+                    &current_field.meta.constraints.enum_values,
+                ) {
+                    out.push(
+                        scope,
+                        ChangeKind::DocOnly,
+                        "schema.enum.order.changed",
+                        Some(subject.clone()),
+                        format!("field `{name}` enum declaration order changed"),
+                    );
+                }
+                let mut base_meta = field.meta.clone();
+                let mut current_meta = current_field.meta.clone();
+                base_meta.constraints.enum_values.clear();
+                current_meta.constraints.enum_values.clear();
+                if base_meta != current_meta {
                     let prefix = directions.prefix(true);
                     out.push(
                         scope,
@@ -1668,6 +1732,10 @@ fn operation_scope(
         operation_id: current
             .map(|operation| operation.id.clone())
             .or_else(|| base.map(|operation| operation.id.clone())),
+        affected_operations: Sides {
+            base: base.map(|operation| affected_operations(base_index.graph, [operation])),
+            current: current.map(|operation| affected_operations(current_index.graph, [operation])),
+        },
         tags: Sides {
             base: base_tags,
             current: current_tags,
@@ -1692,20 +1760,34 @@ fn schema_scope(
     let current_side = current.map(|schema| current_index.schema_side(&schema.id));
     let base_exempt = base_side.as_ref().map(|(_, exempt, _)| *exempt);
     let current_exempt = current_side.as_ref().map(|(_, exempt, _)| *exempt);
-    let current_operation = current_side
+    let base_affected = base_side.as_ref().map(|(_, _, operations)| {
+        affected_operations(base_index.graph, operations.iter().copied())
+    });
+    let current_affected = current_side.as_ref().map(|(_, _, operations)| {
+        affected_operations(current_index.graph, operations.iter().copied())
+    });
+    let current_operation = current_affected
         .as_ref()
-        .and_then(|(_, _, operations)| single_operation(current_index.graph, operations));
-    let base_operation = base_side
+        .and_then(|operations| single_operation(operations));
+    let base_operation = base_affected
         .as_ref()
-        .and_then(|(_, _, operations)| single_operation(base_index.graph, operations));
+        .and_then(|operations| single_operation(operations));
     Scope {
         operation: current_operation
             .as_ref()
-            .map(|(label, _)| label.clone())
-            .or_else(|| base_operation.as_ref().map(|(label, _)| label.clone())),
+            .map(|operation| operation.operation.clone())
+            .or_else(|| {
+                base_operation
+                    .as_ref()
+                    .map(|operation| operation.operation.clone())
+            }),
         operation_id: current_operation
-            .map(|(_, id)| id)
-            .or_else(|| base_operation.map(|(_, id)| id)),
+            .map(|operation| operation.operation_id.clone())
+            .or_else(|| base_operation.map(|operation| operation.operation_id.clone())),
+        affected_operations: Sides {
+            base: base_affected,
+            current: current_affected,
+        },
         tags: Sides {
             base: base_side.as_ref().map(|(tags, _, _)| tags.clone()),
             current: current_side.as_ref().map(|(tags, _, _)| tags.clone()),
@@ -1720,11 +1802,27 @@ fn schema_scope(
     }
 }
 
-fn single_operation(graph: &ApiGraph, operations: &[&Operation]) -> Option<(String, String)> {
+fn affected_operations<'a>(
+    graph: &ApiGraph,
+    operations: impl IntoIterator<Item = &'a Operation>,
+) -> Vec<AffectedOperation> {
+    let mut affected = operations
+        .into_iter()
+        .map(|operation| AffectedOperation {
+            operation: operation_label(graph, operation),
+            operation_id: operation.id.clone(),
+        })
+        .collect::<Vec<_>>();
+    affected.sort();
+    affected.dedup();
+    affected
+}
+
+fn single_operation(operations: &[AffectedOperation]) -> Option<&AffectedOperation> {
     let [operation] = operations else {
         return None;
     };
-    Some((operation_label(graph, operation), operation.id.clone()))
+    Some(operation)
 }
 
 fn document_scope(base: &GraphIndex<'_>, current: &GraphIndex<'_>) -> Scope {
@@ -1733,6 +1831,13 @@ fn document_scope(base: &GraphIndex<'_>, current: &GraphIndex<'_>) -> Scope {
     Scope {
         operation: None,
         operation_id: None,
+        affected_operations: Sides {
+            base: Some(affected_operations(base.graph, &base.graph.operations)),
+            current: Some(affected_operations(
+                current.graph,
+                &current.graph.operations,
+            )),
+        },
         tags: Sides {
             base: Some(base_tags),
             current: Some(current_tags),
@@ -1772,7 +1877,7 @@ mod tests {
     use std::collections::BTreeSet;
 
     use super::{diff_graphs, ChangeKind};
-    use crate::analyze::facts::FieldMeta;
+    use crate::analyze::facts::{Constraints, FieldMeta};
     use crate::graph::{
         ApiGraph, Field, Operation, OperationDocsPolicy, OperationSecurityPolicy, Param, Prim,
         Response, Schema, SchemaRef, SchemaUse, SchemaUseRoot, SecurityRequirementGroup,
@@ -1914,6 +2019,27 @@ mod tests {
                 "base={base:?} current={current:?}"
             );
         }
+    }
+
+    #[test]
+    fn group_fallback_is_the_change_gate_tag_source() {
+        let mut base = graph_with_tags(&[]);
+        base.operations[0].group = Some("internal".to_string());
+        base.operations[0].params.push(parameter(false));
+        let mut current = base.clone();
+        current.operations[0].params[0].required = true;
+
+        let report = diff_graphs(&base, &current, &exemptions(&["internal"]));
+        let finding = change(&report, "request.parameter.required.added");
+        assert_eq!(
+            finding.tags.base.as_ref().expect("base tags"),
+            &["internal".to_string()]
+        );
+        assert_eq!(
+            finding.tags.current.as_ref().expect("current tags"),
+            &["internal".to_string()]
+        );
+        assert!(!finding.gating);
     }
 
     fn parameter(required: bool) -> Param {
@@ -2140,6 +2266,175 @@ mod tests {
     }
 
     #[test]
+    fn sdk_and_openapi_operation_names_are_compared_independently() {
+        let mut base_operation = operation();
+        base_operation.id = "sdkOld".to_string();
+        let mut current_operation = base_operation.clone();
+        current_operation.id = "sdkNew".to_string();
+        let mut base_policy = policy("sdkOld", &[]);
+        base_policy.openapi_operation_id = Some("stable-public-name".to_string());
+        let mut current_policy = policy("sdkNew", &[]);
+        current_policy.openapi_operation_id = Some("stable-public-name".to_string());
+        let base = ApiGraph {
+            operations: vec![base_operation],
+            operation_docs: vec![base_policy],
+            ..ApiGraph::default()
+        };
+        let current = ApiGraph {
+            operations: vec![current_operation],
+            operation_docs: vec![current_policy],
+            ..ApiGraph::default()
+        };
+
+        let report = diff_graphs(&base, &current, &BTreeSet::new());
+        let finding = change(&report, "operation.name.changed");
+        assert_eq!(finding.kind, ChangeKind::Breaking);
+        assert!(finding.message.contains("SDK operation name"));
+
+        let base = ApiGraph {
+            operations: vec![operation()],
+            operation_docs: vec![{
+                let mut policy = policy("listBooks", &[]);
+                policy.openapi_operation_id = Some("old-public-name".to_string());
+                policy
+            }],
+            ..ApiGraph::default()
+        };
+        let current = ApiGraph {
+            operations: vec![operation()],
+            operation_docs: vec![{
+                let mut policy = policy("listBooks", &[]);
+                policy.openapi_operation_id = Some("new-public-name".to_string());
+                policy
+            }],
+            ..ApiGraph::default()
+        };
+        assert!(change(
+            &diff_graphs(&base, &current, &BTreeSet::new()),
+            "operation.name.changed"
+        )
+        .message
+        .contains("OpenAPI operationId"));
+    }
+
+    #[test]
+    fn synthetic_default_group_does_not_report_an_sdk_break() {
+        let base = graph_with_tags(&[]);
+        let mut current = base.clone();
+        current.operations[0].group = Some("default".to_string());
+
+        let report = diff_graphs(&base, &current, &BTreeSet::new());
+        assert_eq!(report.changes.len(), 1, "{:?}", report.changes);
+        assert_eq!(report.changes[0].code, "operation.tags.changed");
+        assert_eq!(report.changes[0].kind, ChangeKind::DocOnly);
+    }
+
+    #[test]
+    fn field_level_enum_constraints_follow_payload_direction() {
+        let enum_field = |values: &[&str]| {
+            let mut field = field("state");
+            field.meta = FieldMeta {
+                constraints: Constraints {
+                    enum_values: values.iter().map(ToString::to_string).collect(),
+                    ..Constraints::default()
+                },
+                ..FieldMeta::default()
+            };
+            field
+        };
+
+        let request_base = request_graph(
+            &[],
+            "Payload::input",
+            vec![schema("Payload::input", vec![enum_field(&["active"])])],
+        );
+        let request_current = request_graph(
+            &[],
+            "Payload::input",
+            vec![schema(
+                "Payload::input",
+                vec![enum_field(&["active", "paused"])],
+            )],
+        );
+        assert_eq!(
+            change(
+                &diff_graphs(&request_base, &request_current, &BTreeSet::new()),
+                "request.enum.value.added"
+            )
+            .kind,
+            ChangeKind::Additive
+        );
+
+        let response_base =
+            response_graph(schema("Payload::output", vec![enum_field(&["active"])]));
+        let response_current = response_graph(schema(
+            "Payload::output",
+            vec![enum_field(&["active", "paused"])],
+        ));
+        assert_eq!(
+            change(
+                &diff_graphs(&response_base, &response_current, &BTreeSet::new()),
+                "response.enum.value.added"
+            )
+            .kind,
+            ChangeKind::Breaking
+        );
+    }
+
+    #[test]
+    fn enum_membership_change_is_not_also_an_order_change() {
+        let base = ApiGraph {
+            schemas: vec![Schema {
+                id: "State".to_string(),
+                name: "State".to_string(),
+                body: Type::Enum(vec!["active".to_string()]),
+                enum_source_order: vec!["active".to_string()],
+                provenance: span("models.rs"),
+            }],
+            ..ApiGraph::default()
+        };
+        let mut current = base.clone();
+        current.schemas[0].body = Type::Enum(vec!["active".to_string(), "paused".to_string()]);
+        current.schemas[0].enum_source_order = vec!["active".to_string(), "paused".to_string()];
+
+        let report = diff_graphs(&base, &current, &BTreeSet::new());
+        assert!(report
+            .changes
+            .iter()
+            .all(|finding| finding.code != "schema.enum.order.changed"));
+    }
+
+    #[test]
+    fn field_level_enum_order_change_is_documentation_only() {
+        let enum_field = |values: &[&str]| {
+            let mut field = field("state");
+            field.meta.constraints.enum_values = values.iter().map(ToString::to_string).collect();
+            field
+        };
+        let base = request_graph(
+            &[],
+            "Payload::input",
+            vec![schema(
+                "Payload::input",
+                vec![enum_field(&["active", "paused"])],
+            )],
+        );
+        let current = request_graph(
+            &[],
+            "Payload::input",
+            vec![schema(
+                "Payload::input",
+                vec![enum_field(&["paused", "active"])],
+            )],
+        );
+
+        let report = diff_graphs(&base, &current, &BTreeSet::new());
+        assert_eq!(report.changes.len(), 1, "{:?}", report.changes);
+        assert_eq!(report.changes[0].code, "schema.enum.order.changed");
+        assert_eq!(report.changes[0].kind, ChangeKind::DocOnly);
+    }
+
+    #[test]
     fn schema_gate_uses_transitive_most_checked_consumer_and_safe_defaults() {
         let leaf_base = schema("Leaf::input", vec![field("value")]);
         let leaf_current = schema("Leaf::input", Vec::new());
@@ -2230,6 +2525,141 @@ mod tests {
         );
         let report = diff_graphs(&base, &current, &exemptions(&["internal"]));
         assert!(change(&report, "request.property.removed").gating);
+    }
+
+    #[test]
+    fn projected_input_and_output_schemas_inherit_their_actual_consumers() {
+        let mut anchor = field("anchor");
+        anchor.deserializer_accepts_absent = true;
+        let base_schema = schema("Payload", vec![anchor.clone(), field("value")]);
+        let current_schema = schema("Payload", vec![anchor]);
+
+        let mut request = operation();
+        request.id = "sendPayload".to_string();
+        request.method = "POST".to_string();
+        request.path = "/payload".to_string();
+        request.request_body = Some(SchemaRef {
+            ref_id: "Payload".to_string(),
+        });
+        let mut response = operation();
+        response.id = "getPayload".to_string();
+        response.path = "/payload".to_string();
+        response.responses = vec![Response {
+            status: 200,
+            body: Some(SchemaRef {
+                ref_id: "Payload".to_string(),
+            }),
+            body_kind: "json".to_string(),
+            content_type: Some("application/json".to_string()),
+            content_types: Vec::new(),
+        }];
+        let graph = |schema| ApiGraph {
+            operations: vec![response.clone(), request.clone()],
+            operation_docs: vec![policy("sendPayload", &["internal"])],
+            schemas: vec![schema],
+            ..ApiGraph::default()
+        };
+        let base = crate::graph::projection::into_generation(graph(base_schema))
+            .expect("project base graph");
+        let current = crate::graph::projection::into_generation(graph(current_schema))
+            .expect("project current graph");
+        assert_eq!(
+            base.schemas
+                .iter()
+                .map(|schema| schema.id.as_str())
+                .collect::<Vec<_>>(),
+            ["Payload::input", "Payload::output"]
+        );
+
+        let report = diff_graphs(&base, &current, &exemptions(&["internal"]));
+        let input = change(&report, "request.property.removed");
+        assert!(!input.gating);
+        assert_eq!(
+            input
+                .affected_operations
+                .current
+                .as_ref()
+                .expect("current input consumers")[0]
+                .operation_id,
+            "sendPayload"
+        );
+        let output = change(&report, "response.property.removed");
+        assert!(output.gating);
+        assert_eq!(
+            output
+                .affected_operations
+                .current
+                .as_ref()
+                .expect("current output consumers")[0]
+                .operation_id,
+            "getPayload"
+        );
+    }
+
+    #[test]
+    fn shared_schema_reports_every_affected_sdk_operation() {
+        let mut first = operation();
+        first.id = "first".to_string();
+        first.path = "/first".to_string();
+        first.request_body = Some(SchemaRef {
+            ref_id: "Shared::input".to_string(),
+        });
+        let mut second = operation();
+        second.id = "second".to_string();
+        second.path = "/second".to_string();
+        second.request_body = Some(SchemaRef {
+            ref_id: "Shared::input".to_string(),
+        });
+        let base = ApiGraph {
+            operations: vec![first.clone(), second.clone()],
+            schemas: vec![schema("Shared::input", vec![field("value")])],
+            ..ApiGraph::default()
+        };
+        let current = ApiGraph {
+            operations: vec![first, second],
+            schemas: vec![schema("Shared::input", Vec::new())],
+            ..ApiGraph::default()
+        };
+
+        let report = diff_graphs(&base, &current, &BTreeSet::new());
+        let finding = change(&report, "request.property.removed");
+        assert!(finding.operation.is_none());
+        assert_eq!(
+            finding
+                .affected_operations
+                .current
+                .as_ref()
+                .expect("current consumers")
+                .iter()
+                .map(|operation| operation.operation_id.as_str())
+                .collect::<Vec<_>>(),
+            ["first", "second"]
+        );
+    }
+
+    #[test]
+    fn document_wide_breaks_gate_when_either_document_has_a_checked_operation() {
+        let graph = |tags: &[&str], base_path: &str| {
+            let mut graph = graph_with_tags(tags);
+            graph.base_path = base_path.to_string();
+            graph
+        };
+        let exempt = exemptions(&["internal"]);
+        let cases = [
+            ((vec!["internal"], vec!["internal"]), false),
+            ((vec!["books"], vec!["internal"]), true),
+            ((vec!["internal"], vec!["books"]), true),
+        ];
+        for ((base_tags, current_tags), expected) in cases {
+            let base = graph(&base_tags, "/v1");
+            let current = graph(&current_tags, "/v2");
+            let report = diff_graphs(&base, &current, &exempt);
+            assert_eq!(
+                change(&report, "document.base_path.changed").gating,
+                expected,
+                "base={base_tags:?} current={current_tags:?}"
+            );
+        }
     }
 
     #[test]

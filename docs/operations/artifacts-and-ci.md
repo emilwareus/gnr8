@@ -293,9 +293,9 @@ Outputs are `binary` (resolved executable path) and `cache-hit`.
 
 Change reporting requires checkout history, so use `actions/checkout` with `fetch-depth: 0`. Missing
 base history fails with an error that names this requirement. The action writes a combined Markdown
-report to the job summary, uploads the Markdown and JSON reports, and updates its pull-request
-comment when the workflow token permits comments. A comment permission failure does not hide or
-weaken the gate.
+report with affected SDK operations and current source locations to the job summary, uploads the
+Markdown and JSON reports, and creates or updates its marker-owned pull-request comment when the
+workflow token permits comments. A comment permission failure does not hide or weaken the gate.
 
 The release installer rejects `latest`: generated checks must use an exact version. `version: lock`
 uses `cargo tree --locked` to find the direct normal `gnr8` dependency. Every working directory must

@@ -92,7 +92,8 @@ mod tests {
     #![allow(clippy::expect_used)]
 
     use gnr8_engine::changes::{
-        BaseGraph, Change, ChangeKind, ChangePolicy, ChangeReport, ChangeSummary, Sides,
+        AffectedOperation, BaseGraph, Change, ChangeKind, ChangePolicy, ChangeReport,
+        ChangeSummary, Sides,
     };
 
     use super::{render_human, render_json};
@@ -104,6 +105,13 @@ mod tests {
             operation: Some("DELETE /books/{id}".to_string()),
             operation_id: Some("deleteBook".to_string()),
             subject: None,
+            affected_operations: Sides {
+                base: Some(vec![AffectedOperation {
+                    operation: "DELETE /books/{id}".to_string(),
+                    operation_id: "deleteBook".to_string(),
+                }]),
+                current: None,
+            },
             tags: Sides {
                 base: Some(vec!["internal".to_string()]),
                 current: None,
@@ -186,6 +194,10 @@ mod tests {
         assert_eq!(value["base"]["ref"], "origin/main");
         assert_eq!(value["policy"]["exempt_tags"][0], "internal");
         assert_eq!(value["changes"][0]["exempt"]["base"], true);
+        assert_eq!(
+            value["changes"][0]["affected_operations"]["base"][0]["operation_id"],
+            "deleteBook"
+        );
         assert_eq!(value["summary"]["gating"], 0);
     }
 
