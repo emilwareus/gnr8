@@ -1522,25 +1522,33 @@ fn compare_fields(
                         format!("field `{name}` documentation changed"),
                     );
                 }
-                compare_enum(
-                    &field.meta.constraints.enum_values,
-                    &current_field.meta.constraints.enum_values,
-                    &subject,
-                    directions,
-                    scope,
-                    out,
-                );
-                if enum_source_order_changed(
-                    &field.meta.constraints.enum_values,
-                    &current_field.meta.constraints.enum_values,
-                ) {
-                    out.push(
+                // An imported OpenAPI inline enum is represented as `Type::Enum` for SDK typing
+                // and mirrored in field constraints for exact schema keywords. It is one public
+                // fact, and `compare_type` immediately above already reported its membership and
+                // order. Constraint-only string enums still need this separate path.
+                let constraints_mirror_type = enum_constraints_mirror_type(field)
+                    && enum_constraints_mirror_type(current_field);
+                if !constraints_mirror_type {
+                    compare_enum(
+                        &field.meta.constraints.enum_values,
+                        &current_field.meta.constraints.enum_values,
+                        &subject,
+                        directions,
                         scope,
-                        ChangeKind::DocOnly,
-                        "schema.enum.order.changed",
-                        Some(subject.clone()),
-                        format!("field `{name}` enum declaration order changed"),
+                        out,
                     );
+                    if enum_source_order_changed(
+                        &field.meta.constraints.enum_values,
+                        &current_field.meta.constraints.enum_values,
+                    ) {
+                        out.push(
+                            scope,
+                            ChangeKind::DocOnly,
+                            "schema.enum.order.changed",
+                            Some(subject.clone()),
+                            format!("field `{name}` enum declaration order changed"),
+                        );
+                    }
                 }
                 let mut base_meta = field.meta.clone();
                 let mut current_meta = current_field.meta.clone();
@@ -1580,6 +1588,16 @@ fn compare_fields(
             );
         }
     }
+}
+
+fn enum_constraints_mirror_type(field: &Field) -> bool {
+    let Type::Enum(type_values) = &field.schema else {
+        return false;
+    };
+    let constraint_values = &field.meta.constraints.enum_values;
+    !constraint_values.is_empty()
+        && type_values.iter().collect::<BTreeSet<_>>()
+            == constraint_values.iter().collect::<BTreeSet<_>>()
 }
 
 fn compare_field_axes(
@@ -2639,6 +2657,80 @@ mod tests {
         assert_eq!(report.changes.len(), 1, "{:?}", report.changes);
         assert_eq!(report.changes[0].code, "schema.enum.order.changed");
         assert_eq!(report.changes[0].kind, ChangeKind::DocOnly);
+        assert_eq!(
+            report.changes[0].subject.as_deref(),
+            Some("Payload::input.state")
+        );
+    }
+
+    #[test]
+    fn mirrored_openapi_inline_enum_is_reported_once() {
+        let inline_enum_field = |values: &[&str]| {
+            let mut field = field("state");
+            let values = values.iter().map(ToString::to_string).collect::<Vec<_>>();
+            field.schema = Type::Enum(values.clone());
+            field.meta.constraints.enum_values = values;
+            field
+        };
+        let base = request_graph(
+            &[],
+            "Payload::input",
+            vec![schema(
+                "Payload::input",
+                vec![inline_enum_field(&["active", "paused"])],
+            )],
+        );
+        let current = request_graph(
+            &[],
+            "Payload::input",
+            vec![schema(
+                "Payload::input",
+                vec![inline_enum_field(&["active"])],
+            )],
+        );
+
+        let report = diff_graphs(&base, &current, &BTreeSet::new());
+        assert_eq!(report.changes.len(), 1, "{:?}", report.changes);
+        assert_eq!(report.summary.breaking, 1);
+        assert_eq!(report.summary.gating, 1);
+        assert_eq!(report.changes[0].code, "request.enum.value.removed");
+        assert_eq!(
+            report.changes[0].subject.as_deref(),
+            Some("Payload::input.state")
+        );
+    }
+
+    #[test]
+    fn mirrored_openapi_inline_enum_order_is_reported_once() {
+        let inline_enum_field = |values: &[&str]| {
+            let mut field = field("state");
+            let values = values.iter().map(ToString::to_string).collect::<Vec<_>>();
+            field.schema = Type::Enum(values.clone());
+            field.meta.constraints.enum_values = values;
+            field
+        };
+        let base = request_graph(
+            &[],
+            "Payload::input",
+            vec![schema(
+                "Payload::input",
+                vec![inline_enum_field(&["active", "paused"])],
+            )],
+        );
+        let current = request_graph(
+            &[],
+            "Payload::input",
+            vec![schema(
+                "Payload::input",
+                vec![inline_enum_field(&["paused", "active"])],
+            )],
+        );
+
+        let report = diff_graphs(&base, &current, &BTreeSet::new());
+        assert_eq!(report.changes.len(), 1, "{:?}", report.changes);
+        assert_eq!(report.summary.doc_only, 1);
+        assert_eq!(report.summary.gating, 0);
+        assert_eq!(report.changes[0].code, "schema.enum.order.changed");
         assert_eq!(
             report.changes[0].subject.as_deref(),
             Some("Payload::input.state")
