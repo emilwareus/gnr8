@@ -1260,10 +1260,14 @@ fn compare_schemas(base: &GraphIndex<'_>, current: &GraphIndex<'_>, out: &mut Co
                     &scope,
                     out,
                 );
+                // `compare_type` reports order changes carried by the public type itself, including
+                // inline enums. `enum_source_order` is the separate declaration-order channel for a
+                // named enum whose normalized body remains lexical; avoid reporting both channels
+                // when a configured order made the same change visible in the body too.
                 if enum_source_order_changed(
                     &schema.enum_source_order,
                     &current_schema.enum_source_order,
-                ) || enum_order_changed(&schema.body, &current_schema.body)
+                ) && !enum_order_changed(&schema.body, &current_schema.body)
                 {
                     out.push(
                         &scope,
@@ -1358,6 +1362,15 @@ fn compare_type(
         }
         (Type::Enum(base_values), Type::Enum(current_values)) => {
             compare_enum(base_values, current_values, subject, directions, scope, out);
+            if enum_order_changed(base, current) {
+                out.push(
+                    scope,
+                    ChangeKind::DocOnly,
+                    "schema.enum.order.changed",
+                    Some(subject.to_string()),
+                    format!("enum `{subject}` declaration order changed"),
+                );
+            }
         }
         (Type::Array(base_item), Type::Array(current_item)) => compare_type(
             base_item,
@@ -1840,23 +1853,16 @@ fn schema_scope(
     let current_affected = current_side.as_ref().map(|(_, _, operations)| {
         affected_operations(current_index.graph, operations.iter().copied())
     });
-    let has_multiple_operations = base_affected
+    let named_operations: BTreeSet<&AffectedOperation> = base_affected
         .as_ref()
-        .is_some_and(|operations| operations.len() > 1)
-        || current_affected
-            .as_ref()
-            .is_some_and(|operations| operations.len() > 1);
-    let named_operation = if has_multiple_operations {
-        None
+        .into_iter()
+        .chain(current_affected.as_ref())
+        .flat_map(|operations| operations.iter())
+        .collect();
+    let named_operation = if named_operations.len() == 1 {
+        named_operations.iter().next().copied()
     } else {
-        current_affected
-            .as_ref()
-            .and_then(|operations| single_operation(operations))
-            .or_else(|| {
-                base_affected
-                    .as_ref()
-                    .and_then(|operations| single_operation(operations))
-            })
+        None
     };
     Scope {
         operation: named_operation.map(|operation| operation.operation.clone()),
@@ -1893,13 +1899,6 @@ fn affected_operations<'a>(
     affected.sort();
     affected.dedup();
     affected
-}
-
-fn single_operation(operations: &[AffectedOperation]) -> Option<&AffectedOperation> {
-    let [operation] = operations else {
-        return None;
-    };
-    Some(operation)
 }
 
 fn document_scope(base: &GraphIndex<'_>, current: &GraphIndex<'_>) -> Scope {
@@ -2562,6 +2561,40 @@ mod tests {
     }
 
     #[test]
+    fn inline_type_enum_order_change_is_documentation_only() {
+        let inline_enum_field = |values: &[&str]| {
+            let mut field = field("state");
+            field.schema = Type::Enum(values.iter().map(ToString::to_string).collect());
+            field
+        };
+        let base = request_graph(
+            &[],
+            "Payload::input",
+            vec![schema(
+                "Payload::input",
+                vec![inline_enum_field(&["active", "paused"])],
+            )],
+        );
+        let current = request_graph(
+            &[],
+            "Payload::input",
+            vec![schema(
+                "Payload::input",
+                vec![inline_enum_field(&["paused", "active"])],
+            )],
+        );
+
+        let report = diff_graphs(&base, &current, &BTreeSet::new());
+        assert_eq!(report.changes.len(), 1, "{:?}", report.changes);
+        assert_eq!(report.changes[0].code, "schema.enum.order.changed");
+        assert_eq!(report.changes[0].kind, ChangeKind::DocOnly);
+        assert_eq!(
+            report.changes[0].subject.as_deref(),
+            Some("Payload::input.state")
+        );
+    }
+
+    #[test]
     fn schema_gate_uses_transitive_most_checked_consumer_and_safe_defaults() {
         let leaf_base = schema("Leaf::input", vec![field("value")]);
         let leaf_current = schema("Leaf::input", Vec::new());
@@ -2796,6 +2829,36 @@ mod tests {
                 .expect("current consumers")
                 .len(),
             2
+        );
+
+        let mut different_current = request_graph(
+            &[],
+            "Shared::input",
+            vec![schema("Shared::input", Vec::new())],
+        );
+        different_current.operations[0].id = "second".to_string();
+        different_current.operations[0].path = "/second".to_string();
+        let report = diff_graphs(&base, &different_current, &BTreeSet::new());
+        let finding = change(&report, "request.property.removed");
+        assert!(finding.operation.is_none());
+        assert!(finding.operation_id.is_none());
+        assert_eq!(
+            finding
+                .affected_operations
+                .base
+                .as_ref()
+                .expect("base consumers")[0]
+                .operation_id,
+            "listBooks"
+        );
+        assert_eq!(
+            finding
+                .affected_operations
+                .current
+                .as_ref()
+                .expect("current consumers")[0]
+                .operation_id,
+            "second"
         );
     }
 
@@ -3303,14 +3366,23 @@ mod tests {
                 id: "State".to_string(),
                 name: "State".to_string(),
                 body: Type::Enum(vec!["active".to_string(), "paused".to_string()]),
-                enum_source_order: Vec::new(),
+                enum_source_order: vec!["active".to_string(), "paused".to_string()],
                 provenance: span("models.rs"),
             }],
             ..ApiGraph::default()
         };
         let mut current = base.clone();
         current.schemas[0].body = Type::Enum(vec!["paused".to_string(), "active".to_string()]);
+        current.schemas[0].enum_source_order = vec!["paused".to_string(), "active".to_string()];
         let report = diff_graphs(&base, &current, &BTreeSet::new());
+        assert_eq!(report.changes.len(), 1);
+        assert_eq!(report.changes[0].code, "schema.enum.order.changed");
+        assert_eq!(report.changes[0].kind, ChangeKind::DocOnly);
+
+        let mut normalized_current = base.clone();
+        normalized_current.schemas[0].enum_source_order =
+            vec!["paused".to_string(), "active".to_string()];
+        let report = diff_graphs(&base, &normalized_current, &BTreeSet::new());
         assert_eq!(report.changes.len(), 1);
         assert_eq!(report.changes[0].code, "schema.enum.order.changed");
         assert_eq!(report.changes[0].kind, ChangeKind::DocOnly);
