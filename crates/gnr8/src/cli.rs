@@ -1,8 +1,8 @@
 //! The gnr8 command-line surface, defined with the clap derive API.
 //!
 //! Commands either scaffold/teach (`init`, `guide`), run the project-local `.gnr8` pipeline
-//! (`generate`, `check`, `watch`, `doctor`), or inspect source facts directly (`inspect`). The global
-//! `--json` flag gives agents machine-readable output where useful.
+//! (`generate`, `check`, `changes`, `watch`, `doctor`), or inspect source facts directly (`inspect`).
+//! The global `--json` flag gives agents machine-readable output where useful.
 
 use clap::{Parser, Subcommand, ValueEnum};
 
