@@ -924,8 +924,8 @@ fn compare_existing_parameter(
     let current_openapi = parameter_openapi_value(current);
     let mut base_structural = base_openapi.clone();
     let mut current_structural = current_openapi.clone();
-    strip_documentation(&mut base_structural);
-    strip_documentation(&mut current_structural);
+    strip_parameter_documentation(&mut base_structural);
+    strip_parameter_documentation(&mut current_structural);
     if base.style != current.style
         || base.explode != current.explode
         || base.allow_reserved != current.allow_reserved
@@ -955,22 +955,106 @@ fn parameter_openapi_value(parameter: &Param) -> serde_json::Value {
     serde_json::json!({ "content": parameter.openapi_content, "fields": fields })
 }
 
-fn strip_documentation(value: &mut serde_json::Value) {
-    match value {
-        serde_json::Value::Object(fields) => {
-            for key in ["deprecated", "description", "example", "examples", "title"] {
-                fields.remove(key);
-            }
-            for child in fields.values_mut() {
-                strip_documentation(child);
+fn strip_parameter_documentation(value: &mut serde_json::Value) {
+    let Some(wrapper) = value.as_object_mut() else {
+        return;
+    };
+    if let Some(fields) = wrapper
+        .get_mut("fields")
+        .and_then(serde_json::Value::as_object_mut)
+    {
+        // These are annotations only at the Parameter Object level. Do not recursively erase
+        // same-named members from vendor-extension payloads: extension values are opaque public
+        // data, and `{"x-client": {"description": "v2"}}` is not a parameter description.
+        for key in ["deprecated", "description", "example", "examples"] {
+            fields.remove(key);
+        }
+        if let Some(schema) = fields.get_mut("schema") {
+            strip_schema_documentation(schema);
+        }
+    }
+    if let Some(content) = wrapper.get_mut("content") {
+        strip_parameter_content_documentation(content);
+    }
+}
+
+fn strip_parameter_content_documentation(value: &mut serde_json::Value) {
+    let Some(content) = value.as_object_mut() else {
+        return;
+    };
+    for media in content.values_mut() {
+        let Some(media) = media.as_object_mut() else {
+            continue;
+        };
+        media.remove("example");
+        media.remove("examples");
+        if let Some(schema) = media.get_mut("schema") {
+            strip_schema_documentation(schema);
+        }
+    }
+}
+
+fn strip_schema_documentation(value: &mut serde_json::Value) {
+    let Some(schema) = value.as_object_mut() else {
+        return;
+    };
+    for key in [
+        "$comment",
+        "deprecated",
+        "description",
+        "example",
+        "examples",
+        "externalDocs",
+        "title",
+    ] {
+        schema.remove(key);
+    }
+
+    for keyword in [
+        "additionalProperties",
+        "contains",
+        "contentSchema",
+        "else",
+        "if",
+        "items",
+        "not",
+        "propertyNames",
+        "then",
+        "unevaluatedItems",
+        "unevaluatedProperties",
+    ] {
+        if let Some(child) = schema.get_mut(keyword) {
+            strip_schema_documentation(child);
+        }
+    }
+    for keyword in ["allOf", "anyOf", "oneOf", "prefixItems"] {
+        if let Some(children) = schema
+            .get_mut(keyword)
+            .and_then(serde_json::Value::as_array_mut)
+        {
+            for child in children {
+                strip_schema_documentation(child);
             }
         }
-        serde_json::Value::Array(values) => {
-            for child in values {
-                strip_documentation(child);
+    }
+    for keyword in [
+        "$defs",
+        "definitions",
+        "dependentSchemas",
+        "patternProperties",
+        "properties",
+    ] {
+        if let Some(children) = schema
+            .get_mut(keyword)
+            .and_then(serde_json::Value::as_object_mut)
+        {
+            // The map key is a schema/property identifier, not a JSON Schema keyword. Preserve a
+            // property literally named `description`, then remove annotations only inside its
+            // schema value.
+            for child in children.values_mut() {
+                strip_schema_documentation(child);
             }
         }
-        _ => {}
     }
 }
 
@@ -3579,6 +3663,50 @@ mod tests {
 
         let removed = diff_graphs(&base, &graph_with_tags(&[]), &BTreeSet::new());
         assert!(change(&removed, "request.parameter.removed").span.is_none());
+    }
+
+    #[test]
+    fn parameter_extension_members_named_like_documentation_remain_structural() {
+        let mut base = graph_with_tags(&[]);
+        base.operations[0].params.push(parameter(false));
+        base.operations[0].params[0].openapi_fields.push((
+            "x-client".to_string(),
+            serde_json::json!({"description": "send compact values"}),
+        ));
+        let mut current = base.clone();
+        current.operations[0].params[0].openapi_fields[0].1 =
+            serde_json::json!({"description": "send expanded values"});
+
+        let report = diff_graphs(&base, &current, &BTreeSet::new());
+        assert_eq!(report.changes.len(), 1, "{:?}", report.changes);
+        let finding = change(&report, "request.parameter.serialization.changed");
+        assert_eq!(finding.kind, ChangeKind::Breaking);
+    }
+
+    #[test]
+    fn nested_parameter_schema_annotations_remain_documentation_only() {
+        let mut base = graph_with_tags(&[]);
+        base.operations[0].params.push(parameter(false));
+        base.operations[0].params[0].openapi_fields.push((
+            "schema".to_string(),
+            serde_json::json!({
+                "type": "object",
+                "properties": {
+                    "description": {
+                        "type": "string",
+                        "description": "old prose"
+                    }
+                }
+            }),
+        ));
+        let mut current = base.clone();
+        current.operations[0].params[0].openapi_fields[0].1["properties"]["description"]
+            ["description"] = serde_json::json!("new prose");
+
+        let report = diff_graphs(&base, &current, &BTreeSet::new());
+        assert_eq!(report.changes.len(), 1, "{:?}", report.changes);
+        let finding = change(&report, "request.parameter.documentation.changed");
+        assert_eq!(finding.kind, ChangeKind::DocOnly);
     }
 
     #[test]
