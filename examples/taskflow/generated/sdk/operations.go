@@ -178,6 +178,78 @@ func (c *Client) CreateTask(ctx context.Context, in CreateTaskRequest, opts ...R
 	return out, &APIError{StatusCode: resp.StatusCode}
 }
 
+// DebugTasks Handles the internal GET /tasks/_debug endpoint.
+//
+// The .gnr8/ pipeline
+// keeps this route generated so change reporting can apply explicit tag-based gate policy.
+//
+// GET /tasks/_debug
+func (c *Client) DebugTasks(ctx context.Context, opts ...RequestOption) (TaskList, error) {
+	var out TaskList
+	reqURL := c.baseURL + "/tasks/_debug"
+	selectedAuth := map[string]bool{}
+	if !c.authTransport {
+		if c.apiKeys["ApiKeyAuth"] != "" || c.apiKeys["X-API-Key"] != "" || c.apiKey != "" {
+			selectedAuth["ApiKeyAuth"] = true
+		} else {
+			return out, &AuthConfigurationError{OperationID: "debugTasks"}
+		}
+	}
+	req, err := http.NewRequestWithContext(ctx, "GET", reqURL, nil)
+	if err != nil {
+		return out, err
+	}
+	if selectedAuth["ApiKeyAuth"] {
+		if key := c.apiKeys["ApiKeyAuth"]; key != "" {
+			req.Header.Set("X-API-Key", key)
+		} else if key := c.apiKeys["X-API-Key"]; key != "" {
+			req.Header.Set("X-API-Key", key)
+		} else if c.apiKey != "" {
+			req.Header.Set("X-API-Key", c.apiKey)
+		}
+	}
+	resp, err := c.do(req, runtimeRequestOptions{
+		OperationID:          "debugTasks",
+		PathTemplate:         "/tasks/_debug",
+		Idempotent:           false,
+		IdempotencyKeyHeader: "Idempotency-Key",
+		Options:              newRequestOptions(opts...),
+	})
+	if err != nil {
+		return out, err
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
+		rawBody, _ := io.ReadAll(resp.Body)
+		var jsonBody any
+		if len(rawBody) > 0 {
+			_ = json.Unmarshal(rawBody, &jsonBody)
+		}
+		var typedBody any
+		if typedBody == nil {
+			typedBody = jsonBody
+		}
+		return out, &APIError{
+			StatusCode: resp.StatusCode,
+			Headers:    resp.Header.Clone(),
+			RequestID:  resp.Header.Get("X-Request-ID"),
+			RawBody:    rawBody,
+			JSONBody:   jsonBody,
+			Body:       typedBody,
+			Message:    apiErrorStringField(jsonBody, "message"),
+			Slug:       apiErrorStringField(jsonBody, "slug"),
+			Hints:      apiErrorStringSliceField(jsonBody, "hints"),
+		}
+	}
+	if resp.StatusCode == 200 {
+		if err := json.NewDecoder(resp.Body).Decode(&out); err != nil {
+			return out, err
+		}
+		return out, nil
+	}
+	return out, &APIError{StatusCode: resp.StatusCode}
+}
+
 // DeleteTask Permanently removes one task.
 //
 // DELETE /tasks/{id}

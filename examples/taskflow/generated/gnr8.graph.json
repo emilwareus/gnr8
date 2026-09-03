@@ -24,8 +24,8 @@
             },
             "provenance": {
               "file": "main.go",
-              "start_line": 58,
-              "end_line": 58
+              "start_line": 57,
+              "end_line": 57
             }
           }
         ],
@@ -43,8 +43,8 @@
         ],
         "provenance": {
           "file": "main.go",
-          "start_line": 29,
-          "end_line": 29
+          "start_line": 28,
+          "end_line": 28
         }
       },
       {
@@ -82,8 +82,35 @@
         ],
         "provenance": {
           "file": "main.go",
-          "start_line": 28,
-          "end_line": 28
+          "start_line": 27,
+          "end_line": 27
+        }
+      },
+      {
+        "id": "debugTasks",
+        "method": "GET",
+        "path": "/tasks/_debug",
+        "handler": "debugTasks",
+        "summary": "Handles the internal GET /tasks/_debug endpoint.",
+        "description": "The .gnr8/ pipeline\nkeeps this route generated so change reporting can apply explicit tag-based gate policy.",
+        "group": "tasks",
+        "params": [],
+        "request_body": null,
+        "responses": [
+          {
+            "status": 200,
+            "body": {
+              "ref_id": "TaskList"
+            },
+            "content_types": [
+              "application/json"
+            ]
+          }
+        ],
+        "provenance": {
+          "file": "main.go",
+          "start_line": 35,
+          "end_line": 35
         }
       },
       {
@@ -106,8 +133,8 @@
             },
             "provenance": {
               "file": "main.go",
-              "start_line": 88,
-              "end_line": 88
+              "start_line": 87,
+              "end_line": 87
             }
           }
         ],
@@ -125,8 +152,8 @@
         ],
         "provenance": {
           "file": "main.go",
-          "start_line": 32,
-          "end_line": 32
+          "start_line": 31,
+          "end_line": 31
         }
       },
       {
@@ -149,8 +176,8 @@
             },
             "provenance": {
               "file": "main.go",
-              "start_line": 65,
-              "end_line": 65
+              "start_line": 64,
+              "end_line": 64
             }
           }
         ],
@@ -177,8 +204,8 @@
         ],
         "provenance": {
           "file": "main.go",
-          "start_line": 30,
-          "end_line": 30
+          "start_line": 29,
+          "end_line": 29
         }
       },
       {
@@ -202,8 +229,8 @@
             },
             "provenance": {
               "file": "main.go",
-              "start_line": 77,
-              "end_line": 77
+              "start_line": 76,
+              "end_line": 76
             }
           }
         ],
@@ -233,8 +260,8 @@
         ],
         "provenance": {
           "file": "main.go",
-          "start_line": 31,
-          "end_line": 31
+          "start_line": 30,
+          "end_line": 30
         }
       }
     ],
@@ -862,11 +889,11 @@
         "category": "request_parameter",
         "message": "untyped query param 'status' on GET /tasks: read via c.Query with no binding struct; param type/required-ness under-specified, type inferred as string only (TARGET-API.md §5.4)",
         "file": "main.go",
-        "line": 58,
+        "line": 57,
         "span": {
           "file": "main.go",
-          "start_line": 58,
-          "end_line": 58
+          "start_line": 57,
+          "end_line": 57
         },
         "operation": "GET /tasks",
         "subject": "status"
@@ -880,6 +907,15 @@
         "kind": "apiKey",
         "location": "header",
         "name": "X-API-Key"
+      }
+    ],
+    "operation_docs": [
+      {
+        "operation_id": "debugTasks",
+        "tags": [
+          "internal",
+          "tasks"
+        ]
       }
     ]
   }

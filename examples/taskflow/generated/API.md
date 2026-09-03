@@ -8,6 +8,7 @@ Base path: `/`
 |--------|------|-----------|
 | GET | `/tasks` | listTasks |
 | POST | `/tasks` | createTask |
+| GET | `/tasks/_debug` | debugTasks |
 | DELETE | `/tasks/{id}` | deleteTask |
 | GET | `/tasks/{id}` | getTask |
 | PUT | `/tasks/{id}` | updateTask |

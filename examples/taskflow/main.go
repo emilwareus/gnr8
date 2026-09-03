@@ -20,8 +20,7 @@ func main() {
 // registerRoutes mounts a static route group at /tasks. gnr8 extracts that group
 // prefix from source; SetBasePath is reserved for an external mount prefix.
 // Note the /_debug route: it is a real internal endpoint that the
-// .gnr8/ lifecycle's custom DropDebugRoutes transform removes before generation,
-// so it never reaches the OpenAPI document or the SDK.
+// .gnr8/ pipeline keeps in every target and marks with the standard "internal" tag.
 func registerRoutes(r *gin.Engine) {
 	tasks := r.Group("/tasks")
 	{
@@ -31,8 +30,8 @@ func registerRoutes(r *gin.Engine) {
 		tasks.PUT("/:id", updateTask)
 		tasks.DELETE("/:id", deleteTask)
 
-		// An internal diagnostics endpoint. It is genuine code, but it should not
-		// be part of the public API surface — the custom transform drops it.
+		// An internal diagnostics endpoint. It stays in the API surface and carries
+		// a standard tag so change-gate policy remains explicit at invocation time.
 		tasks.GET("/_debug", debugTasks)
 	}
 }
@@ -89,9 +88,8 @@ func deleteTask(c *gin.Context) {
 	c.JSON(http.StatusOK, ErrorResponse{Message: "deleted " + id, Code: "ok"})
 }
 
-// debugTasks handles the internal GET /tasks/_debug endpoint. The .gnr8/ custom
-// transform removes this route before generation, so it is absent from the
-// generated OpenAPI + SDK.
+// debugTasks handles the internal GET /tasks/_debug endpoint. The .gnr8/ pipeline
+// keeps this route generated so change reporting can apply explicit tag-based gate policy.
 func debugTasks(c *gin.Context) {
 	c.JSON(http.StatusOK, TaskList{Tasks: []Task{}})
 }
