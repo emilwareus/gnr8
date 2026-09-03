@@ -58,7 +58,7 @@ pub struct SdkService {
 pub struct SdkOperation {
     /// Stable operation id.
     pub id: String,
-    /// Handler-derived method name source.
+    /// Original source handler symbol.
     pub handler: String,
     /// HTTP method.
     pub method: String,
