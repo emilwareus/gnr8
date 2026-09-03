@@ -152,6 +152,13 @@ fn parse_base_artifact(
             path: artifact_path.to_string(),
             detail: error.to_string(),
         })?;
+    crate::graph_artifact::validate_comparison_identities(&artifact.graph).map_err(|detail| {
+        CoreError::BaseGraphCorrupt {
+            reference: reference.to_string(),
+            path: artifact_path.to_string(),
+            detail,
+        }
+    })?;
     match crate::graph::projection::for_generation(&artifact.graph) {
         Ok(std::borrow::Cow::Borrowed(_)) => {}
         Ok(std::borrow::Cow::Owned(_)) => {
@@ -338,6 +345,33 @@ mod tests {
                 ..
             } if found == "99"
         ));
+    }
+
+    #[test]
+    fn rejects_an_artifact_with_ambiguous_comparison_identities() {
+        let schema = Schema {
+            id: "Duplicate".to_string(),
+            name: "Duplicate".to_string(),
+            body: Type::Primitive(Prim::String),
+            enum_source_order: Vec::new(),
+            provenance: SourceSpan {
+                file: "api.rs".to_string(),
+                start_line: 1,
+                end_line: 1,
+            },
+        };
+        let artifact = GraphArtifact::new(ApiGraph {
+            schemas: vec![schema.clone(), schema],
+            ..ApiGraph::default()
+        });
+        // Bypass `GraphArtifact::to_json`, whose writer correctly refuses this graph, to model a
+        // hand-edited or historical committed artifact reaching the reader.
+        let text = serde_json::to_vec(&artifact).expect("serialize adversarial artifact");
+
+        let error = parse_base_artifact("main", GRAPH_ARTIFACT_PATH, &text)
+            .expect_err("ambiguous base identities must fail");
+        assert!(matches!(error, CoreError::BaseGraphCorrupt { .. }));
+        assert!(error.to_string().contains("duplicate schema id"));
     }
 
     #[test]
