@@ -536,7 +536,10 @@ fn run_generate(force: bool, policy: WorkerPolicy, output: Output) -> Result<()>
         output.verbose_paths("skipped", &outcome.skipped);
     }
     if skipped_count > 0 {
-        bail!("generation incomplete: {skipped_count} protected output(s) were skipped");
+        eprintln!("error: generation incomplete: {skipped_count} protected output(s) were skipped");
+        std::io::stdout().flush()?;
+        std::io::stderr().flush()?;
+        std::process::exit(1);
     }
     Ok(())
 }
