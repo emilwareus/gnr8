@@ -159,6 +159,12 @@ The repo already knows this is the only option and says so in `RequireOperationD
 > operation-exclusion transform**, so an internal route a consumer strips later must not fail the
 > gate before it is stripped.
 
+The route is real: `examples/taskflow/main.go:36` registers `tasks.GET("/_debug", debugTasks)`
+inside `r.Group("/tasks")`, and its own comment calls it "a real internal endpoint"
+(`main.go:22-24`). And the deletion is total — `grep -rc 'debugTasks\|_debug'
+examples/taskflow/generated/` matches **zero** lines across `openapi.yaml`, `API.md`, and all of
+`generated/sdk/`.
+
 Deletion is exactly wrong for Emil's case. An endpoint that seeds test data needs to be **in the
 generated SDK** — that is what the test harness calls — while being **out of the merge-blocking
 contract**. A `retain` that drops it makes the SDK unable to reach it; keeping it makes it block
