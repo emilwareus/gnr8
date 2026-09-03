@@ -1170,8 +1170,19 @@ fn security_change_kind(base: &[Vec<String>], current: &[Vec<String>]) -> Change
     if !base_public && current_public {
         return ChangeKind::Additive;
     }
-    if base.iter().collect::<BTreeSet<_>>() == current.iter().collect::<BTreeSet<_>>() {
+    let common: BTreeSet<&Vec<String>> = base
+        .iter()
+        .filter(|group| current.contains(group))
+        .collect();
+    let base_common: Vec<&Vec<String>> =
+        base.iter().filter(|group| common.contains(group)).collect();
+    let current_common: Vec<&Vec<String>> = current
+        .iter()
+        .filter(|group| common.contains(group))
+        .collect();
+    if base_common != current_common {
         // Alternative order is generated-client credential preference, not presentation order.
+        // Preserve that signal even when alternatives were added or removed in the same edit.
         return ChangeKind::Breaking;
     }
     let current_is_at_least_as_permissive = base.iter().all(|base_group| {
@@ -3083,6 +3094,21 @@ mod tests {
         assert_eq!(
             change(
                 &diff_graphs(&first_preference, &second_preference, &BTreeSet::new()),
+                "security.operation.changed"
+            )
+            .kind,
+            ChangeKind::Breaking
+        );
+
+        let mut reordered_with_addition = graph_with_tags(&[]);
+        reordered_with_addition.operation_security = vec![policy(&["Key", "Session", "Bearer"])];
+        assert_eq!(
+            change(
+                &diff_graphs(
+                    &first_preference,
+                    &reordered_with_addition,
+                    &BTreeSet::new()
+                ),
                 "security.operation.changed"
             )
             .kind,
