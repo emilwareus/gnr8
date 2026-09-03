@@ -23,6 +23,7 @@ The current research question:
   ([implementation plan](2026-08-27-thin-sdk-worker-boundary-plan.md))
 - [Endpoint classification and breaking-change sensitivity](2026-09-03-endpoint-classification-breaking-changes.md)
   — where an endpoint's audience lives, and how `gnr8 changes` gates on it
+- [API tags and breaking-change gating](2026-09-03-api-tags-breaking-change-gating.md) — replacement design using standard OpenAPI tags
 
 ## Current Position
 
