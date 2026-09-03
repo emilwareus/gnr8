@@ -349,27 +349,11 @@ fn compare_servers(
     scope: &Scope,
     out: &mut Collector,
 ) {
-    let base_urls: Vec<&str> = base
-        .servers
-        .iter()
-        .map(|server| server.url.as_str())
-        .collect();
-    let current_urls: Vec<&str> = current
-        .servers
-        .iter()
-        .map(|server| server.url.as_str())
-        .collect();
-    let base_servers: BTreeMap<&str, Option<&str>> = base
-        .servers
-        .iter()
-        .map(|server| (server.url.as_str(), server.description.as_deref()))
-        .collect();
-    let current_servers: BTreeMap<&str, Option<&str>> = current
-        .servers
-        .iter()
-        .map(|server| (server.url.as_str(), server.description.as_deref()))
-        .collect();
-    for (url, description) in &base_servers {
+    let base_urls = distinct_server_urls(base);
+    let current_urls = distinct_server_urls(current);
+    let base_servers = server_descriptions(base);
+    let current_servers = server_descriptions(current);
+    for (url, descriptions) in &base_servers {
         match current_servers.get(url) {
             None => out.push(
                 &scope.at(None),
@@ -378,12 +362,12 @@ fn compare_servers(
                 Some((*url).to_string()),
                 format!("server `{url}` removed"),
             ),
-            Some(current_description) if description != current_description => out.push(
+            Some(current_descriptions) if descriptions != current_descriptions => out.push(
                 scope,
                 ChangeKind::DocOnly,
                 "document.server.description.changed",
                 Some((*url).to_string()),
-                format!("server `{url}` description changed"),
+                format!("server `{url}` entries or descriptions changed"),
             ),
             Some(_) => {}
         }
@@ -445,6 +429,29 @@ fn compare_servers(
             },
         );
     }
+}
+
+fn distinct_server_urls(metadata: &OpenApiMetadataPolicy) -> Vec<&str> {
+    let mut seen = BTreeSet::new();
+    metadata
+        .servers
+        .iter()
+        .filter_map(|server| {
+            let url = server.url.as_str();
+            seen.insert(url).then_some(url)
+        })
+        .collect()
+}
+
+fn server_descriptions(metadata: &OpenApiMetadataPolicy) -> BTreeMap<&str, Vec<Option<&str>>> {
+    let mut descriptions: BTreeMap<&str, Vec<Option<&str>>> = BTreeMap::new();
+    for server in &metadata.servers {
+        descriptions
+            .entry(server.url.as_str())
+            .or_default()
+            .push(server.description.as_deref());
+    }
+    descriptions
 }
 
 fn compare_security_schemes(
@@ -2842,6 +2849,26 @@ mod tests {
         );
         let report = diff_graphs(&exempt_base, &exempt_current, &exemptions(&["internal"]));
         assert!(!change(&report, "document.server.added").gating);
+    }
+
+    #[test]
+    fn duplicate_server_urls_do_not_hide_entry_metadata_changes() {
+        let mut base = graph_with_tags(&[]);
+        base.openapi_metadata.servers = vec![
+            OpenApiServer::new("https://api.example").description("primary"),
+            OpenApiServer::new("https://api.example").description("secondary"),
+        ];
+        let mut current = base.clone();
+        current.openapi_metadata.servers[0].description = Some("renamed".to_string());
+
+        let report = diff_graphs(&base, &current, &BTreeSet::new());
+        let finding = change(&report, "document.server.description.changed");
+        assert_eq!(finding.kind, ChangeKind::DocOnly);
+        assert_eq!(finding.subject.as_deref(), Some("https://api.example"));
+        assert!(!report
+            .changes
+            .iter()
+            .any(|change| change.code == "document.server.order.changed"));
     }
 
     #[test]
