@@ -9,6 +9,29 @@ must move the minor version.
 
 ## Unreleased
 
+### Breaking
+
+- **`OperationSelector` adds the `SourcePrefix` variant.** Custom Rust code that exhaustively matches
+  this public enum must handle the new source-file selector. The host/worker protocol is now version
+  6 so a worker and CLI cannot silently disagree about the stage-plan shape.
+- **`RenameOperation` now controls generated SDK method names in every built-in SDK target.** The
+  transform already changed the canonical graph id and operation file names; Go, Python, and
+  TypeScript emitters now use that same id instead of retaining the original handler symbol.
+
+### Added
+
+- **`gnr8 changes --base <ref> [--exempt-tag <name>]...` classifies committed API changes.** It
+  compares the current projected graph with `generated/gnr8.graph.json` at the base commit, reports
+  breaking, additive, and documentation-only findings in human or JSON form, and exits 1 only when a
+  checked breaking finding exists. Exact standard operation tags can exempt a finding only when
+  every extant side is exempt; schema scope follows all transitive consumers independently on both
+  graphs.
+- **Every successful pipeline emits the versioned `generated/gnr8.graph.json` artifact.** It uses the
+  ordinary generated-output lifecycle and must be committed with the OpenAPI and SDK artifacts.
+- **The GitHub Action can publish API-change reports.** `report-api-changes`, `base-ref`, and
+  `exempt-tags` add Markdown/JSON artifacts, a job summary, a marker-owned pull-request comment when
+  permitted, and a final checked-breaking gate.
+
 ## 0.10.2 — 2026-09-02
 
 ### Changed
