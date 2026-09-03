@@ -589,9 +589,13 @@ and Kubernetes that level is carried by the version identifier itself (`v1alpha1
 `2021-06-04-preview`). Google's visibility labels are the single exception, and AIP-185 frames them as
 versioning by other means — an "ACL'ed API version" whose labels are removed entirely at GA.
 
-Issue #75's ask is therefore genuinely novel in one respect and conventional in another: gating CI on
-a *per-operation* classification is not attested anywhere, but the underlying idea — different parts
-of one surface carry different compatibility promises — is the consensus position everywhere.
+So among the *governance standards*, the differentiator is never an audience label. The one place a
+per-operation label really does gate breaking-change detection is a diff tool rather than a standard —
+oasdiff's `x-stability-level`, covered in §5.4 — and it is the single closest prior art to issue #75's
+ask. Emil's version differs from it in one way that matters: oasdiff's axis is *stability* (how
+finished is this?), Emil's is *audience* (who is promised this?). They are genuinely different
+questions — an endpoint can be rock-stable and still not a customer contract — and conflating them is
+the mistake §6.2 avoids by keeping `Audience` a separate, closed vocabulary from `deprecated`.
 
 ### 5.3 SDK generators: exclusion is a boolean everywhere but Fern
 
