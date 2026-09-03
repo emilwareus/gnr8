@@ -1491,11 +1491,11 @@ fn compare_fields(
     for (name, field) in &current_map {
         if !base_map.contains_key(name) {
             let required = required_on(field, directions.current);
-            let request_break = required && directions.request_or_unconsumed();
-            let prefix = directions.prefix(request_break);
+            // A newly required key changes every payload/model contract, including responses.
+            let prefix = directions.prefix(required);
             out.push(
                 scope,
-                if request_break {
+                if required {
                     ChangeKind::Breaking
                 } else {
                     ChangeKind::Additive
@@ -2220,6 +2220,37 @@ mod tests {
             )
             .kind,
             ChangeKind::Breaking
+        );
+
+        let response_base = response_graph(schema("Added::output", vec![field("existing")]));
+        let mut required_addition = field("count");
+        required_addition.serializer_may_omit = false;
+        let response_current = response_graph(schema(
+            "Added::output",
+            vec![field("existing"), required_addition],
+        ));
+        assert_eq!(
+            change(
+                &diff_graphs(&response_base, &response_current, &BTreeSet::new()),
+                "response.property.added",
+            )
+            .kind,
+            ChangeKind::Breaking
+        );
+
+        let mut optional_addition = field("count");
+        optional_addition.serializer_may_omit = true;
+        let response_current = response_graph(schema(
+            "Added::output",
+            vec![field("existing"), optional_addition],
+        ));
+        assert_eq!(
+            change(
+                &diff_graphs(&response_base, &response_current, &BTreeSet::new()),
+                "response.property.added",
+            )
+            .kind,
+            ChangeKind::Additive
         );
 
         let mut accepts_null = field("value");
