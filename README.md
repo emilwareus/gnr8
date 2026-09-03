@@ -145,7 +145,7 @@ jobs:
       - uses: actions/checkout@v7
         with:
           fetch-depth: 0
-      - uses: oaiz-io/gnr8@v0.10.1
+      - uses: oaiz-io/gnr8@v0.11.0 # first release with API change reporting
         with:
           setup-go: "true"
           report-api-changes: "true"

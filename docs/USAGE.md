@@ -71,9 +71,10 @@ executes every built-in stage itself and asks the worker only for the stages you
 | `gnr8 changes` | `--base <ref>`, repeatable `--exempt-tag <name>` | current pipeline plus the base commit's `generated/gnr8.graph.json` | — | **0 gate passed; 1 checked breaking finding**; 2 on error |
 | `gnr8 watch` | `--debounce-ms N` (def 200) | `.gnr8/` crate (incl. `.gnr8/src/`), src | same as generate, on each change | 0 on Ctrl-C; 2 on error |
 | `gnr8 doctor` | — | `.gnr8/` crate, src, manifest | — | **0 healthy; 1 actionable problem**; 2 on error |
+| `gnr8 inspect routes\|schemas\|graph` | `[<dir>]` (positional, defaults to bundled fixture) | the `<dir>` Go module | — (prints) | 0; 2 on error |
+
 `doctor` probes the **source toolchain** for the detected source language (`go`/`python3`/`node`) — it
 reports `source_toolchain` + the `language` field, not a hardcoded Go probe.
-| `gnr8 inspect routes\|schemas\|graph` | `[<dir>]` (positional, defaults to bundled fixture) | the `<dir>` Go module | — (prints) | 0; 2 on error |
 
 Notes:
 - Missing local cache state is safe: generate adopts byte-identical outputs without rewriting and
