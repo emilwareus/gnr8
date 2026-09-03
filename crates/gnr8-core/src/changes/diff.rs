@@ -1765,8 +1765,8 @@ fn operation_documentation<'a>(
         summary: operation.summary.as_deref(),
         description: operation.description.as_deref(),
         deprecated: policy.is_some_and(|policy| policy.deprecated),
-        request_examples: policy.map(|policy| policy.request_examples.as_slice()),
-        responses: policy.map(|policy| policy.responses.as_slice()),
+        request_examples: policy.map_or(&[], |policy| policy.request_examples.as_slice()),
+        responses: policy.map_or(&[], |policy| policy.responses.as_slice()),
     }
 }
 
@@ -1775,8 +1775,8 @@ struct OperationDocumentation<'a> {
     summary: Option<&'a str>,
     description: Option<&'a str>,
     deprecated: bool,
-    request_examples: Option<&'a [crate::graph::MediaExample]>,
-    responses: Option<&'a [crate::graph::ResponseDocsPolicy]>,
+    request_examples: &'a [crate::graph::MediaExample],
+    responses: &'a [crate::graph::ResponseDocsPolicy],
 }
 
 fn operation_docs_policy<'a>(
@@ -2432,6 +2432,25 @@ mod tests {
         assert_eq!(report.changes.len(), 1, "{:?}", report.changes);
         assert_eq!(report.changes[0].code, "operation.tags.changed");
         assert_eq!(report.changes[0].kind, ChangeKind::DocOnly);
+    }
+
+    #[test]
+    fn policy_presence_without_effective_documentation_is_not_a_change() {
+        let mut grouped_operation = operation();
+        grouped_operation.group = Some("books".to_string());
+        let base = ApiGraph {
+            operations: vec![grouped_operation.clone()],
+            ..ApiGraph::default()
+        };
+        let current = ApiGraph {
+            operations: vec![grouped_operation],
+            operation_docs: vec![policy("listBooks", &["books"])],
+            ..ApiGraph::default()
+        };
+
+        assert!(diff_graphs(&base, &current, &BTreeSet::new())
+            .changes
+            .is_empty());
     }
 
     #[test]
