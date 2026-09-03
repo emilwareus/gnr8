@@ -354,3 +354,133 @@ That single requirement rules option (b)-as-pure-config out as the *storage* loc
 shape: rules in config, resolved value on the graph.
 
 ---
+
+## 4. Verified: issue #75's change categories, mapped to graph facts
+
+Every category in the issue has a home in the graph. This matters for classification because it
+determines what "this change belongs to an internal endpoint" can even mean.
+
+| Issue #75 category | Graph fact | `graph.rs` |
+|---|---|---|
+| operations | `ApiGraph::operations`, sorted by `(path, method)` | `:62` |
+| paths | `Operation::path` + `ApiGraph::base_path` | `:502`, `:69` |
+| methods | `Operation::method` | `:497` |
+| parameters | `Operation::params` → `Param::{name, location, required, schema, default, style, explode}` | `:522`, `:547-567` |
+| request bodies | `request_body`, `request_body_required`, `request_body_content_type` | `:524-530` |
+| responses | `Operation::responses` → `Response::{status, body, body_kind, content_type, content_types}` | `:532`, `:587-604` |
+| schemas | `ApiGraph::schemas` → `Schema::{id, name, body, enum_source_order}` | `:64`, `:661-671` |
+| required fields | derived per direction: `SchemaDirections::field_is_required` | `graph/direction.rs:48-56` |
+| nullability | derived per direction: `SchemaDirections::field_is_nullable` | `graph/direction.rs:65-72` |
+| enums | `Type::Enum(Vec<String>)` + `Schema::enum_source_order` | `facts.rs:341`, `graph.rs:671` |
+| security | `security`, `security_requirements`, `operation_security`, `Operation::security` | `:79-85`, `:535` |
+| operation names | `Operation::id`, plus `OperationDocsPolicy::openapi_operation_id` | `:495`, `:398` |
+| SDK group names | `Operation::group` | `:517` |
+
+Two of these deserve emphasis.
+
+**"Required" and "nullable" are not stored fields — they are direction-dependent derivations.**
+`field_is_required` is a three-arm match over `(request, response)`
+(`crates/gnr8-core/src/graph/direction.rs:48-56`), built from four independent extraction facts on
+`FieldFact` (`deserializer_accepts_absent`, `validator_requires_presence`, `serializer_may_omit`,
+and the null trio). A diff must therefore compare the *derived* value in the *same position*, not the
+raw field, or it will report phantom changes on a schema whose direction set changed.
+
+**`Operation::group` is not cosmetic.** `SdkFileLayout::split()` sets
+`OperationFileSplit::PerTag` (`crates/gnr8-sdk/src/sdk/layout.rs:33-42`), and per-tag emission puts
+operations in a file named for the group, falling back to the synthetic `"default"` group
+(`layout.rs:73-77`, `:114`, `:192`). Renaming a group renames generated SDK files and, in Go and
+TypeScript, the symbols users import. That is why the issue lists it as a breaking-change category
+alongside HTTP facts.
+
+**And the SDK is why `Operation::id` matters at all.** For a pure OpenAPI producer, renaming
+`operationId` is cosmetic. gnr8 generates SDK method names from the graph id, so an id rename is a
+compile error in every consumer — as breaking as deleting the route.
+
+---
+
+## 5. Prior art
+
+### 5.1 Marking an operation internal: four incompatible models, no standard
+
+**There is no spec-native concept.** OpenAPI 3.1.1's Operation Object has `tags`, described as "A list
+of tags for API documentation control … logical grouping of operations by resources or any other
+qualifier", and the Tag Object has exactly three fields — `name`, `description`, `externalDocs`
+([spec.openapis.org/oas/v3.1.1.html](https://spec.openapis.org/oas/v3.1.1.html)). No audience,
+visibility, or access field exists anywhere in the document model.
+
+`deprecated` is a *lifecycle* signal, not an *audience* one, and it is advisory: on the Operation
+Object, "Declares this operation to be deprecated. Consumers SHOULD refrain from usage of the declared
+operation. Default value is `false`." The Schema Object adds no `deprecated` of its own — it inherits
+JSON Schema 2020-12's, whose wording is likewise "applications SHOULD refrain from usage"
+([json-schema.org §9.3](https://json-schema.org/draft/2020-12/json-schema-validation.html)). Nothing
+is removed, and nothing is guaranteed.
+
+Specification Extensions carry an explicit non-promise (3.1.1 §4.9): "The field name MUST begin with
+`x-`, for example, `x-internal-id`. Field names beginning `x-oai-` and `x-oas-` are reserved for uses
+defined by the OpenAPI Initiative", and — the load-bearing sentence — **"Support for any one extension
+is OPTIONAL, and support for one extension does not imply support for others."**
+
+**`x-internal` is not registered.** The OAI extension registry
+([spec.openapis.org/registry/extension](https://spec.openapis.org/registry/extension/)) lists
+`x-codeSamples`, `x-data-classification`, `x-sensitive-data`, the `x-jsonschema-*` and `x-oai-*`
+families, and a handful more. `x-internal`, `x-hidden`, `x-private`, and `x-visibility` are all
+absent.
+
+What the spec *does* bless is omission. §4.10 "Security Filtering": "Some objects in the OpenAPI
+Specification MAY be declared and remain empty, or be completely removed … The reasoning is to allow
+an additional layer of access control over the documentation", and it states this behaviour is "not
+part of the specification itself."
+
+The ecosystem then splits four ways:
+
+| Model | Who | Mechanism | What ships to the client |
+|---|---|---|---|
+| **Omit at generation** | FastAPI, NestJS, ASP.NET Core | `include_in_schema=False`; `@ApiExcludeEndpoint()`; `[ApiExplorerSettings(IgnoreApi = true)]` / `ExcludeFromDescription()` | nothing — the operation is absent, no key emitted |
+| **Mark, delete at build** | Redocly CLI, openapi-filter | `x-internal: true` + a bundling decorator | nothing, *after* the extra build step |
+| **Mark, filter at render** | Stoplight Elements, Mintlify | `x-internal` + `hideInternal` prop; `x-hidden` / `x-excluded` | everything — hiding is the consumer's opt-in |
+| **Platform ACL** | Gravitee (root-level `visibility` inside `x-graviteeio-definition`), Azure APIM products/groups | not an operation property at all | n/a |
+
+Details worth carrying:
+
+- **FastAPI** ([docs](https://fastapi.tiangolo.com/advanced/path-operation-advanced-configuration/)):
+  "To exclude a *path operation* from the generated OpenAPI schema (and thus, from the automatic
+  documentation systems), use the parameter `include_in_schema` and set it to `False`." The route
+  stays live and routable; only the document omits it. Router and route compose with `and`, so a
+  `False` upstream cannot be re-enabled by a child.
+- **NestJS** ([docs.nestjs.com/openapi/decorators](https://docs.nestjs.com/openapi/decorators)):
+  `@ApiExcludeController()` on a controller, `@ApiExcludeEndpoint()` on a method. Same shape — route
+  live, document silent.
+- **ASP.NET Core**: `[ApiExplorerSettings(IgnoreApi = true)]` suppresses the `ApiDescription` itself
+  ("If `true` then no `ApiDescription` objects will be created for the associated controller or
+  action" —
+  [learn.microsoft.com](https://learn.microsoft.com/en-us/dotnet/api/microsoft.aspnetcore.mvc.apiexplorersettingsattribute.ignoreapi)),
+  so *every* .NET OpenAPI generator loses sight of it at once. Minimal APIs use
+  [`ExcludeFromDescription()`](https://learn.microsoft.com/en-us/aspnet/core/fundamentals/openapi/include-metadata).
+- **Redocly** ([remove-x-internal decorator](https://redocly.com/docs/cli/decorators/remove-x-internal)):
+  "Removes nodes that have a specific flag property. Nodes that don't have the flag property defined
+  are not impacted." The property name is *configurable* — `internalFlagProperty`, default
+  `x-internal`. Their own guide adds the caveat: "**Security through obscurity** — … Removing APIs
+  from documentation is not a security mechanism."
+- **Redoc, the open-source renderer, does not implement `x-internal` at all** — the flag only takes
+  effect if the document is first run through Redocly CLI's bundler.
+- **Stoplight Elements** ([elements-options](https://github.com/stoplightio/elements/blob/main/docs/getting-started/elements/elements-options.md)):
+  "`hideInternal` - Pass `\"true\"` to filter out any content which has been marked as internal with
+  `x-internal`." It defaults to **off**, deliberately —
+  [issue #1266](https://github.com/stoplightio/elements/issues/1266) records the reasoning: "Elements
+  OSS will not know anything about a user being logged in or not, so it cannot know if it should
+  display internal or not, so we can leave that up to the caller to decide."
+- **The spelling is not even stable across the "mark" camp.** Redocly `x-internal` (configurable),
+  [openapi-filter](https://github.com/Mermade/openapi-filter) `--flags x-internal` (its own README
+  demos `x-private x-hidden`), Mintlify `x-hidden` *and* `x-excluded` with different meanings, and
+  [LoopBack 4](https://github.com/loopbackio/loopback-next) `x-visibility: documented|undocumented`.
+  LoopBack's [PR #1896](https://github.com/loopbackio/loopback-next/pull/1896) explicitly rejected a
+  boolean `x-internal` in review in favour of the open-valued enum.
+
+**The finding that matters for gnr8.** "Internal" is at least two requirements wearing one name — the
+spec's own §4.10 distinguishes an empty Path Item ("the viewer will be aware that the path exists")
+from removing the path outright, and Mintlify needed two keys for exactly that. And every "mark"
+mechanism has the same default failure mode: an unmodified renderer shows the operation. There is
+nothing here to *comply* with, because there is no single thing to comply with — which, conveniently,
+is also what makes borrowing safe.
+
+---
