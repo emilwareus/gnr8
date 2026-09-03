@@ -143,7 +143,10 @@ fn generated_sdks_support_configurable_surface_and_compile() {
     let ts_op = std::fs::read_to_string(root.join("ts-sdk/api_goals.ts"))
         .expect("read grouped TypeScript operation");
     assert!(ts_op.contains("authorization"), "{ts_op}");
-    assert!(ts_op.contains("async submitGoal("), "{ts_op}");
+    assert!(
+        ts_op.contains("export const submitGoal = async function ("),
+        "{ts_op}"
+    );
 
     if command_available("go", "version") {
         std::fs::write(root.join("go-sdk/go.mod"), "module sdktest\n\ngo 1.26\n")
