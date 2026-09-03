@@ -1232,16 +1232,16 @@ fn security_change_kind(base: &[Vec<String>], current: &[Vec<String>]) -> Change
         .iter()
         .filter(|group| current.contains(group))
         .collect();
-    let base_common: Vec<&Vec<String>> =
-        base.iter().filter(|group| common.contains(group)).collect();
-    let current_common: Vec<&Vec<String>> = current
-        .iter()
-        .filter(|group| common.contains(group))
-        .collect();
-    if base_common != current_common {
-        // Alternative order is generated-client credential preference, not presentation order.
-        // Preserve that signal even when alternatives were added or removed in the same edit.
-        return ChangeKind::Breaking;
+    for group in common.into_iter().filter(|group| !group.is_empty()) {
+        let base_position = base.iter().position(|candidate| candidate == group);
+        let current_position = current.iter().position(|candidate| candidate == group);
+        if base_position != current_position {
+            // Alternative position is generated-client credential preference, not presentation
+            // order. A new alternative inserted ahead of an unchanged one can preempt it just as
+            // surely as swapping two existing alternatives, so preserve absolute common positions
+            // even when alternatives were added or removed in the same edit.
+            return ChangeKind::Breaking;
+        }
     }
     let current_is_at_least_as_permissive = base.iter().all(|base_group| {
         current.iter().any(|current_group| {
@@ -3516,6 +3516,28 @@ mod tests {
             )
             .kind,
             ChangeKind::Breaking
+        );
+
+        let mut inserted_preference = graph_with_tags(&[]);
+        inserted_preference.operation_security = vec![policy(&["Session", "Bearer", "Key"])];
+        assert_eq!(
+            change(
+                &diff_graphs(&first_preference, &inserted_preference, &BTreeSet::new()),
+                "security.operation.changed"
+            )
+            .kind,
+            ChangeKind::Breaking
+        );
+
+        let mut appended_preference = graph_with_tags(&[]);
+        appended_preference.operation_security = vec![policy(&["Bearer", "Key", "Session"])];
+        assert_eq!(
+            change(
+                &diff_graphs(&first_preference, &appended_preference, &BTreeSet::new()),
+                "security.operation.changed"
+            )
+            .kind,
+            ChangeKind::Additive
         );
 
         let public = graph_with_tags(&[]);
