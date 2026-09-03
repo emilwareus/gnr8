@@ -17,6 +17,14 @@ pub(crate) struct SchemaDirections {
     pub(crate) response: bool,
 }
 
+/// HTTP operations and non-HTTP roots that transitively reach each component schema.
+pub(crate) struct SchemaConsumers<'a> {
+    /// Operation indexes keyed by reached schema id.
+    pub(crate) operations: BTreeMap<&'a str, BTreeSet<usize>>,
+    /// Schemas reached from an explicit non-HTTP input/output root.
+    pub(crate) non_http: BTreeSet<&'a str>,
+}
+
 impl SchemaDirections {
     /// A parameter is a request, and so is every schema inline within one.
     pub(crate) const REQUEST: Self = Self {
@@ -131,6 +139,60 @@ pub(crate) fn schema_directions(graph: &ApiGraph) -> BTreeMap<&str, SchemaDirect
             )
         })
         .collect()
+}
+
+/// Map every component schema to the consumers that transitively reach it.
+///
+/// This uses the same roots and reference walk as [`schema_directions`]. Keeping the walk here means
+/// change gating cannot disagree with the generation projection about what one schema reaches.
+pub(crate) fn schema_consumers(graph: &ApiGraph) -> SchemaConsumers<'_> {
+    let bodies: BTreeMap<&str, &Type> = graph
+        .schemas
+        .iter()
+        .map(|schema| (schema.id.as_str(), &schema.body))
+        .collect();
+    let mut operations: BTreeMap<&str, BTreeSet<usize>> = bodies
+        .keys()
+        .map(|schema_id| (*schema_id, BTreeSet::new()))
+        .collect();
+    for (index, operation) in graph.operations.iter().enumerate() {
+        let mut roots = Vec::new();
+        if let Some(body) = &operation.request_body {
+            roots.push(body.ref_id.as_str());
+        }
+        for param in &operation.params {
+            collect_named_refs(&param.schema, &mut roots);
+            for value in param
+                .openapi_content
+                .iter()
+                .chain(param.openapi_fields.iter().map(|(_, value)| value))
+            {
+                collect_json_component_refs(value, &bodies, &mut roots);
+            }
+        }
+        for response in &operation.responses {
+            if let Some(body) = &response.body {
+                roots.push(body.ref_id.as_str());
+            }
+        }
+        for schema_id in reachable_schemas(roots, &bodies) {
+            if let Some(consumers) = operations.get_mut(schema_id) {
+                consumers.insert(index);
+            }
+        }
+    }
+    let non_http = reachable_schemas(
+        graph
+            .schema_uses
+            .iter()
+            .map(|root| root.schema_id.as_str())
+            .collect(),
+        &bodies,
+    );
+    SchemaConsumers {
+        operations,
+        non_http,
+    }
 }
 
 /// The positions `schema_id` is reached from, or [`SchemaDirections::default`] for an id the map does
