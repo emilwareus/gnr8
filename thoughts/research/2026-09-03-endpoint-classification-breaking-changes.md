@@ -205,3 +205,100 @@ into the parameter's preserved fields, which the graph carries verbatim as
 `Param::openapi_fields` (`graph.rs:580`). No `x-` key anywhere in the repo is *branched on*.
 
 ---
+
+## 2. Verified: the three candidate homes, tested against this checkout
+
+### 2.1 (a) "In-source" — the tension dissolves once you look at what the graph already carries
+
+CLAUDE.md 0.1 closes the obvious door: "There is **no directive syntax, no marker prefix, and no
+key/value grammar inside the comment** — not `@Summary`, not `gnr8:summary`, not anything." 0.5 closes
+the subtle one: "If a change ever introduces matching, tokenizing, or branching on *content* inside a
+comment, that is a dialect and it must be rejected in review." So a `// internal` comment, an
+`x-internal`-in-a-docstring, and a magic first word are all out — not on a technicality, but because
+each would make gnr8's behaviour depend on a grammar someone has to learn and maintain.
+
+But "in-source" was never really about comments. The facts that make an endpoint internal in a real Go
+or Nest codebase are *structural*, and the graph already carries three of them, each derived purely
+from the source language's own routing constructs:
+
+| Graph fact | `graph.rs` | What it is in source |
+|---|---|---|
+| `Operation::group` | `:517` | "Optional static route-group/tag metadata" — a Gin `r.Group("/internal")`, a FastAPI `APIRouter(prefix=…)`, a Nest `@Controller(…)` |
+| `Operation::middleware` | `:520` | "Source middleware symbols applied before the handler" — e.g. an internal-auth guard |
+| `Operation::provenance.file` | `:540`, `:804` | module-relative source file of the route registration |
+
+Router prefixes and controller prefixes are *statically composed into the path* as of P0.4
+(`PLAN.md`, "Preserve static router/controller prefixes") — that item's validation note records that
+`pyextract/routes.py` and `tsextract/routes.js` used to discard them, and that this was fixed. So the
+group structure a developer sees in the code is already faithfully in the graph.
+
+**This is the resolution of the brief's tension.** Source-structure-based classification does not need
+a new reading mechanism, because gnr8 already reads route groups, middleware, and file provenance as
+first-class typed facts. What is missing is not a way to *read* structure, it is a way to *say what
+structure means* — and saying what a fact means is, by rule 4, the config's job. "Close to the code"
+and "in the pipeline" are not competing homes; the evidence lives in the code and the interpretation
+lives in the pipeline.
+
+The refactor-survival argument follows from the same table. A rule keyed on `group` or `middleware`
+survives file moves and renames, because moving a handler out of `r.Group("/internal")` is exactly
+the act of making it public — the rule tracks the thing a reviewer would look at anyway. A rule keyed
+on `provenance.file` does not survive a file move, and that is a real, if acceptable, weakness
+(`GroupRule::SourcePrefix` has it today).
+
+### 2.2 (b) Pipeline config — fits, with one honest cost
+
+Rule 4 is direct: "What the source can't express comes from user code-as-config." Which endpoints are
+customer contracts is a *product* fact — the same category as security schemes. Two teams can ship
+byte-identical Go and disagree about which routes they support.
+
+It also lands on the existing machinery: a `Transform` writing a sorted side-table keyed by operation
+id (§1.3), selected by the existing `OperationSelector` (§1.4), ordered by composition order (§1.6).
+Nothing new is invented.
+
+The honest cost is the one CLAUDE.md itself names in rule 4: "A rule that forces a `.gnr8/` edit every
+time someone adds an endpoint is a bad rule … it lets new routes ship undocumented, and it scales as a
+central table nobody maintains."
+
+A per-operation-id table would be exactly that bad rule. A rule keyed on *structure* — `PathPrefix`,
+`Middleware`, group, source prefix — is not: adding a route under `/internal` classifies it with no
+`.gnr8/` edit at all. Rule 4's own next sentence draws that line: "Reach for config when a fact spans
+operations or lives outside the handler entirely." A classification policy spans operations by
+construction.
+
+### 2.3 (c) Purely derived on the graph — cannot be the whole answer, and must not be the default
+
+For gnr8 to derive classification with no user input, it would have to *guess* — path prefixes like
+`/internal` or `/_debug`, or a handler-name convention. Three problems, in increasing severity:
+
+1. It is gnr8 inventing a convention users must then comply with. That is rule 0 pointed inward.
+2. It cannot express the exception ("this one endpoint under `/v1` is internal"), so it would need a
+   config override alongside it — and "derive it, unless config overrides" is the dual-source pattern
+   rule 3 forbids by name.
+3. It is a *silent* semantic. A team that names a customer route `/internal-tools/export` would have
+   gnr8 quietly stop blocking merges on it. The failure mode of a wrong guess here is a shipped
+   breaking change, not a cosmetic defect.
+
+What *is* legitimately derived is the resolution: given the user's declared rules and the graph, the
+classification of each operation is a pure, deterministic function of the two. That is derivation in
+the same sense `graph::direction` derives which side a schema is reached from — computed, not
+guessed.
+
+### 2.4 The trap that makes or breaks the feature: reclassification is itself a change
+
+Whatever the home, one property is non-negotiable, and it is easy to miss.
+
+If `gnr8 changes` reads only the **current** classification, then the cheapest way to make a breaking
+change pass CI is to add one line to `.gnr8/src/main.rs` marking the broken endpoint internal. The
+gate would then be advisory in the precise situation it exists for.
+
+So the diff must read classification from **both** graphs and treat the transition as a first-class
+change:
+
+- customer-facing → internal is a **removal from the public contract**. Every consumer SDK loses a
+  supported operation. It is BREAKING, and it is breaking *for the same reason deleting the route is*.
+- internal → customer-facing is new public surface: ADDITIVE.
+
+This is the only mechanism that keeps an override path honest, and it costs nothing extra — the base
+graph is already being materialised to diff against.
+
+---
