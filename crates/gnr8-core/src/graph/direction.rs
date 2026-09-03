@@ -5,7 +5,7 @@
 //! what decoding, validation, and serialization each do; this module selects the facts for the
 //! schema's payload position. Nullability never changes presence.
 
-use super::{ApiGraph, Field, Type};
+use super::{ApiGraph, Field, Param, Type};
 use std::collections::{BTreeMap, BTreeSet};
 
 /// The HTTP positions a component schema is reached from.
@@ -101,17 +101,7 @@ pub(crate) fn schema_directions(graph: &ApiGraph) -> BTreeMap<&str, SchemaDirect
             request_roots.push(body.ref_id.as_str());
         }
         for param in &op.params {
-            collect_named_refs(&param.schema, &mut request_roots);
-            // A parameter also carries imported `OpenAPI` fragments verbatim, and those can reference
-            // a component the typed schema does not — the same `$ref`s the `OpenAPI` target rewrites
-            // on the way out. They are parameters, so they are requests.
-            for value in param
-                .openapi_content
-                .iter()
-                .chain(param.openapi_fields.iter().map(|(_, value)| value))
-            {
-                collect_json_component_refs(value, &bodies, &mut request_roots);
-            }
+            collect_parameter_refs(param, &bodies, &mut request_roots);
         }
         for response in &op.responses {
             if let Some(body) = &response.body {
@@ -161,14 +151,7 @@ pub(crate) fn schema_consumers(graph: &ApiGraph) -> SchemaConsumers<'_> {
             roots.push(body.ref_id.as_str());
         }
         for param in &operation.params {
-            collect_named_refs(&param.schema, &mut roots);
-            for value in param
-                .openapi_content
-                .iter()
-                .chain(param.openapi_fields.iter().map(|(_, value)| value))
-            {
-                collect_json_component_refs(value, &bodies, &mut roots);
-            }
+            collect_parameter_refs(param, &bodies, &mut roots);
         }
         for response in &operation.responses {
             if let Some(body) = &response.body {
@@ -249,17 +232,57 @@ fn collect_named_refs<'a>(ty: &'a Type, out: &mut Vec<&'a str>) {
     }
 }
 
-/// Push every known component schema id referenced by a local `$ref` anywhere inside an imported
-/// `OpenAPI` fragment. Ids are looked up in `bodies` so the borrow outlives the decoded name and an
-/// unknown reference is skipped rather than invented.
-fn collect_json_component_refs<'a>(
+/// Push the component schemas a parameter actually uses.
+///
+/// Imported parameters retain documentation examples and opaque vendor extensions beside their
+/// schema. A user payload or extension object may itself contain a property named `$ref`; that value
+/// is data, not an OpenAPI Reference Object, and must not turn an otherwise consumerless schema into
+/// an operation-scoped schema. Visit only the typed schema and the exact schema-bearing positions of
+/// the preserved Parameter/Content Objects.
+fn collect_parameter_refs<'a>(
+    parameter: &'a Param,
+    bodies: &BTreeMap<&'a str, &'a Type>,
+    out: &mut Vec<&'a str>,
+) {
+    collect_named_refs(&parameter.schema, out);
+    if let Some(content) = &parameter.openapi_content {
+        collect_content_schema_refs(content, bodies, out);
+    }
+    for (name, value) in &parameter.openapi_fields {
+        if name == "schema" {
+            collect_json_schema_refs(value, bodies, out);
+        }
+    }
+}
+
+fn collect_content_schema_refs<'a>(
+    value: &serde_json::Value,
+    bodies: &BTreeMap<&'a str, &'a Type>,
+    out: &mut Vec<&'a str>,
+) {
+    let Some(content) = value.as_object() else {
+        return;
+    };
+    for media in content.values() {
+        if let Some(schema) = media.get("schema") {
+            collect_json_schema_refs(schema, bodies, out);
+        }
+    }
+}
+
+/// Push every known component id referenced from a JSON Schema position.
+///
+/// Map keys under `properties`/`$defs` are identifiers, so a property literally named `example` or
+/// `$ref` remains intact while its schema value is walked. Unknown keywords and `x-*` payloads stay
+/// opaque instead of acquiring structural meaning by accident.
+fn collect_json_schema_refs<'a>(
     value: &serde_json::Value,
     bodies: &BTreeMap<&'a str, &'a Type>,
     out: &mut Vec<&'a str>,
 ) {
     match value {
-        serde_json::Value::Object(object) => {
-            if let Some((id, _)) = object
+        serde_json::Value::Object(schema) => {
+            if let Some((id, _)) = schema
                 .get("$ref")
                 .and_then(serde_json::Value::as_str)
                 .and_then(super::split_local_component_ref)
@@ -267,13 +290,51 @@ fn collect_json_component_refs<'a>(
             {
                 out.push(id);
             }
-            for child in object.values() {
-                collect_json_component_refs(child, bodies, out);
+            for keyword in [
+                "additionalItems",
+                "additionalProperties",
+                "contains",
+                "contentSchema",
+                "else",
+                "if",
+                "items",
+                "not",
+                "propertyNames",
+                "then",
+                "unevaluatedItems",
+                "unevaluatedProperties",
+            ] {
+                if let Some(child) = schema.get(keyword) {
+                    collect_json_schema_refs(child, bodies, out);
+                }
+            }
+            for keyword in ["allOf", "anyOf", "oneOf", "prefixItems"] {
+                if let Some(children) = schema.get(keyword).and_then(serde_json::Value::as_array) {
+                    for child in children {
+                        collect_json_schema_refs(child, bodies, out);
+                    }
+                }
+            }
+            for keyword in [
+                "$defs",
+                "definitions",
+                "dependencies",
+                "dependentSchemas",
+                "patternProperties",
+                "properties",
+            ] {
+                if let Some(children) = schema.get(keyword).and_then(serde_json::Value::as_object) {
+                    for child in children.values() {
+                        collect_json_schema_refs(child, bodies, out);
+                    }
+                }
             }
         }
         serde_json::Value::Array(items) => {
+            // Draft-04 tuple validation allowed an array in `items`; strings in legacy
+            // `dependencies` are harmless leaves here.
             for item in items {
-                collect_json_component_refs(item, bodies, out);
+                collect_json_schema_refs(item, bodies, out);
             }
         }
         serde_json::Value::Null

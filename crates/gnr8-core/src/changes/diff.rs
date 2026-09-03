@@ -2899,6 +2899,36 @@ mod tests {
     }
 
     #[test]
+    fn parameter_example_refs_do_not_exempt_consumerless_schemas() {
+        let standalone_base = schema("Standalone", vec![field("value")]);
+        let standalone_current = schema("Standalone", Vec::new());
+        let mut exempt_operation = operation();
+        exempt_operation.params.push(parameter(false));
+        exempt_operation.params[0].openapi_fields.push((
+            "example".to_string(),
+            serde_json::json!({"$ref": "#/components/schemas/Standalone"}),
+        ));
+        let graph = |schema| ApiGraph {
+            operations: vec![exempt_operation.clone()],
+            operation_docs: vec![policy("listBooks", &["internal"])],
+            schemas: vec![schema],
+            ..ApiGraph::default()
+        };
+
+        let report = diff_graphs(
+            &graph(standalone_base),
+            &graph(standalone_current),
+            &exemptions(&["internal"]),
+        );
+        let finding = change(&report, "schema.property.removed");
+        assert!(finding.gating);
+        assert_eq!(finding.exempt.base, Some(false));
+        assert_eq!(finding.exempt.current, Some(false));
+        assert_eq!(finding.affected_operations.base, Some(Vec::new()));
+        assert_eq!(finding.affected_operations.current, Some(Vec::new()));
+    }
+
+    #[test]
     fn checked_on_either_schema_side_gates() {
         let base = request_graph(
             &["books"],
