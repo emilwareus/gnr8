@@ -302,3 +302,49 @@ This is the only mechanism that keeps an override path honest, and it costs noth
 graph is already being materialised to diff against.
 
 ---
+
+## 3. Verified: what `--base <ref>` costs, and why it constrains the classification design
+
+Issue #75 says "a graph from a Git revision". Getting one is harder than it reads, and the
+constraints land directly on where classification may live.
+
+**The host cannot run an old `.gnr8` worker.** `crates/gnr8-core/src/worker/mod.rs:298-303` compares
+the worker's capability digest to its own by strict equality and errors with "gnr8 capability
+mismatch: host {}, worker {}. Rebuild both …". `capability_digest`
+(`crates/gnr8-sdk/src/protocol/mod.rs:74-79`) hashes
+`"gnr8-sdk:{sdk_version};protocol:{PROTOCOL_VERSION};frames:2;plan:1;artifacts:1;patched:1"`, and
+`sdk_version()` is `env!("CARGO_PKG_VERSION")` (`:82-85`). A base ref whose `.gnr8/Cargo.toml` pins a
+different `gnr8` version produces a worker that **cannot handshake with the installed host at all**.
+`validate_workspace` additionally rejects a pin below `FIRST_SDK_VERSION` outright
+(`crates/gnr8-core/src/worker/build.rs:292-307`).
+
+So "check out the base ref and run its pipeline" is not generally available. Three viable shapes,
+each with a different meaning:
+
+| Shape | Base graph = | Cost | Meaning |
+|---|---|---|---|
+| Re-run **base config + base source** | what the API actually was | needs a matching host per ref; blocked by the digest above whenever the pin moved | the true published contract |
+| Re-run **current config + base source** | what today's pipeline says about yesterday's code | one worker build, current host | isolates *source* changes; a config change is invisible |
+| Read a **committed graph artifact** at the base ref (`git show <ref>:<path>`) | whatever was committed | no build at all, and it is already deterministic and sorted | the true published contract, if the artifact was committed |
+
+The third is the only one that is both cheap and correct, and gnr8 is unusually well set up for it:
+the graph is already fully `Serialize`/`Deserialize` (`graph.rs:57`), already deterministic and sorted
+by construction (`graph.rs:9-14`), and `gnr8 inspect graph --json` already serialises it straight from
+those impls (`crates/gnr8/src/render.rs:9-10`). Committing the projected graph as a generated artifact
+would make `--base <ref>` a `git show` plus two `serde_json::from_str` calls.
+
+It also has a hard cost: it only works if the artifact was committed at the base ref, and "committed,
+otherwise re-run the pipeline" is precisely the dual-path shape rule 3 forbids. Whichever shape is
+chosen has to be the *only* shape. This is left as an Open decision (§8.1) because it is a `changes`
+design question, not a classification one — but it bears on classification in one specific way:
+
+**If the base graph comes from a committed artifact, the classification must be IN the graph**, not
+recomputed from the current `.gnr8` rules against old operations. Recomputing would apply today's
+policy to yesterday's API, which silently defeats §2.4: relabel an endpoint internal today and the
+recomputation says it was always internal. A classification stored on the graph, serialised with it,
+and read back is the only form that makes the transition detectable.
+
+That single requirement rules option (b)-as-pure-config out as the *storage* location and settles the
+shape: rules in config, resolved value on the graph.
+
+---
