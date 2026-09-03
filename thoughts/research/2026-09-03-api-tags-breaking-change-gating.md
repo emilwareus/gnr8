@@ -115,6 +115,13 @@ or several strings (`crates/gnr8-sdk/src/sdk/builtins.rs:1552-1625`). It is expo
 prelude (`crates/gnr8-sdk/src/sdk/mod.rs:642-652`) and documented with
 `.tag("Books")` (`docs/pipeline/transforms.md:343-364`).
 
+`GroupOperations::by_tag(existing, group)` is not a tag-assignment alternative. Despite the builder's
+name, its `ExistingGroup` rule compares only `op.group` and replaces that singular group
+(`crates/gnr8-sdk/src/sdk/builtins.rs:1812-1818`;
+`crates/gnr8-core/src/sdk/builtins.rs:2506-2512`). It cannot add a second operation tag, and for an
+imported operation tagged `[Reports, Audited]` it can match `Reports`—the first tag copied to
+`group`—but not `Audited` through that rule.
+
 The transform is a multi-operation selector, not an exactly-one override. Its implementation scans
 every operation, applies to each match, and errors if the selector matched zero operations
 (`crates/gnr8-core/src/sdk/builtins.rs:2150-2211`). It validates that tag values are not empty
@@ -185,6 +192,11 @@ OpenAPI tag, with `default` for an ungrouped operation
 (`crates/gnr8-sdk/src/sdk/layout.rs:73-80`). `SdkFileLayout::split()` selects that `PerTag` layout
 (`layout.rs:32-42`, enum at `:187-195`).
 
+All three SDK target constructors default to `SdkFileLayout::compact()`
+(`crates/gnr8-sdk/src/sdk/builtins.rs:2181-2190`, `:2302-2315`, `:2442-2453`). Therefore a group
+changes files only when the user selects a split/group-aware layout; the convenience `split_files()`
+methods choose per-endpoint splitting instead (`:2230-2239`, `:2341-2349`, `:2479-2487`).
+
 The common emitter returns only `op.group` or `default`
 (`crates/gnr8-core/src/sdk/emit_common.rs:526-532`). Go, Python, and TypeScript each build a sorted
 map keyed by that one value and emit a group file for it
@@ -194,6 +206,13 @@ map keyed by that one value and emit a group file for it
 membership comes from `op.group`, while documentation tags come from a non-empty docs policy or the
 same group fallback (`crates/gnr8-core/src/sdk/model.rs:306-370`).
 
+The checked-in SDK reference renderer is slightly narrower than `SdkModel`: `write_sdk_docs` currently
+ignores its model argument and renders directly from the graph
+(`crates/gnr8-core/src/sdk/docs.rs:13-38`), where, when SDK docs output is enabled, the “Tags” line reads only a non-empty
+`OperationDocsPolicy.tags` vector (`:227-276`). A source `group` fallback therefore appears in OpenAPI
+and SDK grouping but not as a Tags line in generated `reference.md`; a configured classification tag
+does appear there because it creates the policy vector.
+
 Therefore:
 
 - a source group or the **first** tag on an imported OpenAPI operation can determine native SDK
@@ -202,6 +221,10 @@ Therefore:
   (`crates/gnr8-core/src/sdk/builtins.rs:2485-2528`);
 - `DocumentOperation::tag("internal")` changes effective OpenAPI/docs tags but does not change the
   native SDK service or group-file name, because it leaves `Operation.group` alone.
+
+Several configured tags likewise do not duplicate a method across several native gnr8 service
+classes: there is still exactly one `Operation.group`. That differs deliberately from the downstream
+multi-namespace behavior some generators apply to the same OpenAPI array (§3.3).
 
 This distinction is load-bearing for the replacement design. The gate may inspect the full effective
 standard tag set without making `internal`, `beta`, or `partner` into SDK grouping policy. Conversely,
@@ -552,7 +575,9 @@ gnr8 changes --base origin/main \
 `--exempt-tag` is repeatable, duplicates are deduplicated, and the report prints the resolved values
 in lexical order. Order has no meaning. An empty string is an invalid invocation, matching the
 existing tag-value validation rather than inventing a “matches untagged” spelling. A tag containing
-spaces remains a valid OpenAPI string and is passed with normal shell quoting; equality is exact.
+spaces remains a valid string value because the Operation Object imposes no narrower tag grammar
+([OpenAPI Operation Object](https://spec.openapis.org/oas/v3.1.2.html#operation-object)); it is passed
+with normal shell quoting and equality is exact.
 
 Do **not** also add `.changes().exempt_tags(...)` to the `.gnr8/` pipeline in the first version. The
 same policy in the pipeline and on the command line immediately needs override/merge precedence,
@@ -658,6 +683,12 @@ There are two deliberately separate facts in the middle rows:
    operation from the protected set and is therefore `BREAKING`; `X → C` adds it to the protected set
    and is `ADDITIVE`. Replacing `beta` with `internal` is only `DOC-ONLY` when both are in `E`, because
    it stays `X → X`.
+
+A root Tag Object definition added, removed, described, or reordered without changing any Operation
+Object membership is also `DOC-ONLY`: OpenAPI defines the root list as optional tag metadata and an
+ordering hint, not the operation-to-tag connection itself
+([OpenAPI Object](https://spec.openapis.org/oas/v3.1.2.html#openapi-object),
+[Tag Object](https://spec.openapis.org/oas/v3.1.2.html#tag-object)).
 
 This retains the earlier document's classification direction without retaining its enum. More
 importantly, the structural gate rule does not rely on the separate policy-transition finding. If a
