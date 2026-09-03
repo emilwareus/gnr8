@@ -43,9 +43,9 @@ fn load_base_graph_with(
     artifact_path: &str,
     git: &OsStr,
 ) -> Result<BaseGraph, CoreError> {
-    ensure_git_checkout(project_root, git)?;
+    let repository_prefix = git_repository_prefix(project_root, git)?;
     let commit = resolve_commit(project_root, reference, git)?;
-    let object = format!("{commit}:{artifact_path}");
+    let object = format!("{commit}:{repository_prefix}{artifact_path}");
     let output = run_git(
         project_root,
         git,
@@ -65,19 +65,27 @@ fn load_base_graph_with(
     })
 }
 
-fn ensure_git_checkout(project_root: &Path, git: &OsStr) -> Result<(), CoreError> {
+fn git_repository_prefix(project_root: &Path, git: &OsStr) -> Result<String, CoreError> {
     if !project_root.is_dir() {
         return Err(CoreError::NotGitCheckout {
             path: project_root.display().to_string(),
         });
     }
-    let output = run_git(project_root, git, ["rev-parse", "--is-inside-work-tree"])?;
-    if !output.status.success() || String::from_utf8_lossy(&output.stdout).trim() != "true" {
+    let checkout = run_git(project_root, git, ["rev-parse", "--is-inside-work-tree"])?;
+    if !checkout.status.success() || String::from_utf8_lossy(&checkout.stdout).trim() != "true" {
         return Err(CoreError::NotGitCheckout {
             path: project_root.display().to_string(),
         });
     }
-    Ok(())
+    let prefix = run_git(project_root, git, ["rev-parse", "--show-prefix"])?;
+    if !prefix.status.success() {
+        return Err(CoreError::NotGitCheckout {
+            path: project_root.display().to_string(),
+        });
+    }
+    Ok(String::from_utf8_lossy(&prefix.stdout)
+        .trim_end_matches(['\r', '\n'])
+        .to_string())
 }
 
 fn resolve_commit(project_root: &Path, reference: &str, git: &OsStr) -> Result<String, CoreError> {
@@ -223,6 +231,15 @@ mod tests {
                 .expect("load committed graph");
         assert_eq!(loaded.reference, "HEAD");
         assert_eq!(loaded.commit.len(), 40);
+        assert!(!loaded.graph.operations.is_empty());
+        std::fs::remove_dir_all(fixture).unwrap();
+    }
+
+    #[test]
+    fn loads_project_relative_artifact_from_a_repository_subdirectory() {
+        let fixture = real_git_fixture();
+        let project = fixture.join("examples/bookstore");
+        let loaded = super::load_base_graph(&project, "HEAD").expect("load nested graph");
         assert!(!loaded.graph.operations.is_empty());
         std::fs::remove_dir_all(fixture).unwrap();
     }

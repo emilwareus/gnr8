@@ -15,7 +15,7 @@ Run commands from the application repository root. Global options are:
 -V, --version   print the CLI version
 ```
 
-`generate`, `check`, `watch`, `doctor`, and `inspect` without a path all build and run the project's
+`generate`, `check`, `changes`, `watch`, `doctor`, and `inspect` without a path all build and run the project's
 `.gnr8` worker. That compiles and executes Rust from the repository — build scripts, proc macros, and
 the pipeline itself — with your privileges, and is not sandboxed. `--no-build` withholds the compile
 step; `--no-execute` withholds both. `gnr8 inspect routes <path>` analyzes a source tree without
@@ -33,6 +33,7 @@ diagnostics.
 | `generate` | Run the pipeline and reconcile generated files | yes |
 | `watch` | Regenerate after source changes | yes |
 | `check` | Detect generated drift without writing | no |
+| `changes` | Classify API changes against a committed graph artifact | no |
 | `inspect` | Explain extracted routes, schemas, or graph | no |
 | `doctor` | Diagnose workspace, output, and pipeline health | no |
 
@@ -117,6 +118,32 @@ gnr8 generate   # developer: inspect and commit the result
 gnr8 check      # CI: fail on uncommitted generated drift
 ```
 
+## `changes`
+
+```bash
+gnr8 changes --base origin/main
+gnr8 changes --base origin/main --exempt-tag internal --exempt-tag beta
+gnr8 --json changes --base origin/main
+```
+
+Runs the current project pipeline without writing, then compares its projected graph with
+`generated/gnr8.graph.json` committed at `--base`. The base pipeline is never executed. If that
+revision has no graph artifact, run `gnr8 generate` on that revision and commit the artifact before
+using it as a base.
+
+Findings are classified as `BREAKING`, `ADDITIVE`, or `DOC-ONLY`. A breaking finding exits `1` only
+when it is in the checked scope. `--exempt-tag` removes operations carrying an exact,
+case-sensitive matching standard OpenAPI tag from that scope; it is repeatable, and untagged
+operations remain checked. Findings are always reported, including exempt ones. Schema findings use
+their most checked transitive consumer on each graph side.
+
+JSON contains the requested and resolved base revision, sorted exempt-tag policy, summary counts,
+and deterministically sorted changes with stable dotted codes, effective tags and exemption state
+for both graph sides, the derived `gating` result, and current source locations where available.
+
+The committed base must be reachable in the local Git checkout. In CI, configure checkout with full
+history (`fetch-depth: 0`) before invoking this command.
+
 ## `inspect`
 
 ```bash
@@ -150,7 +177,7 @@ means at least one actionable lifecycle or output problem exists.
 | Status | Meaning |
 |---:|---|
 | `0` | command completed and its gate passed |
-| `1` | generated drift or an actionable doctor finding |
+| `1` | a command's domain gate failed: generated drift, an actionable doctor finding, or a gating API change |
 | other nonzero | invalid invocation or execution/configuration failure |
 
 Do not infer success from parseable JSON alone; always inspect the process status.

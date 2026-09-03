@@ -85,6 +85,16 @@ pub(crate) enum Commands {
     },
     /// Verify generated outputs are up to date.
     Check,
+    /// Classify API changes against a committed graph artifact.
+    Changes {
+        /// Git revision whose committed graph artifact is the comparison base.
+        #[arg(long)]
+        base: String,
+
+        /// Exact, case-sensitive operation tag to exempt from the breaking-change gate.
+        #[arg(long, value_parser = non_empty_tag)]
+        exempt_tag: Vec<String>,
+    },
     /// Explain inferred API facts and diagnostics.
     Inspect {
         /// What to inspect.
@@ -151,6 +161,14 @@ pub(crate) enum InspectAction {
     },
 }
 
+fn non_empty_tag(value: &str) -> Result<String, String> {
+    if value.is_empty() {
+        Err("tag must not be empty".to_string())
+    } else {
+        Ok(value.to_string())
+    }
+}
+
 #[cfg(test)]
 mod tests {
     // Tests legitimately use unwrap/expect/panic (rust-best-practices skill ch.4); scope the allow to
@@ -209,6 +227,28 @@ mod tests {
             Cli::try_parse_from(["gnr8", "check"]).unwrap().command,
             Commands::Check
         ));
+        let cli = Cli::try_parse_from([
+            "gnr8",
+            "changes",
+            "--base",
+            "origin/main",
+            "--exempt-tag",
+            "internal",
+            "--exempt-tag",
+            "beta",
+        ])
+        .unwrap();
+        assert!(matches!(
+            cli.command,
+            Commands::Changes {
+                base,
+                exempt_tag
+            } if base == "origin/main" && exempt_tag == ["internal", "beta"]
+        ));
+        assert!(
+            Cli::try_parse_from(["gnr8", "changes", "--base", "main", "--exempt-tag", ""]).is_err()
+        );
+        assert!(Cli::try_parse_from(["gnr8", "changes"]).is_err());
         assert!(matches!(
             Cli::try_parse_from(["gnr8", "doctor"]).unwrap().command,
             Commands::Doctor

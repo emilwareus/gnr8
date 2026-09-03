@@ -8,6 +8,7 @@
 //! `.gnr8/`, a compile error in the user's pipeline, a missing Go toolchain) through this `anyhow`
 //! boundary as a clean stderr message + a deliberate non-zero exit, never a panic (RUST-04).
 
+mod changes;
 mod cli;
 mod doctor;
 mod render;
@@ -19,7 +20,7 @@ use cli::{Cli, Commands, GuideTopic, InspectAction, SdkPreset, SourcePreset};
 use gnr8_engine::store::Store;
 use gnr8_engine::worker::WorkerPolicy;
 use std::path::{Component, Path, PathBuf};
-use std::process::Command;
+use std::process::{Command, ExitCode};
 use std::time::{Duration, Instant, UNIX_EPOCH};
 
 /// The gnr8 host: parse argv, resolve the trust policy, dispatch.
@@ -27,7 +28,17 @@ use std::time::{Duration, Instant, UNIX_EPOCH};
 /// `init` and `guide` never touch `.gnr8/`. Every other command builds and runs the project's
 /// worker, which is trusted-code execution — `--no-build` and `--no-execute` are how a caller
 /// withholds that consent.
-fn main() -> Result<()> {
+fn main() -> ExitCode {
+    match run() {
+        Ok(()) => ExitCode::SUCCESS,
+        Err(error) => {
+            eprintln!("error: {error:#}");
+            ExitCode::from(2)
+        }
+    }
+}
+
+fn run() -> Result<()> {
     let cli = Cli::parse();
     let output = Output::new(cli.json, cli.verbose);
     let policy = worker_policy(&cli);
@@ -42,9 +53,58 @@ fn main() -> Result<()> {
         Commands::Guide { topic } => run_guide(*topic, output),
         Commands::Generate { force } => run_generate(*force, policy, output),
         Commands::Check => run_check(policy, output),
+        Commands::Changes { base, exempt_tag } => run_changes(base, exempt_tag, policy, output),
         Commands::Watch { debounce_ms } => run_watch(*debounce_ms, policy, output),
         Commands::Doctor => run_doctor(policy, output),
     }
+}
+
+/// Run the current pipeline without writing, then compare its canonical projected graph with the
+/// sole historical source: the base revision's committed graph artifact.
+fn run_changes(
+    base_reference: &str,
+    exempt_tags: &[String],
+    policy: WorkerPolicy,
+    output: Output,
+) -> Result<()> {
+    let root = project_root()?;
+    let total_start = Instant::now();
+    output.verbose(format!("changes: loading base {base_reference}"));
+    let base = gnr8_engine::changes::load_base_graph(&root, base_reference)?;
+
+    output.verbose("changes: running current pipeline");
+    let run = gnr8_engine::worker::run_pipeline(&root, policy, cache_store().as_ref())?;
+    let artifact = run
+        .outcome
+        .artifacts
+        .iter()
+        .find(|artifact| artifact.path == gnr8_engine::graph_artifact::GRAPH_ARTIFACT_PATH)
+        .ok_or_else(|| anyhow::anyhow!("current pipeline did not emit its gnr8 graph artifact"))?;
+    let current: gnr8_engine::graph_artifact::GraphArtifact = serde_json::from_str(&artifact.text)
+        .map_err(|error| anyhow::anyhow!("current graph artifact is invalid: {error}"))?;
+    if current.schema_version != gnr8_engine::graph_artifact::GRAPH_ARTIFACT_SCHEMA_VERSION {
+        bail!(
+            "current graph artifact schema version {} is unsupported; expected {}",
+            current.schema_version,
+            gnr8_engine::graph_artifact::GRAPH_ARTIFACT_SCHEMA_VERSION
+        );
+    }
+
+    let exempt_tags: std::collections::BTreeSet<String> = exempt_tags.iter().cloned().collect();
+    let report = gnr8_engine::changes::diff_graphs(&base.graph, &current.graph, &exempt_tags);
+    print_diagnostics(output, &run.outcome.diagnostics);
+    if output.json {
+        print!("{}", changes::render_json(&base, &report)?);
+    } else {
+        print!("{}", changes::render_human(&report));
+        output.verbose(format!("base resolved: {}", base.commit));
+        output.verbose(format!("worker: {}", run.worker_origin.label()));
+        output.verbose(format!("total: {}", fmt_duration(total_start.elapsed())));
+    }
+    if report.is_gating() {
+        std::process::exit(1);
+    }
+    Ok(())
 }
 
 /// The machine's shared cache for this invocation, or `None` when sharing is off.
