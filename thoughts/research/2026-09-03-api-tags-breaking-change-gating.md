@@ -426,3 +426,402 @@ Three conclusions are strong enough to carry into the design:
    off-the-shelf rule.
 
 ---
+
+## 4. Recommendation
+
+### 4.1 The one-line answer to each design question
+
+1. **Where does classification live?** In each operation's existing effective standard OpenAPI tag
+   set: non-empty `OperationDocsPolicy.tags`, otherwise its singleton source/imported `group`,
+   otherwise empty. Each historical graph supplies its own set.
+2. **How are tags assigned?** Use the existing
+   `DocumentOperation::when(OperationSelector).tag(...)` / `.tags(...)` transform in `.gnr8/`.
+   Add only `OperationSelector::SourcePrefix` if source-directory selection is required; do not add
+   `Audience`, `OperationAudiencePolicy`, `ClassifyOperations`, `SetTags`, or a parallel field.
+3. **How is gate policy supplied?** `gnr8 changes --base <ref> --exempt-tag <name>`, with
+   `--exempt-tag` repeatable. No flag means no exemptions, so every breaking change gates by default.
+4. **How is a breaking operation evaluated?** It is non-gating only if it carries at least one
+   configured exempt tag on **every graph side where that operation exists**. A missing exempt tag on
+   either extant side makes the break gate.
+5. **What happens to the artifacts?** Every operation remains in OpenAPI and every native SDK by
+   default. Standard operation tags are visible; no `x-internal` or gnr8-owned replacement is emitted
+   or read. Artifact filtering remains a separate explicit target decision.
+6. **How do schema changes inherit scope?** A non-exempt consumer wins transitively, independently in
+   each graph. A schema break is non-gating only when all of its extant consumers on both sides are
+   exempt.
+
+### 4.2 One canonical tag resolver, no new classification model
+
+Define one graph-level function with the behavior already verified at
+`crates/gnr8-core/src/lower/mod.rs:760-764`:
+
+```rust
+// Pseudocode — proposed shared behavior, not an API present in this checkout.
+fn effective_operation_tags(graph: &ApiGraph, op: &Operation) -> &[String] {
+    // non-empty OperationDocsPolicy.tags; otherwise the singleton op.group; otherwise empty
+}
+```
+
+The actual return representation may need to avoid allocating for the singleton fallback; the
+contract is the three-branch result, not this illustrative signature. Move or wrap the current
+lowering logic so OpenAPI lowering, SDK documentation, and `changes` cannot drift into three answers.
+Do **not** union `group` with non-empty policy tags, because that would silently change today's
+emitted OpenAPI semantics (§1.4). If the product later decides tags should be additive over the group,
+change the one resolver and its contract deliberately.
+
+The exemption predicate for graph side `g`, operation `o`, and invocation set `E` is:
+
+```text
+exempt(g, o, E) = exists tag in effective_tags(g, o) such that tag is in E
+```
+
+Matching is exact and case-sensitive. OpenAPI says most field values are case-sensitive unless a
+field says otherwise, and the `tags` field defines no exception
+([OpenAPI 3.1.2 case sensitivity](https://spec.openapis.org/oas/v3.1.2.html#case-sensitivity),
+[Operation Object](https://spec.openapis.org/oas/v3.1.2.html#operation-object)). There are no prefixes,
+globs, regular expressions, case folding, reserved tag names, or special treatment for `/internal`
+paths. `internal` has meaning only when the caller passes `--exempt-tag internal`.
+
+### 4.3 Tag assignment: use `DocumentOperation`; close only the selector gap
+
+The pipeline remains ordinary Rust code:
+
+```rust
+Pipeline::new()
+    .source(GoGin::new().inputs(["."]))
+    .transform(
+        DocumentOperation::when(OperationSelector::middleware("RequireInternalToken"))
+            .tag("internal"),
+    )
+    .transform(
+        DocumentOperation::when(OperationSelector::path_prefix("/partner"))
+            .tags(["partner", "beta"]),
+    )
+    .target(OpenApi31::new().to("generated/openapi.yaml"))
+```
+
+Every identifier in that example exists today (`crates/gnr8-sdk/src/sdk/builtins.rs:1134-1152`,
+`:1552-1625`); it uses only the current surface. The transform already matches several
+operations, rejects a zero-match selector, validates tag strings, and produces a sorted/deduplicated
+policy vector (`crates/gnr8-core/src/sdk/builtins.rs:2150-2220`, `:2325-2335`).
+
+There is no need for a `ClassifyOperations` replacement. Such a transform would either write the same
+tag vector as `DocumentOperation`—two public ways to state one fact—or write a second field that the
+gate must reconcile. Both shapes violate the repository's one-source invariant.
+
+The one small, independently useful addition is the selector the prior research already found absent:
+
+```rust
+// PROPOSED; not present in this checkout.
+OperationSelector::source_prefix("internal/debug/")
+```
+
+It should match `op.provenance.file.starts_with(prefix)`, exactly as
+`GroupOperations::by_source_prefix` does today
+(`crates/gnr8-core/src/sdk/builtins.rs:2498-2504`). This extends the shared selector used by tagging,
+security, and documentation; it does not create a tag mechanism. It must be documented as sensitive
+to file moves. Until it exists, path/middleware/id selectors or a custom Rust transform are the clean
+available paths.
+
+One authoring caveat stays explicit: on a source operation with group `books`, `.tag("internal")`
+currently makes the effective OpenAPI tag set `[internal]`, not `[books, internal]`. A user who needs
+both downstream meanings writes `.tags(["books", "internal"])`. A future decision to make tag
+updates additive over the fallback belongs to the effective-tag resolver, not to `changes`.
+
+### 4.4 The CLI policy surface
+
+The recommended initial command is:
+
+```text
+gnr8 changes --base <ref> [--exempt-tag <name>]...
+```
+
+Examples:
+
+```bash
+# Safe default: every breaking change gates, tagged or not.
+gnr8 changes --base origin/main
+
+# A break is non-gating only when each extant side has internal, beta, or partner.
+gnr8 changes --base origin/main \
+  --exempt-tag internal \
+  --exempt-tag beta \
+  --exempt-tag partner
+```
+
+`--exempt-tag` is repeatable, duplicates are deduplicated, and the report prints the resolved values
+in lexical order. Order has no meaning. An empty string is an invalid invocation, matching the
+existing tag-value validation rather than inventing a “matches untagged” spelling. A tag containing
+spaces remains a valid OpenAPI string and is passed with normal shell quoting; equality is exact.
+
+Do **not** also add `.changes().exempt_tags(...)` to the `.gnr8/` pipeline in the first version. The
+same policy in the pipeline and on the command line immediately needs override/merge precedence,
+giving one fact two control paths. The division is clean:
+
+- `.gnr8/` produces the graph and assigns standard tags;
+- the `changes` invocation says which of those standard tags are exempt for this gate.
+
+This also meets the owner's “not a new protocol” decision: the graphs already serialize the tag
+facts, and the exempt set is command policy, not another graph field or worker message.
+
+### 4.5 Exit status: binary gate result, complete report
+
+`changes` must report every detected change and derive `gating` afterward. Its domain result is:
+
+```text
+exit 1  iff at least one reported BREAKING change has gating = true
+exit 0  otherwise
+```
+
+A report containing only additive changes, documentation-only changes, or breaking changes exempt
+on every extant side exits `0`. Invalid arguments, an unresolved base ref, a pipeline failure, or an
+invalid graph still use another nonzero error status; this preserves the existing distinction between
+gate failure and command failure (`docs/cli/commands.md:148-156`). There is no third domain exit code
+for “breaking but exempt.”
+
+For an operation-scoped breaking finding `c`, the exact rule is:
+
+```text
+gating(c) =
+    (base operation exists    AND NOT exempt(base, operation, E))
+ OR (current operation exists AND NOT exempt(current, operation, E))
+```
+
+Absence is skipped, not treated as an empty tag set. This gives deletions a meaningful base-side
+classification and additions a meaningful current-side classification without pretending a missing
+operation is untagged.
+
+Human output should make the distinction visible without hiding anything:
+
+```text
+BREAKING  POST /tasks          request field `priority` became required
+BREAKING  GET /tasks/_debug    response field `count` removed  (exempt on both sides; not gating)
+DOC-ONLY  GET /reports         operation tag `beta` added
+```
+
+Machine output should carry the input policy, both effective tag sets, the derived per-side booleans,
+and final `gating` result so callers do not reimplement the rule:
+
+```json
+{
+  "policy": { "exempt_tags": ["beta", "internal", "partner"] },
+  "summary": { "breaking": 2, "additive": 0, "doc_only": 1, "gating": 1 },
+  "changes": [
+    {
+      "kind": "breaking",
+      "code": "response.property.removed",
+      "operation": "GET /tasks/_debug",
+      "tags": { "base": ["internal"], "current": ["internal"] },
+      "exempt": { "base": true, "current": true },
+      "gating": false
+    }
+  ]
+}
+```
+
+The exact outer diff schema remains issue #75 work; the fields above are the minimum tag-policy facts
+that make the exit decision auditable. Arrays and changes remain deterministically sorted, consistent
+with `ApiGraph`'s ordered-vector contract (`crates/gnr8-sdk/src/graph.rs:8-16`).
+
+### 4.6 The retag trap, closed on both dimensions
+
+For the table below:
+
+- `C` means the operation exists and is **checked**—none of its effective tags is in `E`;
+- `X` means it exists and is **exempt**—at least one effective tag is in `E`;
+- `Ø` means it is absent.
+
+“Tagged” here always means “has a tag configured as exempt for this invocation.” An operation tagged
+only `books` is `C` when `E = {internal, beta}`.
+
+| Base → current | Classification of the transition | Does a simultaneous structural BREAKING finding gate? |
+|---|---|---:|
+| `Ø → Ø` | no operation subject | n/a |
+| `Ø → C` | operation added: ADDITIVE | no breaking finding |
+| `Ø → X` | operation added: ADDITIVE | no breaking finding |
+| `C → Ø` | operation removed: BREAKING | **yes** — base is checked |
+| `X → Ø` | operation removed: BREAKING, reported as exempt | no — the only extant side is exempt |
+| `C → C` | ordinary tag delta, if any: DOC-ONLY | **yes** |
+| `C → X` | protected scope narrowed: BREAKING | **yes** — base is checked |
+| `X → C` | protected scope expanded: ADDITIVE | **yes** — current is checked |
+| `X → X` | ordinary tag delta, if any: DOC-ONLY | no |
+
+There are two deliberately separate facts in the middle rows:
+
+1. **The raw addition/removal of a standard OpenAPI tag is documentation metadata.** If it does not
+   change whether the operation intersects `E`, classify it `DOC-ONLY`. That agrees with OpenAPI's
+   documentation-control definition
+   ([Operation Object](https://spec.openapis.org/oas/v3.1.2.html#operation-object)) and oasdiff's
+   informational tag-add/tag-remove rules
+   ([oasdiff rule catalog](https://www.oasdiff.com/docs/breaking-changes)).
+2. **Crossing the configured gate boundary is a separate policy change.** `C → X` removes an existing
+   operation from the protected set and is therefore `BREAKING`; `X → C` adds it to the protected set
+   and is `ADDITIVE`. Replacing `beta` with `internal` is only `DOC-ONLY` when both are in `E`, because
+   it stays `X → X`.
+
+This retains the earlier document's classification direction without retaining its enum. More
+importantly, the structural gate rule does not rely on the separate policy-transition finding. If a
+revision both breaks an operation and adds its first exempt tag, the base side is `C`, so the
+structural break still exits `1`. If it removes the last exempt tag while breaking the operation, the
+current side is `C`, so that break also exits `1`.
+
+Only after the exempt tag is present on both compared revisions does an underlying breaking change
+become reported-but-non-gating. This is the fixed owner rule, expressed over standard tags.
+
+### 4.7 Several exempt tags: any match per side, both sides overall
+
+For `E = {internal, beta, partner}`, exemption is a set intersection, not a priority list:
+
+| Base effective tags | Current effective tags | Exempt on both extant sides? | Structural break gates? |
+|---|---|---:|---:|
+| `[books]` | `[books]` | no | **yes** |
+| `[books]` | `[books, internal]` | no | **yes** |
+| `[books, beta]` | `[books, internal]` | yes | no |
+| `[partner, beta]` | `[partner]` | yes | no |
+| `[partner]` | `[books]` | no | **yes** |
+| `[]` | `[internal]` | no | **yes** |
+
+The matching tag need not be the same on the two sides. Requiring the same tag would turn a harmless
+`beta → internal` policy progression into a gating structural break even though both revisions are in
+an explicitly exempt set. What matters is whether each historical operation was protected, not which
+configured reason exempted it.
+
+### 4.8 Include-only mode does not earn its first-version complexity
+
+An inverse option could be spelled `--include-tag <name>` and mean “gate only operations carrying one
+of these tags.” **Do not ship it initially.** It creates three costs:
+
+1. It reverses the safe default: a newly added untagged operation or a new, unknown tag becomes
+   non-gating merely because it was not anticipated in the include list.
+2. Combining include and exempt sets requires a precedence rule for an operation carrying both; that
+   is a second policy model with no evidence-backed winner.
+3. Removal of an included tag needs the mirror anti-evasion rule—gate when the include set matches
+   either extant side—so include and exempt modes use opposite-looking boolean formulas that users
+   and report consumers can easily confuse.
+
+Repeatable `--exempt-tag` already filters both directions needed for the stated use case: named tags
+are removed from the **gate**, while every operation lacking an exempt tag remains included. It also
+keeps untagged/default operations gating.
+
+If include-only demand becomes concrete, make it a mutually exclusive mode, never an option merged
+with `--exempt-tag`. Its safe retag rule would be “a structural break gates if an include tag appears
+on either extant side,” and the report would have to announce that untagged operations are outside
+the gate. That possible surface is **Open**, not part of this recommendation.
+
+### 4.9 Schema-level changes: the most checked consumer wins
+
+For each graph side, compute the operations that transitively reach every schema using the same root
+and `$ref` traversal shape as `schema_directions`
+(`crates/gnr8-core/src/graph/direction.rs:76-163`). Then:
+
+```text
+checked(graph, schema) =
+    any non-exempt operation in that graph reaches schema
+ OR any non-HTTP schema_uses root reaches schema
+ OR schema has no known consumer
+```
+
+The last two terms are the safe default. A `schema_uses` root has no operation tag
+(`crates/gnr8-sdk/src/graph.rs:98-101`, type at `:150-156`), and a consumerless graph schema can still
+be emitted as an SDK model because SDK generation walks `graph.schemas`
+(`crates/gnr8-core/src/gosdk/mod.rs:156-175`). Neither may acquire an exemption by absence.
+
+A breaking schema finding gates when `checked(base, schema)` or `checked(current, schema)` is true on
+an extant side. Consequences:
+
+- one checked consumer and ten exempt consumers ⇒ **gating**;
+- checked in the base, exempt-only in the current ⇒ **gating**;
+- exempt-only on every extant side ⇒ reported, not gating;
+- a removed schema uses base reachability; an added schema is additive;
+- projected `::input` / `::output` components inherit scope through their actual projected references,
+  because the diff operates on projected graphs.
+
+Per-operation security changes follow that operation's rule. Document-wide facts such as base path or
+global security gate whenever the document has any checked operation; otherwise a global change could
+break the one non-exempt consumer while being washed out by many exempt ones. This is the earlier
+§6.11 “most public consumer wins” reasoning, re-keyed on tag intersection and derived rather than
+stored.
+
+### 4.10 OpenAPI and SDK artifacts: include, tag, never translate
+
+The earlier document's central artifact conclusion survives:
+
+> **All operations remain in the default OpenAPI document and native SDKs. Gate exemption does not
+> authorize artifact deletion.**
+
+What changes is “unmarked.” The selected classification is a standard tag, so it appears in the
+Operation Object and in SDK documentation through the verified current path (§1.5–§1.6). That visible
+metadata can affect downstream tools exactly as §3.3 documents; the report should not pretend
+otherwise. Native gnr8 SDK service/file grouping remains `Operation.group`, and merely adding a
+documentation tag does not regroup it (`crates/gnr8-core/src/sdk/model.rs:306-370`).
+
+Do not emit or read `x-internal`, `x-audience`, or a gnr8-owned substitute. The owner chose the
+standard field, and the repository invariants forbid understanding another generator's convention.
+If a user wants a reduced OpenAPI document, that remains an explicit generic tag-filtering decision
+on an `OpenApi31` target or a custom target/post-process—not an automatic consequence of
+`--exempt-tag`. No such built-in target filter exists in this checkout, so its exact API remains
+**Open** rather than invented here.
+
+Root Tag Objects should not participate in gating; operation tag membership is the canonical fact.
+As a separate OpenAPI-output improvement, the lowerer can synthesize one name-only root Tag Object for
+each distinct effective operation tag, sorted lexically. That would close the verified declaration
+gap (§1.5) without adding another graph source or requiring a user to repeat tag names. Preserving
+imported root tag descriptions/order would require graph representation that does not exist today and
+is left Open.
+
+### 4.11 Worked example: the taskflow debug route
+
+`examples/taskflow` has the exact motivating endpoint:
+`tasks.GET("/_debug", debugTasks)` under `/tasks`
+(`examples/taskflow/main.go:20-36`). Its current custom `DropDebugRoutes` deletes every `_debug`
+operation before targets (`examples/taskflow/.gnr8/src/main.rs:42-55`), which is why the endpoint
+cannot appear in either artifact.
+
+Replace that deletion with the existing tag transform:
+
+```rust
+.transform(
+    DocumentOperation::when(OperationSelector::get("/tasks/_debug"))
+        .tags(["tasks", "internal"]),
+)
+```
+
+Both tags are explicit because current configured-tag semantics replace the `tasks` group fallback;
+`Operation.group` itself remains `tasks`, so native SDK grouping remains stable. The gate invocation
+is:
+
+```bash
+gnr8 changes --base origin/main --exempt-tag internal
+```
+
+The safe sequence is:
+
+1. The first revision that adds `internal` changes `C → X`. It is reported as protected-scope
+   narrowing and gates for deliberate review.
+2. After that revision is the base, a response break with `internal` on both graphs is reported but
+   exits `0`.
+3. A break to the ordinary `POST /tasks` operation remains gating because `tasks` is not in `E`.
+4. Adding `internal` to `POST /tasks` in the same revision as its break does not help: its base side
+   is still `C`, so both the scope narrowing and structural break gate.
+
+This keeps the debug endpoint callable in the generated SDK while making the exemption visible in
+the standard OpenAPI document.
+
+### 4.12 What changes from the rejected design, and what survives
+
+| Prior document | Replacement / disposition |
+|---|---|
+| §6.2 `Audience` enum plus `OperationAudiencePolicy` side-table | **Gone.** Existing effective OpenAPI tags are the only per-operation classification fact. No protocol field is added. |
+| §6.3 `ClassifyOperations` | **Gone.** Existing `DocumentOperation::tag(s)` assigns tags. The only recommended addition is the independently useful `OperationSelector::SourcePrefix` selector. |
+| §6.4 first-match audience precedence | **Gone.** Exemption is unordered set intersection: any configured tag matches on one side; every extant side must match overall. Existing tag updates already sort/deduplicate. |
+| §6.5 unclassified ⇒ public ⇒ gates | **Kept, re-keyed.** No matching exempt tag—including no tags—means checked and gates. |
+| §6.6 classification changes no generated byte | **Rejected with the enum.** Standard tags are intentionally emitted metadata, although they do not by themselves change gnr8's native SDK `group`. |
+| §6.7 either-graph rule | **Kept.** A break gates if its operation lacks an exempt tag on either extant graph side. Absence remains a distinct state. |
+| §6.10 default artifact behavior | **Core conclusion kept.** Include every operation by default; never emit/read `x-internal`; artifact reduction is explicit. “Unmarked” is replaced by visible standard tags, and the proposed `.audience(...)` target API is gone. |
+| §6.11 most-public-consumer schema walk | **Kept, re-keyed.** Any checked/non-exempt consumer on either graph side makes a schema break gate; no schema classification is stored. |
+
+The earlier verified conclusions about projected graphs, deterministic reporting, binary gate result,
+base-only removals, keeping exempt operations callable, and never scraping foreign markers also
+survive. Only the mechanism that answered “who gates?” has changed.
+
+---
