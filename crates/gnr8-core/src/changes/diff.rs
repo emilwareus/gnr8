@@ -545,8 +545,8 @@ fn compare_operations(base: &GraphIndex<'_>, current: &GraphIndex<'_>, out: &mut
     let mut matched_current = BTreeSet::new();
 
     // Preserve exact operation identity first. The later phases then correlate moves by stable id,
-    // same-route handler renames, and finally unmatched removals/additions without ever consuming a
-    // current operation twice.
+    // same-route name changes, uniquely stable source handlers, and finally unmatched
+    // removals/additions without ever consuming a current operation twice.
     for (route, operation) in &base_operations {
         if let Some(current_operation) = current_operations
             .get(route)
@@ -584,6 +584,7 @@ fn compare_operations(base: &GraphIndex<'_>, current: &GraphIndex<'_>, out: &mut
             matched_current.insert(*route);
         }
     }
+    compare_unique_handler_moves(base, current, &mut matched_base, &mut matched_current, out);
     for (route, operation) in &base_operations {
         if matched_base.contains(route) {
             continue;
@@ -610,6 +611,56 @@ fn compare_operations(base: &GraphIndex<'_>, current: &GraphIndex<'_>, out: &mut
             "operation added".to_string(),
         );
     }
+}
+
+fn compare_unique_handler_moves<'a, 'b>(
+    base: &GraphIndex<'a>,
+    current: &GraphIndex<'b>,
+    matched_base: &mut BTreeSet<(&'a str, &'a str)>,
+    matched_current: &mut BTreeSet<(&'b str, &'b str)>,
+    out: &mut Collector,
+) {
+    // `RenameOperation` changes the canonical SDK id while deliberately retaining the source
+    // handler. If the route moves in the same revision, neither the id nor route phases can pair
+    // the two sides; treating them as a removal plus addition would let an exempt-to-checked move
+    // evade the both-sides gate. A handler is used only when it is globally unique in each graph,
+    // after stronger id and route identities have already been exhausted.
+    let base_by_handler = unique_operations_by_handler(&base.graph.operations);
+    let current_by_handler = unique_operations_by_handler(&current.graph.operations);
+    for operation in base_by_handler.values() {
+        let route = (operation.method.as_str(), operation.path.as_str());
+        if matched_base.contains(&route) {
+            continue;
+        }
+        let Some(current_operation) = current_by_handler.get(operation.handler.as_str()) else {
+            continue;
+        };
+        let current_route = (
+            current_operation.method.as_str(),
+            current_operation.path.as_str(),
+        );
+        if matched_current.contains(&current_route) {
+            continue;
+        }
+        compare_moved_operation(base, current, operation, current_operation, out);
+        matched_base.insert(route);
+        matched_current.insert(current_route);
+    }
+}
+
+fn unique_operations_by_handler(operations: &[Operation]) -> BTreeMap<&str, &Operation> {
+    let mut indexed = BTreeMap::new();
+    let mut duplicates = BTreeSet::new();
+    for operation in operations {
+        let handler = operation.handler.as_str();
+        if handler.is_empty() || indexed.insert(handler, operation).is_some() {
+            duplicates.insert(handler);
+        }
+    }
+    for handler in duplicates {
+        indexed.remove(handler);
+    }
+    indexed
 }
 
 fn compare_moved_operation(
@@ -3148,6 +3199,30 @@ mod tests {
     }
 
     #[test]
+    fn simultaneous_name_and_route_change_uses_both_sides_for_gating() {
+        let mut base = graph_with_tags(&["internal"]);
+        base.operations[0].path = "/old-books".to_string();
+
+        let mut current = graph_with_tags(&["books"]);
+        current.operations[0].id = "renamedListBooks".to_string();
+        current.operations[0].path = "/new-books".to_string();
+        current.operation_docs[0].operation_id = "renamedListBooks".to_string();
+
+        let report = diff_graphs(&base, &current, &exemptions(&["internal"]));
+        assert!(report.is_gating(), "{:?}", report.changes);
+        assert!(change(&report, "operation.path.changed").gating);
+        assert!(change(&report, "operation.name.changed").gating);
+        assert_eq!(
+            change(&report, "operation.exemption.removed").kind,
+            ChangeKind::Additive
+        );
+        assert!(!report
+            .changes
+            .iter()
+            .any(|change| change.code == "operation.removed" || change.code == "operation.added"));
+    }
+
+    #[test]
     fn moved_operation_cannot_consume_the_same_current_route_twice() {
         let mut first = operation();
         first.id = "first".to_string();
@@ -3173,6 +3248,39 @@ mod tests {
                 .map(|change| change.code.as_str())
                 .collect::<BTreeSet<_>>(),
             BTreeSet::from(["operation.path.changed", "operation.removed"])
+        );
+    }
+
+    #[test]
+    fn reused_handlers_are_not_treated_as_operation_identity() {
+        let mut first = operation();
+        first.id = "first".to_string();
+        first.path = "/first".to_string();
+        first.handler = "sharedHandler".to_string();
+        let mut second = first.clone();
+        second.id = "second".to_string();
+        second.path = "/second".to_string();
+        let base = ApiGraph {
+            operations: vec![first, second],
+            ..ApiGraph::default()
+        };
+        let mut current_operation = operation();
+        current_operation.id = "third".to_string();
+        current_operation.path = "/third".to_string();
+        current_operation.handler = "sharedHandler".to_string();
+        let current = ApiGraph {
+            operations: vec![current_operation],
+            ..ApiGraph::default()
+        };
+
+        let report = diff_graphs(&base, &current, &BTreeSet::new());
+        assert_eq!(
+            report
+                .changes
+                .iter()
+                .map(|change| change.code.as_str())
+                .collect::<Vec<_>>(),
+            ["operation.removed", "operation.removed", "operation.added"]
         );
     }
 
