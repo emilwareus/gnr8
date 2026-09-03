@@ -23,16 +23,17 @@ pub(crate) struct EffectiveOperationTags<'a> {
 }
 
 impl<'a> EffectiveOperationTags<'a> {
-    /// Index the graph's non-empty explicit tag policies once.
+    /// Index the graph's first explicit policy for each operation once.
+    ///
+    /// Generated graph artifacts reject duplicate policy ids, but retaining first-match behavior
+    /// here also preserves the lowering rule for an in-memory graph before artifact validation.
     #[must_use]
     pub(crate) fn new(graph: &'a ApiGraph) -> Self {
         let mut policies = BTreeMap::new();
         for policy in &graph.operation_docs {
-            if !policy.tags.is_empty() {
-                policies
-                    .entry(policy.operation_id.as_str())
-                    .or_insert(policy.tags.as_slice());
-            }
+            policies
+                .entry(policy.operation_id.as_str())
+                .or_insert(policy.tags.as_slice());
         }
         Self { policies }
     }
@@ -43,6 +44,7 @@ impl<'a> EffectiveOperationTags<'a> {
         self.policies
             .get(operation.id.as_str())
             .copied()
+            .filter(|tags| !tags.is_empty())
             .unwrap_or(operation.group.as_slice())
     }
 }
@@ -135,6 +137,17 @@ mod tests {
         assert_eq!(
             indexed.resolve(&with_policy.operations[0]),
             ["internal", "partner"]
+        );
+
+        let first_policy_wins = ApiGraph {
+            operations: vec![operation(Some("Books"))],
+            operation_docs: vec![policy(&[]), policy(&["internal"])],
+            ..ApiGraph::default()
+        };
+        assert_eq!(
+            EffectiveOperationTags::new(&first_policy_wins)
+                .resolve(&first_policy_wins.operations[0]),
+            ["Books"]
         );
     }
 }
