@@ -349,6 +349,16 @@ fn compare_servers(
     scope: &Scope,
     out: &mut Collector,
 ) {
+    let base_urls: Vec<&str> = base
+        .servers
+        .iter()
+        .map(|server| server.url.as_str())
+        .collect();
+    let current_urls: Vec<&str> = current
+        .servers
+        .iter()
+        .map(|server| server.url.as_str())
+        .collect();
     let base_servers: BTreeMap<&str, Option<&str>> = base
         .servers
         .iter()
@@ -380,14 +390,60 @@ fn compare_servers(
     }
     for url in current_servers.keys() {
         if !base_servers.contains_key(url) {
+            let changes_default = !base_urls.is_empty()
+                && current_urls.first().copied() == Some(*url)
+                && base_urls.first() != current_urls.first();
             out.push(
                 scope,
-                ChangeKind::Additive,
+                if changes_default {
+                    ChangeKind::Breaking
+                } else {
+                    ChangeKind::Additive
+                },
                 "document.server.added",
                 Some((*url).to_string()),
-                format!("server `{url}` added"),
+                if changes_default {
+                    format!("server `{url}` added as the new default")
+                } else {
+                    format!("server `{url}` added")
+                },
             );
         }
+    }
+
+    let default_reordered = match (base_urls.first(), current_urls.first()) {
+        (Some(base_default), Some(current_default)) => {
+            base_default != current_default && base_servers.contains_key(*current_default)
+        }
+        _ => false,
+    };
+    let common_base: Vec<&str> = base_urls
+        .iter()
+        .copied()
+        .filter(|url| current_servers.contains_key(url))
+        .collect();
+    let common_current: Vec<&str> = current_urls
+        .iter()
+        .copied()
+        .filter(|url| base_servers.contains_key(url))
+        .collect();
+    let later_order_changed = !default_reordered && common_base != common_current;
+    if default_reordered || later_order_changed {
+        out.push(
+            scope,
+            if default_reordered {
+                ChangeKind::Breaking
+            } else {
+                ChangeKind::DocOnly
+            },
+            "document.server.order.changed",
+            None,
+            if default_reordered {
+                "server order changed the default server".to_string()
+            } else {
+                "server order changed".to_string()
+            },
+        );
     }
 }
 
@@ -1879,9 +1935,9 @@ mod tests {
     use super::{diff_graphs, ChangeKind};
     use crate::analyze::facts::{Constraints, FieldMeta};
     use crate::graph::{
-        ApiGraph, Field, Operation, OperationDocsPolicy, OperationSecurityPolicy, Param, Prim,
-        Response, Schema, SchemaRef, SchemaUse, SchemaUseRoot, SecurityRequirementGroup,
-        SecurityScheme, SourceSpan, Type,
+        ApiGraph, Field, OpenApiMetadataPolicy, OpenApiServer, Operation, OperationDocsPolicy,
+        OperationSecurityPolicy, Param, Prim, Response, Schema, SchemaRef, SchemaUse,
+        SchemaUseRoot, SecurityRequirementGroup, SecurityScheme, SourceSpan, Type,
     };
 
     fn span(file: &str) -> SourceSpan {
@@ -2635,6 +2691,115 @@ mod tests {
                 .collect::<Vec<_>>(),
             ["first", "second"]
         );
+    }
+
+    fn servers(urls: &[&str]) -> OpenApiMetadataPolicy {
+        OpenApiMetadataPolicy {
+            servers: urls.iter().map(|url| OpenApiServer::new(*url)).collect(),
+            ..OpenApiMetadataPolicy::default()
+        }
+    }
+
+    #[test]
+    fn server_order_tracks_default_semantics_without_overstating_later_order() {
+        let graph = |urls: &[&str], tags: &[&str]| {
+            let mut graph = graph_with_tags(tags);
+            graph.openapi_metadata = servers(urls);
+            graph
+        };
+
+        let base = graph(&["https://one.example", "https://two.example"], &[]);
+        let current = graph(&["https://two.example", "https://one.example"], &[]);
+        let report = diff_graphs(&base, &current, &BTreeSet::new());
+        let reordered = change(&report, "document.server.order.changed");
+        assert_eq!(reordered.kind, ChangeKind::Breaking);
+        assert!(reordered.gating);
+
+        let base = graph(
+            &[
+                "https://one.example",
+                "https://two.example",
+                "https://three.example",
+            ],
+            &[],
+        );
+        let current = graph(
+            &[
+                "https://one.example",
+                "https://three.example",
+                "https://two.example",
+            ],
+            &[],
+        );
+        let report = diff_graphs(&base, &current, &BTreeSet::new());
+        assert_eq!(
+            change(&report, "document.server.order.changed").kind,
+            ChangeKind::DocOnly
+        );
+
+        let current = graph(
+            &[
+                "https://one.example",
+                "https://three.example",
+                "https://two.example",
+                "https://four.example",
+            ],
+            &[],
+        );
+        let report = diff_graphs(&base, &current, &BTreeSet::new());
+        assert_eq!(
+            change(&report, "document.server.order.changed").kind,
+            ChangeKind::DocOnly
+        );
+
+        let current = graph(
+            &[
+                "https://two.example",
+                "https://one.example",
+                "https://three.example",
+                "https://four.example",
+            ],
+            &[],
+        );
+        let report = diff_graphs(&base, &current, &BTreeSet::new());
+        assert_eq!(
+            change(&report, "document.server.order.changed").kind,
+            ChangeKind::Breaking
+        );
+    }
+
+    #[test]
+    fn adding_a_server_only_breaks_when_it_replaces_the_default() {
+        let graph = |urls: &[&str], tags: &[&str]| {
+            let mut graph = graph_with_tags(tags);
+            graph.openapi_metadata = servers(urls);
+            graph
+        };
+
+        let base = graph(&["https://one.example"], &[]);
+        let appended = graph(&["https://one.example", "https://two.example"], &[]);
+        assert_eq!(
+            change(
+                &diff_graphs(&base, &appended, &BTreeSet::new()),
+                "document.server.added"
+            )
+            .kind,
+            ChangeKind::Additive
+        );
+
+        let replacement_default = graph(&["https://two.example", "https://one.example"], &[]);
+        let report = diff_graphs(&base, &replacement_default, &BTreeSet::new());
+        let added = change(&report, "document.server.added");
+        assert_eq!(added.kind, ChangeKind::Breaking);
+        assert!(added.gating);
+
+        let exempt_base = graph(&["https://one.example"], &["internal"]);
+        let exempt_current = graph(
+            &["https://two.example", "https://one.example"],
+            &["internal"],
+        );
+        let report = diff_graphs(&exempt_base, &exempt_current, &exemptions(&["internal"]));
+        assert!(!change(&report, "document.server.added").gating);
     }
 
     #[test]

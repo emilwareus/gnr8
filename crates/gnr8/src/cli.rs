@@ -162,11 +162,9 @@ pub(crate) enum InspectAction {
 }
 
 fn non_empty_tag(value: &str) -> Result<String, String> {
-    if value.is_empty() {
-        Err("tag must not be empty".to_string())
-    } else {
-        Ok(value.to_string())
-    }
+    gnr8_engine::sdk::builtins::validate_metadata_value("tag", value)
+        .map(|()| value.to_string())
+        .map_err(|error| error.to_string())
 }
 
 #[cfg(test)]
@@ -245,9 +243,6 @@ mod tests {
                 exempt_tag
             } if base == "origin/main" && exempt_tag == ["internal", "beta"]
         ));
-        assert!(
-            Cli::try_parse_from(["gnr8", "changes", "--base", "main", "--exempt-tag", ""]).is_err()
-        );
         assert!(Cli::try_parse_from(["gnr8", "changes"]).is_err());
         assert!(matches!(
             Cli::try_parse_from(["gnr8", "doctor"]).unwrap().command,
@@ -265,6 +260,30 @@ mod tests {
                 topic: Some(GuideTopic::GoGinToPythonTypescript)
             }
         ));
+    }
+
+    #[test]
+    fn changes_exempt_tags_use_the_metadata_value_contract() {
+        for invalid in ["", "   ", "internal\npartner", "internal\rpartner"] {
+            assert!(Cli::try_parse_from([
+                "gnr8",
+                "changes",
+                "--base",
+                "main",
+                "--exempt-tag",
+                invalid,
+            ])
+            .is_err());
+        }
+        assert!(Cli::try_parse_from([
+            "gnr8",
+            "changes",
+            "--base",
+            "main",
+            "--exempt-tag",
+            "partner APIs",
+        ])
+        .is_ok());
     }
 
     #[test]

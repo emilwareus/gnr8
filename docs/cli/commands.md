@@ -149,6 +149,7 @@ document.base_path.changed
 document.metadata.changed
 document.server.added
 document.server.description.changed
+document.server.order.changed
 document.server.removed
 document.title.changed
 operation.added

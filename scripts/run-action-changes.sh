@@ -23,9 +23,10 @@ done <<< "$WORKING_DIRECTORIES"
 
 change_args=()
 while IFS= read -r tag || [[ -n "$tag" ]]; do
-  tag="${tag#"${tag%%[![:space:]]*}"}"
-  tag="${tag%"${tag##*[![:space:]]}"}"
-  [[ -z "$tag" || "$tag" == \#* ]] && continue
+  # Tag matching is exact. Empty lines separate values; every byte on a non-empty line belongs to
+  # the OpenAPI tag, including leading/trailing spaces and a leading '#'. The CLI performs the one
+  # canonical validity check (blank-only and multiline values are invalid).
+  [[ -z "$tag" ]] && continue
   change_args+=(--exempt-tag "$tag")
 done <<< "${EXEMPT_TAGS:-}"
 

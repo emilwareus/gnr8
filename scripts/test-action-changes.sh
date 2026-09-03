@@ -49,7 +49,7 @@ log="$tmp/args"
 
 GNR8_BIN="$fake" \
 BASE_REF=HEAD \
-EXEMPT_TAGS=$'internal\ninternal' \
+EXEMPT_TAGS=$'internal\ninternal\n#partner\n partner APIs ' \
 WORKING_DIRECTORIES="$repo_root/examples/bookstore" \
 RUNNER_TEMP="$tmp" \
 GITHUB_OUTPUT="$output" \
@@ -68,6 +68,8 @@ if grep -E '^## injected heading$|^```' "$summary" >/dev/null; then
   exit 1
 fi
 grep -F -- '--exempt-tag internal --exempt-tag internal' "$log" >/dev/null
+grep -F -- '--exempt-tag \#partner' "$log" >/dev/null
+grep -F -- '--exempt-tag \ partner\ APIs\ ' "$log" >/dev/null
 report_root="$(sed -n 's/^report-root=//p' "$output")"
 test -s "$report_root/001/report.json"
 test -s "$report_root/001/report.md"
