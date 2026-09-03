@@ -1,0 +1,661 @@
+{
+  "schema_version": 1,
+  "graph": {
+    "module": "src",
+    "operations": [
+      {
+        "id": "listBooks",
+        "method": "GET",
+        "path": "/books/",
+        "handler": "listBooks",
+        "summary": "List books in one genre.",
+        "description": "Results are ordered by title and paginated with an opaque cursor. Pass the\ncursor from the previous page to continue; omit it to start from the beginning.",
+        "params": [
+          {
+            "name": "cursor",
+            "location": "query",
+            "required": false,
+            "schema": {
+              "type": "primitive",
+              "of": {
+                "prim": "string"
+              }
+            },
+            "provenance": {
+              "file": "books.controller.ts",
+              "start_line": 51,
+              "end_line": 51
+            }
+          },
+          {
+            "name": "genre",
+            "location": "query",
+            "required": true,
+            "schema": {
+              "type": "primitive",
+              "of": {
+                "prim": "string"
+              }
+            },
+            "provenance": {
+              "file": "books.controller.ts",
+              "start_line": 49,
+              "end_line": 49
+            }
+          },
+          {
+            "name": "sort",
+            "location": "query",
+            "required": false,
+            "schema": {
+              "type": "primitive",
+              "of": {
+                "prim": "string"
+              }
+            },
+            "provenance": {
+              "file": "books.controller.ts",
+              "start_line": 50,
+              "end_line": 50
+            }
+          }
+        ],
+        "request_body": null,
+        "responses": [
+          {
+            "status": 200,
+            "body": {
+              "ref_id": "books.dto.ListBooksResponse"
+            },
+            "content_types": [
+              "application/json"
+            ]
+          }
+        ],
+        "provenance": {
+          "file": "books.controller.ts",
+          "start_line": 48,
+          "end_line": 48
+        }
+      },
+      {
+        "id": "createBook",
+        "method": "POST",
+        "path": "/books/",
+        "handler": "createBook",
+        "summary": "Add a book to the catalogue.",
+        "description": "The book is created immediately and its generated identifier is returned.",
+        "params": [],
+        "request_body": {
+          "ref_id": "books.dto.BookDto"
+        },
+        "request_body_content_type": "application/json",
+        "responses": [
+          {
+            "status": 201,
+            "body": {
+              "ref_id": "books.dto.CreatedMessage"
+            },
+            "content_types": [
+              "application/json"
+            ]
+          }
+        ],
+        "provenance": {
+          "file": "books.controller.ts",
+          "start_line": 61,
+          "end_line": 61
+        }
+      },
+      {
+        "id": "getBook",
+        "method": "GET",
+        "path": "/books/{bookId}",
+        "handler": "getBook",
+        "summary": "Fetch one book by its identifier.",
+        "description": "Returns the book when it is in stock, and an out-of-stock notice otherwise.",
+        "params": [
+          {
+            "name": "bookId",
+            "location": "path",
+            "required": true,
+            "schema": {
+              "type": "primitive",
+              "of": {
+                "prim": "float",
+                "bits": 64
+              }
+            },
+            "provenance": {
+              "file": "books.controller.ts",
+              "start_line": 71,
+              "end_line": 71
+            }
+          },
+          {
+            "name": "fmt",
+            "location": "query",
+            "required": false,
+            "schema": {
+              "type": "named",
+              "of": "books.dto.BookFormat"
+            },
+            "provenance": {
+              "file": "books.controller.ts",
+              "start_line": 72,
+              "end_line": 72
+            }
+          }
+        ],
+        "request_body": null,
+        "responses": [
+          {
+            "status": 200,
+            "body": {
+              "ref_id": "books.dto.BookOrError"
+            },
+            "content_types": [
+              "application/json"
+            ]
+          }
+        ],
+        "provenance": {
+          "file": "books.controller.ts",
+          "start_line": 70,
+          "end_line": 70
+        }
+      },
+      {
+        "id": "updateBook",
+        "method": "PUT",
+        "path": "/books/{bookId}",
+        "handler": "updateBook",
+        "summary": "Update the stored filters for one book.",
+        "description": "Filters left unset in the payload keep their current values.",
+        "params": [
+          {
+            "name": "bookId",
+            "location": "path",
+            "required": true,
+            "schema": {
+              "type": "primitive",
+              "of": {
+                "prim": "float",
+                "bits": 64
+              }
+            },
+            "provenance": {
+              "file": "books.controller.ts",
+              "start_line": 83,
+              "end_line": 83
+            }
+          }
+        ],
+        "request_body": {
+          "ref_id": "books.dto.BookFilters"
+        },
+        "request_body_content_type": "application/json",
+        "responses": [
+          {
+            "status": 200,
+            "body": {
+              "ref_id": "books.dto.CreatedMessage"
+            },
+            "content_types": [
+              "application/json"
+            ]
+          }
+        ],
+        "provenance": {
+          "file": "books.controller.ts",
+          "start_line": 82,
+          "end_line": 82
+        }
+      }
+    ],
+    "schemas": [
+      {
+        "id": "books.dto.AuthorDto",
+        "name": "AuthorDto",
+        "body": {
+          "type": "object",
+          "of": [
+            {
+              "json_name": "bio",
+              "serializer_may_omit": false,
+              "deserializer_accepts_absent": false,
+              "deserializer_accepts_null": true,
+              "serializer_may_emit_null": true,
+              "validator_requires_presence": false,
+              "validator_rejects_null": false,
+              "schema": {
+                "type": "primitive",
+                "of": {
+                  "prim": "string"
+                }
+              },
+              "description": null,
+              "example": null
+            },
+            {
+              "json_name": "name",
+              "serializer_may_omit": false,
+              "deserializer_accepts_absent": false,
+              "deserializer_accepts_null": false,
+              "serializer_may_emit_null": false,
+              "validator_requires_presence": false,
+              "validator_rejects_null": false,
+              "schema": {
+                "type": "primitive",
+                "of": {
+                  "prim": "string"
+                }
+              },
+              "description": null,
+              "example": null
+            }
+          ]
+        },
+        "provenance": {
+          "file": "books.dto.ts",
+          "start_line": 41,
+          "end_line": 41
+        }
+      },
+      {
+        "id": "books.dto.BookDto",
+        "name": "BookDto",
+        "body": {
+          "type": "object",
+          "of": [
+            {
+              "json_name": "author",
+              "serializer_may_omit": false,
+              "deserializer_accepts_absent": false,
+              "deserializer_accepts_null": false,
+              "serializer_may_emit_null": false,
+              "validator_requires_presence": false,
+              "validator_rejects_null": false,
+              "schema": {
+                "type": "named",
+                "of": "books.dto.AuthorDto"
+              },
+              "description": null,
+              "example": null
+            },
+            {
+              "json_name": "format",
+              "serializer_may_omit": false,
+              "deserializer_accepts_absent": false,
+              "deserializer_accepts_null": false,
+              "serializer_may_emit_null": false,
+              "validator_requires_presence": false,
+              "validator_rejects_null": false,
+              "schema": {
+                "type": "named",
+                "of": "books.dto.BookFormat"
+              },
+              "description": null,
+              "example": null
+            },
+            {
+              "json_name": "id",
+              "serializer_may_omit": false,
+              "deserializer_accepts_absent": false,
+              "deserializer_accepts_null": false,
+              "serializer_may_emit_null": false,
+              "validator_requires_presence": false,
+              "validator_rejects_null": false,
+              "schema": {
+                "type": "primitive",
+                "of": {
+                  "prim": "float",
+                  "bits": 64
+                }
+              },
+              "description": null,
+              "example": null
+            },
+            {
+              "json_name": "rating",
+              "serializer_may_omit": true,
+              "deserializer_accepts_absent": true,
+              "deserializer_accepts_null": true,
+              "serializer_may_emit_null": true,
+              "validator_requires_presence": false,
+              "validator_rejects_null": false,
+              "schema": {
+                "type": "primitive",
+                "of": {
+                  "prim": "float",
+                  "bits": 64
+                }
+              },
+              "description": null,
+              "example": null
+            },
+            {
+              "json_name": "tags",
+              "serializer_may_omit": true,
+              "deserializer_accepts_absent": true,
+              "deserializer_accepts_null": false,
+              "serializer_may_emit_null": false,
+              "validator_requires_presence": false,
+              "validator_rejects_null": false,
+              "schema": {
+                "type": "array",
+                "of": {
+                  "type": "primitive",
+                  "of": {
+                    "prim": "string"
+                  }
+                }
+              },
+              "description": null,
+              "example": null
+            },
+            {
+              "json_name": "title",
+              "serializer_may_omit": false,
+              "deserializer_accepts_absent": false,
+              "deserializer_accepts_null": false,
+              "serializer_may_emit_null": false,
+              "validator_requires_presence": false,
+              "validator_rejects_null": false,
+              "schema": {
+                "type": "primitive",
+                "of": {
+                  "prim": "string"
+                }
+              },
+              "description": null,
+              "example": null
+            }
+          ]
+        },
+        "provenance": {
+          "file": "books.dto.ts",
+          "start_line": 47,
+          "end_line": 47
+        }
+      },
+      {
+        "id": "books.dto.BookFilters",
+        "name": "BookFilters",
+        "body": {
+          "type": "object",
+          "of": [
+            {
+              "json_name": "genre",
+              "serializer_may_omit": false,
+              "deserializer_accepts_absent": false,
+              "deserializer_accepts_null": false,
+              "serializer_may_emit_null": false,
+              "validator_requires_presence": false,
+              "validator_rejects_null": false,
+              "schema": {
+                "type": "primitive",
+                "of": {
+                  "prim": "string"
+                }
+              },
+              "description": null,
+              "example": null
+            },
+            {
+              "json_name": "inStock",
+              "serializer_may_omit": true,
+              "deserializer_accepts_absent": true,
+              "deserializer_accepts_null": false,
+              "serializer_may_emit_null": false,
+              "validator_requires_presence": false,
+              "validator_rejects_null": false,
+              "schema": {
+                "type": "primitive",
+                "of": {
+                  "prim": "bool"
+                }
+              },
+              "description": null,
+              "example": null
+            },
+            {
+              "json_name": "published",
+              "serializer_may_omit": false,
+              "deserializer_accepts_absent": false,
+              "deserializer_accepts_null": true,
+              "serializer_may_emit_null": true,
+              "validator_requires_presence": false,
+              "validator_rejects_null": false,
+              "schema": {
+                "type": "primitive",
+                "of": {
+                  "prim": "float",
+                  "bits": 64
+                }
+              },
+              "description": null,
+              "example": null
+            },
+            {
+              "json_name": "sort",
+              "serializer_may_omit": true,
+              "deserializer_accepts_absent": true,
+              "deserializer_accepts_null": true,
+              "serializer_may_emit_null": true,
+              "validator_requires_presence": false,
+              "validator_rejects_null": false,
+              "schema": {
+                "type": "enum",
+                "of": [
+                  "asc",
+                  "desc"
+                ]
+              },
+              "description": null,
+              "example": null
+            }
+          ]
+        },
+        "provenance": {
+          "file": "books.dto.ts",
+          "start_line": 56,
+          "end_line": 56
+        }
+      },
+      {
+        "id": "books.dto.BookFormat",
+        "name": "BookFormat",
+        "body": {
+          "type": "enum",
+          "of": [
+            "hardcover",
+            "paperback"
+          ]
+        },
+        "enum_source_order": [
+          "hardcover",
+          "paperback"
+        ],
+        "provenance": {
+          "file": "books.dto.ts",
+          "start_line": 36,
+          "end_line": 36
+        }
+      },
+      {
+        "id": "books.dto.BookOrError",
+        "name": "BookOrError",
+        "body": {
+          "type": "union",
+          "of": [
+            {
+              "type": "named",
+              "of": "books.dto.BookDto"
+            },
+            {
+              "type": "named",
+              "of": "books.dto.OutOfStockDto"
+            }
+          ]
+        },
+        "provenance": {
+          "file": "books.dto.ts",
+          "start_line": 73,
+          "end_line": 73
+        }
+      },
+      {
+        "id": "books.dto.CreatedMessage",
+        "name": "CreatedMessage",
+        "body": {
+          "type": "object",
+          "of": [
+            {
+              "json_name": "id",
+              "serializer_may_omit": false,
+              "deserializer_accepts_absent": false,
+              "deserializer_accepts_null": false,
+              "serializer_may_emit_null": false,
+              "validator_requires_presence": false,
+              "validator_rejects_null": false,
+              "schema": {
+                "type": "primitive",
+                "of": {
+                  "prim": "float",
+                  "bits": 64
+                }
+              },
+              "description": null,
+              "example": null
+            },
+            {
+              "json_name": "message",
+              "serializer_may_omit": false,
+              "deserializer_accepts_absent": false,
+              "deserializer_accepts_null": false,
+              "serializer_may_emit_null": false,
+              "validator_requires_presence": false,
+              "validator_rejects_null": false,
+              "schema": {
+                "type": "primitive",
+                "of": {
+                  "prim": "string"
+                }
+              },
+              "description": null,
+              "example": null
+            }
+          ]
+        },
+        "provenance": {
+          "file": "books.dto.ts",
+          "start_line": 75,
+          "end_line": 75
+        }
+      },
+      {
+        "id": "books.dto.ListBooksResponse",
+        "name": "ListBooksResponse",
+        "body": {
+          "type": "object",
+          "of": [
+            {
+              "json_name": "books",
+              "serializer_may_omit": false,
+              "deserializer_accepts_absent": false,
+              "deserializer_accepts_null": false,
+              "serializer_may_emit_null": false,
+              "validator_requires_presence": false,
+              "validator_rejects_null": false,
+              "schema": {
+                "type": "array",
+                "of": {
+                  "type": "named",
+                  "of": "books.dto.BookDto"
+                }
+              },
+              "description": null,
+              "example": null
+            },
+            {
+              "json_name": "nextCursor",
+              "serializer_may_omit": false,
+              "deserializer_accepts_absent": false,
+              "deserializer_accepts_null": true,
+              "serializer_may_emit_null": true,
+              "validator_requires_presence": false,
+              "validator_rejects_null": false,
+              "schema": {
+                "type": "primitive",
+                "of": {
+                  "prim": "string"
+                }
+              },
+              "description": null,
+              "example": null
+            },
+            {
+              "json_name": "total",
+              "serializer_may_omit": false,
+              "deserializer_accepts_absent": false,
+              "deserializer_accepts_null": false,
+              "serializer_may_emit_null": false,
+              "validator_requires_presence": false,
+              "validator_rejects_null": false,
+              "schema": {
+                "type": "primitive",
+                "of": {
+                  "prim": "float",
+                  "bits": 64
+                }
+              },
+              "description": null,
+              "example": null
+            }
+          ]
+        },
+        "provenance": {
+          "file": "books.dto.ts",
+          "start_line": 80,
+          "end_line": 80
+        }
+      },
+      {
+        "id": "books.dto.OutOfStockDto",
+        "name": "OutOfStockDto",
+        "body": {
+          "type": "object",
+          "of": [
+            {
+              "json_name": "reason",
+              "serializer_may_omit": false,
+              "deserializer_accepts_absent": false,
+              "deserializer_accepts_null": false,
+              "serializer_may_emit_null": false,
+              "validator_requires_presence": false,
+              "validator_rejects_null": false,
+              "schema": {
+                "type": "primitive",
+                "of": {
+                  "prim": "string"
+                }
+              },
+              "description": null,
+              "example": null
+            }
+          ]
+        },
+        "provenance": {
+          "file": "books.dto.ts",
+          "start_line": 70,
+          "end_line": 70
+        }
+      }
+    ],
+    "diagnostics": [],
+    "base_path": "/",
+    "title": "Bookstore API",
+    "security": []
+  }
+}

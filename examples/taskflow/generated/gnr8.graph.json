@@ -1,0 +1,886 @@
+{
+  "schema_version": 1,
+  "graph": {
+    "module": "example.com/taskflow",
+    "operations": [
+      {
+        "id": "listTasks",
+        "method": "GET",
+        "path": "/tasks",
+        "handler": "listTasks",
+        "summary": "Returns every task.",
+        "description": "Pass a status to narrow the results to one status; omit it to list everything.",
+        "group": "tasks",
+        "params": [
+          {
+            "name": "status",
+            "location": "query",
+            "required": false,
+            "schema": {
+              "type": "primitive",
+              "of": {
+                "prim": "string"
+              }
+            },
+            "provenance": {
+              "file": "main.go",
+              "start_line": 58,
+              "end_line": 58
+            }
+          }
+        ],
+        "request_body": null,
+        "responses": [
+          {
+            "status": 200,
+            "body": {
+              "ref_id": "TaskList"
+            },
+            "content_types": [
+              "application/json"
+            ]
+          }
+        ],
+        "provenance": {
+          "file": "main.go",
+          "start_line": 29,
+          "end_line": 29
+        }
+      },
+      {
+        "id": "createTask",
+        "method": "POST",
+        "path": "/tasks",
+        "handler": "createTask",
+        "summary": "Creates a task.",
+        "description": "The task starts in the pending status and is returned with its generated\nidentifier.",
+        "group": "tasks",
+        "params": [],
+        "request_body": {
+          "ref_id": "CreateTaskRequest"
+        },
+        "request_body_content_type": "application/json",
+        "responses": [
+          {
+            "status": 201,
+            "body": {
+              "ref_id": "Task"
+            },
+            "content_types": [
+              "application/json"
+            ]
+          },
+          {
+            "status": 400,
+            "body": {
+              "ref_id": "ErrorResponse"
+            },
+            "content_types": [
+              "application/json"
+            ]
+          }
+        ],
+        "provenance": {
+          "file": "main.go",
+          "start_line": 28,
+          "end_line": 28
+        }
+      },
+      {
+        "id": "deleteTask",
+        "method": "DELETE",
+        "path": "/tasks/{id}",
+        "handler": "deleteTask",
+        "summary": "Permanently removes one task.",
+        "group": "tasks",
+        "params": [
+          {
+            "name": "id",
+            "location": "path",
+            "required": true,
+            "schema": {
+              "type": "primitive",
+              "of": {
+                "prim": "string"
+              }
+            },
+            "provenance": {
+              "file": "main.go",
+              "start_line": 88,
+              "end_line": 88
+            }
+          }
+        ],
+        "request_body": null,
+        "responses": [
+          {
+            "status": 200,
+            "body": {
+              "ref_id": "ErrorResponse"
+            },
+            "content_types": [
+              "application/json"
+            ]
+          }
+        ],
+        "provenance": {
+          "file": "main.go",
+          "start_line": 32,
+          "end_line": 32
+        }
+      },
+      {
+        "id": "getTask",
+        "method": "GET",
+        "path": "/tasks/{id}",
+        "handler": "getTask",
+        "summary": "Returns one task by its identifier.",
+        "group": "tasks",
+        "params": [
+          {
+            "name": "id",
+            "location": "path",
+            "required": true,
+            "schema": {
+              "type": "primitive",
+              "of": {
+                "prim": "string"
+              }
+            },
+            "provenance": {
+              "file": "main.go",
+              "start_line": 65,
+              "end_line": 65
+            }
+          }
+        ],
+        "request_body": null,
+        "responses": [
+          {
+            "status": 200,
+            "body": {
+              "ref_id": "Task"
+            },
+            "content_types": [
+              "application/json"
+            ]
+          },
+          {
+            "status": 404,
+            "body": {
+              "ref_id": "ErrorResponse"
+            },
+            "content_types": [
+              "application/json"
+            ]
+          }
+        ],
+        "provenance": {
+          "file": "main.go",
+          "start_line": 30,
+          "end_line": 30
+        }
+      },
+      {
+        "id": "updateTask",
+        "method": "PUT",
+        "path": "/tasks/{id}",
+        "handler": "updateTask",
+        "summary": "Replaces the mutable fields of one task.",
+        "description": "Fields omitted from the payload keep their current values.",
+        "group": "tasks",
+        "params": [
+          {
+            "name": "id",
+            "location": "path",
+            "required": true,
+            "schema": {
+              "type": "primitive",
+              "of": {
+                "prim": "string"
+              }
+            },
+            "provenance": {
+              "file": "main.go",
+              "start_line": 77,
+              "end_line": 77
+            }
+          }
+        ],
+        "request_body": {
+          "ref_id": "UpdateTaskRequest"
+        },
+        "request_body_content_type": "application/json",
+        "responses": [
+          {
+            "status": 200,
+            "body": {
+              "ref_id": "Task"
+            },
+            "content_types": [
+              "application/json"
+            ]
+          },
+          {
+            "status": 404,
+            "body": {
+              "ref_id": "ErrorResponse"
+            },
+            "content_types": [
+              "application/json"
+            ]
+          }
+        ],
+        "provenance": {
+          "file": "main.go",
+          "start_line": 31,
+          "end_line": 31
+        }
+      }
+    ],
+    "schemas": [
+      {
+        "id": "Assignee::input",
+        "name": "AssigneeInput",
+        "body": {
+          "type": "object",
+          "of": [
+            {
+              "json_name": "email",
+              "serializer_may_omit": false,
+              "deserializer_accepts_absent": true,
+              "deserializer_accepts_null": true,
+              "serializer_may_emit_null": false,
+              "validator_requires_presence": false,
+              "validator_rejects_null": false,
+              "schema": {
+                "type": "primitive",
+                "of": {
+                  "prim": "string"
+                }
+              },
+              "description": null,
+              "example": null
+            },
+            {
+              "json_name": "id",
+              "serializer_may_omit": false,
+              "deserializer_accepts_absent": true,
+              "deserializer_accepts_null": true,
+              "serializer_may_emit_null": false,
+              "validator_requires_presence": false,
+              "validator_rejects_null": false,
+              "schema": {
+                "type": "primitive",
+                "of": {
+                  "prim": "string"
+                }
+              },
+              "description": null,
+              "example": null
+            },
+            {
+              "json_name": "name",
+              "serializer_may_omit": false,
+              "deserializer_accepts_absent": true,
+              "deserializer_accepts_null": true,
+              "serializer_may_emit_null": false,
+              "validator_requires_presence": false,
+              "validator_rejects_null": false,
+              "schema": {
+                "type": "primitive",
+                "of": {
+                  "prim": "string"
+                }
+              },
+              "description": null,
+              "example": null
+            }
+          ]
+        },
+        "provenance": {
+          "file": "models.go",
+          "start_line": 18,
+          "end_line": 18
+        }
+      },
+      {
+        "id": "Assignee::output",
+        "name": "AssigneeOutput",
+        "body": {
+          "type": "object",
+          "of": [
+            {
+              "json_name": "email",
+              "serializer_may_omit": false,
+              "deserializer_accepts_absent": true,
+              "deserializer_accepts_null": true,
+              "serializer_may_emit_null": false,
+              "validator_requires_presence": false,
+              "validator_rejects_null": false,
+              "schema": {
+                "type": "primitive",
+                "of": {
+                  "prim": "string"
+                }
+              },
+              "description": null,
+              "example": null
+            },
+            {
+              "json_name": "id",
+              "serializer_may_omit": false,
+              "deserializer_accepts_absent": true,
+              "deserializer_accepts_null": true,
+              "serializer_may_emit_null": false,
+              "validator_requires_presence": false,
+              "validator_rejects_null": false,
+              "schema": {
+                "type": "primitive",
+                "of": {
+                  "prim": "string"
+                }
+              },
+              "description": null,
+              "example": null
+            },
+            {
+              "json_name": "name",
+              "serializer_may_omit": false,
+              "deserializer_accepts_absent": true,
+              "deserializer_accepts_null": true,
+              "serializer_may_emit_null": false,
+              "validator_requires_presence": false,
+              "validator_rejects_null": false,
+              "schema": {
+                "type": "primitive",
+                "of": {
+                  "prim": "string"
+                }
+              },
+              "description": null,
+              "example": null
+            }
+          ]
+        },
+        "provenance": {
+          "file": "models.go",
+          "start_line": 18,
+          "end_line": 18
+        }
+      },
+      {
+        "id": "CreateTaskRequest",
+        "name": "CreateTaskRequest",
+        "body": {
+          "type": "object",
+          "of": [
+            {
+              "json_name": "assignee",
+              "serializer_may_omit": false,
+              "deserializer_accepts_absent": true,
+              "deserializer_accepts_null": true,
+              "serializer_may_emit_null": false,
+              "validator_requires_presence": false,
+              "validator_rejects_null": false,
+              "schema": {
+                "type": "named",
+                "of": "Assignee::input"
+              },
+              "description": null,
+              "example": null
+            },
+            {
+              "json_name": "dueAt",
+              "serializer_may_omit": false,
+              "deserializer_accepts_absent": true,
+              "deserializer_accepts_null": true,
+              "serializer_may_emit_null": false,
+              "validator_requires_presence": false,
+              "validator_rejects_null": false,
+              "schema": {
+                "type": "well_known",
+                "of": "date_time"
+              },
+              "description": null,
+              "example": null
+            },
+            {
+              "json_name": "labels",
+              "serializer_may_omit": false,
+              "deserializer_accepts_absent": true,
+              "deserializer_accepts_null": true,
+              "serializer_may_emit_null": true,
+              "validator_requires_presence": false,
+              "validator_rejects_null": false,
+              "schema": {
+                "type": "array",
+                "of": {
+                  "type": "primitive",
+                  "of": {
+                    "prim": "string"
+                  }
+                }
+              },
+              "description": null,
+              "example": null
+            },
+            {
+              "json_name": "notes",
+              "serializer_may_omit": true,
+              "deserializer_accepts_absent": true,
+              "deserializer_accepts_null": true,
+              "serializer_may_emit_null": false,
+              "validator_requires_presence": false,
+              "validator_rejects_null": false,
+              "schema": {
+                "type": "primitive",
+                "of": {
+                  "prim": "string"
+                }
+              },
+              "description": null,
+              "example": null
+            },
+            {
+              "json_name": "priority",
+              "serializer_may_omit": false,
+              "deserializer_accepts_absent": true,
+              "deserializer_accepts_null": true,
+              "serializer_may_emit_null": false,
+              "validator_requires_presence": false,
+              "validator_rejects_null": false,
+              "schema": {
+                "type": "primitive",
+                "of": {
+                  "prim": "int",
+                  "bits": 32,
+                  "signed": true
+                }
+              },
+              "description": null,
+              "example": null
+            },
+            {
+              "json_name": "status",
+              "serializer_may_omit": false,
+              "deserializer_accepts_absent": true,
+              "deserializer_accepts_null": true,
+              "serializer_may_emit_null": false,
+              "validator_requires_presence": true,
+              "validator_rejects_null": true,
+              "schema": {
+                "type": "named",
+                "of": "Status"
+              },
+              "description": null,
+              "example": null
+            },
+            {
+              "json_name": "title",
+              "serializer_may_omit": false,
+              "deserializer_accepts_absent": true,
+              "deserializer_accepts_null": true,
+              "serializer_may_emit_null": false,
+              "validator_requires_presence": true,
+              "validator_rejects_null": true,
+              "schema": {
+                "type": "primitive",
+                "of": {
+                  "prim": "string"
+                }
+              },
+              "description": null,
+              "example": null
+            }
+          ]
+        },
+        "provenance": {
+          "file": "models.go",
+          "start_line": 40,
+          "end_line": 40
+        }
+      },
+      {
+        "id": "ErrorResponse",
+        "name": "ErrorResponse",
+        "body": {
+          "type": "object",
+          "of": [
+            {
+              "json_name": "code",
+              "serializer_may_omit": false,
+              "deserializer_accepts_absent": true,
+              "deserializer_accepts_null": true,
+              "serializer_may_emit_null": false,
+              "validator_requires_presence": false,
+              "validator_rejects_null": false,
+              "schema": {
+                "type": "primitive",
+                "of": {
+                  "prim": "string"
+                }
+              },
+              "description": null,
+              "example": null
+            },
+            {
+              "json_name": "message",
+              "serializer_may_omit": false,
+              "deserializer_accepts_absent": true,
+              "deserializer_accepts_null": true,
+              "serializer_may_emit_null": false,
+              "validator_requires_presence": false,
+              "validator_rejects_null": false,
+              "schema": {
+                "type": "primitive",
+                "of": {
+                  "prim": "string"
+                }
+              },
+              "description": null,
+              "example": null
+            }
+          ]
+        },
+        "provenance": {
+          "file": "models.go",
+          "start_line": 65,
+          "end_line": 65
+        }
+      },
+      {
+        "id": "Status",
+        "name": "Status",
+        "body": {
+          "type": "enum",
+          "of": [
+            "done",
+            "in_progress",
+            "open"
+          ]
+        },
+        "enum_source_order": [
+          "done",
+          "in_progress",
+          "open"
+        ],
+        "provenance": {
+          "file": "models.go",
+          "start_line": 8,
+          "end_line": 8
+        }
+      },
+      {
+        "id": "Task",
+        "name": "Task",
+        "body": {
+          "type": "object",
+          "of": [
+            {
+              "json_name": "assignee",
+              "serializer_may_omit": false,
+              "deserializer_accepts_absent": true,
+              "deserializer_accepts_null": true,
+              "serializer_may_emit_null": false,
+              "validator_requires_presence": false,
+              "validator_rejects_null": false,
+              "schema": {
+                "type": "named",
+                "of": "Assignee::output"
+              },
+              "description": null,
+              "example": null
+            },
+            {
+              "json_name": "dueAt",
+              "serializer_may_omit": false,
+              "deserializer_accepts_absent": true,
+              "deserializer_accepts_null": true,
+              "serializer_may_emit_null": false,
+              "validator_requires_presence": false,
+              "validator_rejects_null": false,
+              "schema": {
+                "type": "well_known",
+                "of": "date_time"
+              },
+              "description": null,
+              "example": null
+            },
+            {
+              "json_name": "id",
+              "serializer_may_omit": false,
+              "deserializer_accepts_absent": true,
+              "deserializer_accepts_null": true,
+              "serializer_may_emit_null": false,
+              "validator_requires_presence": false,
+              "validator_rejects_null": false,
+              "schema": {
+                "type": "primitive",
+                "of": {
+                  "prim": "string"
+                }
+              },
+              "description": null,
+              "example": null
+            },
+            {
+              "json_name": "labels",
+              "serializer_may_omit": false,
+              "deserializer_accepts_absent": true,
+              "deserializer_accepts_null": true,
+              "serializer_may_emit_null": true,
+              "validator_requires_presence": false,
+              "validator_rejects_null": false,
+              "schema": {
+                "type": "array",
+                "of": {
+                  "type": "primitive",
+                  "of": {
+                    "prim": "string"
+                  }
+                }
+              },
+              "description": null,
+              "example": null
+            },
+            {
+              "json_name": "notes",
+              "serializer_may_omit": true,
+              "deserializer_accepts_absent": true,
+              "deserializer_accepts_null": true,
+              "serializer_may_emit_null": false,
+              "validator_requires_presence": false,
+              "validator_rejects_null": false,
+              "schema": {
+                "type": "primitive",
+                "of": {
+                  "prim": "string"
+                }
+              },
+              "description": null,
+              "example": null
+            },
+            {
+              "json_name": "priority",
+              "serializer_may_omit": false,
+              "deserializer_accepts_absent": true,
+              "deserializer_accepts_null": true,
+              "serializer_may_emit_null": false,
+              "validator_requires_presence": false,
+              "validator_rejects_null": false,
+              "schema": {
+                "type": "primitive",
+                "of": {
+                  "prim": "int",
+                  "bits": 32,
+                  "signed": true
+                }
+              },
+              "description": null,
+              "example": null
+            },
+            {
+              "json_name": "status",
+              "serializer_may_omit": false,
+              "deserializer_accepts_absent": true,
+              "deserializer_accepts_null": true,
+              "serializer_may_emit_null": false,
+              "validator_requires_presence": false,
+              "validator_rejects_null": false,
+              "schema": {
+                "type": "named",
+                "of": "Status"
+              },
+              "description": null,
+              "example": null
+            },
+            {
+              "json_name": "title",
+              "serializer_may_omit": false,
+              "deserializer_accepts_absent": true,
+              "deserializer_accepts_null": true,
+              "serializer_may_emit_null": false,
+              "validator_requires_presence": false,
+              "validator_rejects_null": false,
+              "schema": {
+                "type": "primitive",
+                "of": {
+                  "prim": "string"
+                }
+              },
+              "description": null,
+              "example": null
+            }
+          ]
+        },
+        "provenance": {
+          "file": "models.go",
+          "start_line": 27,
+          "end_line": 27
+        }
+      },
+      {
+        "id": "TaskList",
+        "name": "TaskList",
+        "body": {
+          "type": "object",
+          "of": [
+            {
+              "json_name": "tasks",
+              "serializer_may_omit": false,
+              "deserializer_accepts_absent": true,
+              "deserializer_accepts_null": true,
+              "serializer_may_emit_null": true,
+              "validator_requires_presence": false,
+              "validator_rejects_null": false,
+              "schema": {
+                "type": "array",
+                "of": {
+                  "type": "named",
+                  "of": "Task"
+                }
+              },
+              "description": null,
+              "example": null
+            }
+          ]
+        },
+        "provenance": {
+          "file": "models.go",
+          "start_line": 60,
+          "end_line": 60
+        }
+      },
+      {
+        "id": "UpdateTaskRequest",
+        "name": "UpdateTaskRequest",
+        "body": {
+          "type": "object",
+          "of": [
+            {
+              "json_name": "labels",
+              "serializer_may_omit": true,
+              "deserializer_accepts_absent": true,
+              "deserializer_accepts_null": true,
+              "serializer_may_emit_null": false,
+              "validator_requires_presence": false,
+              "validator_rejects_null": false,
+              "schema": {
+                "type": "array",
+                "of": {
+                  "type": "primitive",
+                  "of": {
+                    "prim": "string"
+                  }
+                }
+              },
+              "description": null,
+              "example": null
+            },
+            {
+              "json_name": "notes",
+              "serializer_may_omit": true,
+              "deserializer_accepts_absent": true,
+              "deserializer_accepts_null": true,
+              "serializer_may_emit_null": false,
+              "validator_requires_presence": false,
+              "validator_rejects_null": false,
+              "schema": {
+                "type": "primitive",
+                "of": {
+                  "prim": "string"
+                }
+              },
+              "description": null,
+              "example": null
+            },
+            {
+              "json_name": "priority",
+              "serializer_may_omit": true,
+              "deserializer_accepts_absent": true,
+              "deserializer_accepts_null": true,
+              "serializer_may_emit_null": false,
+              "validator_requires_presence": false,
+              "validator_rejects_null": false,
+              "schema": {
+                "type": "primitive",
+                "of": {
+                  "prim": "int",
+                  "bits": 32,
+                  "signed": true
+                }
+              },
+              "description": null,
+              "example": null
+            },
+            {
+              "json_name": "status",
+              "serializer_may_omit": true,
+              "deserializer_accepts_absent": true,
+              "deserializer_accepts_null": true,
+              "serializer_may_emit_null": false,
+              "validator_requires_presence": false,
+              "validator_rejects_null": false,
+              "schema": {
+                "type": "named",
+                "of": "Status"
+              },
+              "description": null,
+              "example": null
+            },
+            {
+              "json_name": "title",
+              "serializer_may_omit": true,
+              "deserializer_accepts_absent": true,
+              "deserializer_accepts_null": true,
+              "serializer_may_emit_null": false,
+              "validator_requires_presence": false,
+              "validator_rejects_null": false,
+              "schema": {
+                "type": "primitive",
+                "of": {
+                  "prim": "string"
+                }
+              },
+              "description": null,
+              "example": null
+            }
+          ]
+        },
+        "provenance": {
+          "file": "models.go",
+          "start_line": 51,
+          "end_line": 51
+        }
+      }
+    ],
+    "diagnostics": [
+      {
+        "code": "request.parameter.unresolved",
+        "severity": "WARN",
+        "category": "request_parameter",
+        "message": "untyped query param 'status' on GET /tasks: read via c.Query with no binding struct; param type/required-ness under-specified, type inferred as string only (TARGET-API.md §5.4)",
+        "file": "main.go",
+        "line": 58,
+        "span": {
+          "file": "main.go",
+          "start_line": 58,
+          "end_line": 58
+        },
+        "operation": "GET /tasks",
+        "subject": "status"
+      }
+    ],
+    "base_path": "/",
+    "title": "Taskflow API",
+    "security": [
+      {
+        "id": "ApiKeyAuth",
+        "kind": "apiKey",
+        "location": "header",
+        "name": "X-API-Key"
+      }
+    ]
+  }
+}

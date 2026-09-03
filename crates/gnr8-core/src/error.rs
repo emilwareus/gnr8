@@ -183,6 +183,13 @@ pub enum CoreError {
         message: String,
     },
 
+    /// The projected API graph could not be serialized or read as its generated artifact.
+    #[error("graph artifact error: {message}")]
+    GraphArtifact {
+        /// Human-readable failure detail naming the artifact and cause.
+        message: String,
+    },
+
     /// A configured diagnostic policy denied one or more structured diagnostics.
     #[error("diagnostic policy denied: {codes:?}")]
     DiagnosticsDenied {

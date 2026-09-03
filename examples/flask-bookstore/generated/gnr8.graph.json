@@ -1,0 +1,488 @@
+{
+  "schema_version": 1,
+  "graph": {
+    "module": "flask-bookstore",
+    "operations": [
+      {
+        "id": "list_orders",
+        "method": "GET",
+        "path": "/orders/",
+        "handler": "list_orders",
+        "summary": "List orders, optionally narrowed to one stock status.",
+        "description": "Orders are returned newest first. Omit the status filter to list every order\nregardless of availability.",
+        "params": [
+          {
+            "name": "status",
+            "location": "query",
+            "required": false,
+            "schema": {
+              "type": "primitive",
+              "of": {
+                "prim": "string"
+              }
+            },
+            "provenance": {
+              "file": "app/routes.py",
+              "start_line": 36,
+              "end_line": 36
+            }
+          }
+        ],
+        "request_body": null,
+        "responses": [
+          {
+            "status": 200,
+            "body": {
+              "ref_id": "app.dto.OrderConfirmation"
+            },
+            "content_types": [
+              "application/json"
+            ]
+          }
+        ],
+        "provenance": {
+          "file": "app/routes.py",
+          "start_line": 30,
+          "end_line": 30
+        }
+      },
+      {
+        "id": "create_order",
+        "method": "POST",
+        "path": "/orders/",
+        "handler": "create_order",
+        "summary": "Place a new order.",
+        "description": "The order is confirmed immediately and its confirmation number is returned.",
+        "params": [],
+        "request_body": {
+          "ref_id": "app.dto.OrderInput"
+        },
+        "request_body_content_type": "application/json",
+        "responses": [
+          {
+            "status": 201,
+            "body": {
+              "ref_id": "app.dto.OrderConfirmation"
+            },
+            "content_types": [
+              "application/json"
+            ]
+          }
+        ],
+        "provenance": {
+          "file": "app/routes.py",
+          "start_line": 43,
+          "end_line": 43
+        }
+      },
+      {
+        "id": "create_order_raw",
+        "method": "POST",
+        "path": "/orders/raw",
+        "handler": "create_order_raw",
+        "summary": "Place an order from a raw, unvalidated payload.",
+        "description": "Provided for clients that cannot produce the typed order shape. The payload is\naccepted as-is and validated downstream.",
+        "params": [],
+        "request_body": null,
+        "responses": [
+          {
+            "status": 201,
+            "body": null,
+            "body_kind": "empty"
+          }
+        ],
+        "provenance": {
+          "file": "app/routes.py",
+          "start_line": 60,
+          "end_line": 60
+        }
+      },
+      {
+        "id": "get_order",
+        "method": "GET",
+        "path": "/orders/{order_id}",
+        "handler": "get_order",
+        "summary": "Fetch one order by its identifier.",
+        "params": [
+          {
+            "name": "order_id",
+            "location": "path",
+            "required": true,
+            "schema": {
+              "type": "primitive",
+              "of": {
+                "prim": "int",
+                "bits": 64,
+                "signed": true
+              }
+            },
+            "provenance": {
+              "file": "app/routes.py",
+              "start_line": 54,
+              "end_line": 54
+            }
+          }
+        ],
+        "request_body": null,
+        "responses": [
+          {
+            "status": 200,
+            "body": {
+              "ref_id": "app.dto.OrderConfirmation"
+            },
+            "content_types": [
+              "application/json"
+            ]
+          }
+        ],
+        "provenance": {
+          "file": "app/routes.py",
+          "start_line": 54,
+          "end_line": 54
+        }
+      }
+    ],
+    "schemas": [
+      {
+        "id": "app.dto.Availability",
+        "name": "Availability",
+        "body": {
+          "type": "enum",
+          "of": [
+            "in_stock",
+            "out_of_stock"
+          ]
+        },
+        "enum_source_order": [
+          "in_stock",
+          "out_of_stock"
+        ],
+        "provenance": {
+          "file": "app/dto.py",
+          "start_line": 31,
+          "end_line": 31
+        }
+      },
+      {
+        "id": "app.dto.OrderConfirmation",
+        "name": "OrderConfirmation",
+        "body": {
+          "type": "object",
+          "of": [
+            {
+              "json_name": "availability",
+              "serializer_may_omit": false,
+              "deserializer_accepts_absent": false,
+              "deserializer_accepts_null": false,
+              "serializer_may_emit_null": false,
+              "validator_requires_presence": false,
+              "validator_rejects_null": false,
+              "schema": {
+                "type": "named",
+                "of": "app.dto.Availability"
+              },
+              "description": null,
+              "example": null
+            },
+            {
+              "json_name": "lines",
+              "serializer_may_omit": false,
+              "deserializer_accepts_absent": false,
+              "deserializer_accepts_null": false,
+              "serializer_may_emit_null": false,
+              "validator_requires_presence": false,
+              "validator_rejects_null": false,
+              "schema": {
+                "type": "array",
+                "of": {
+                  "type": "named",
+                  "of": "app.dto.Price"
+                }
+              },
+              "description": null,
+              "example": null
+            },
+            {
+              "json_name": "message",
+              "serializer_may_omit": false,
+              "deserializer_accepts_absent": false,
+              "deserializer_accepts_null": true,
+              "serializer_may_emit_null": true,
+              "validator_requires_presence": false,
+              "validator_rejects_null": false,
+              "schema": {
+                "type": "primitive",
+                "of": {
+                  "prim": "string"
+                }
+              },
+              "description": null,
+              "example": null
+            },
+            {
+              "json_name": "order_id",
+              "serializer_may_omit": false,
+              "deserializer_accepts_absent": false,
+              "deserializer_accepts_null": false,
+              "serializer_may_emit_null": false,
+              "validator_requires_presence": false,
+              "validator_rejects_null": false,
+              "schema": {
+                "type": "primitive",
+                "of": {
+                  "prim": "int",
+                  "bits": 64,
+                  "signed": true
+                }
+              },
+              "description": null,
+              "example": null
+            }
+          ]
+        },
+        "provenance": {
+          "file": "app/dto.py",
+          "start_line": 96,
+          "end_line": 96
+        }
+      },
+      {
+        "id": "app.dto.OrderInput",
+        "name": "OrderInput",
+        "body": {
+          "type": "object",
+          "of": [
+            {
+              "json_name": "book_id",
+              "serializer_may_omit": false,
+              "deserializer_accepts_absent": false,
+              "deserializer_accepts_null": false,
+              "serializer_may_emit_null": false,
+              "validator_requires_presence": false,
+              "validator_rejects_null": false,
+              "schema": {
+                "type": "primitive",
+                "of": {
+                  "prim": "int",
+                  "bits": 64,
+                  "signed": true
+                }
+              },
+              "description": null,
+              "example": null
+            },
+            {
+              "json_name": "coupon",
+              "serializer_may_omit": true,
+              "deserializer_accepts_absent": true,
+              "deserializer_accepts_null": true,
+              "serializer_may_emit_null": true,
+              "validator_requires_presence": false,
+              "validator_rejects_null": false,
+              "schema": {
+                "type": "primitive",
+                "of": {
+                  "prim": "string"
+                }
+              },
+              "description": null,
+              "example": null
+            },
+            {
+              "json_name": "discount",
+              "serializer_may_omit": true,
+              "deserializer_accepts_absent": true,
+              "deserializer_accepts_null": true,
+              "serializer_may_emit_null": true,
+              "validator_requires_presence": false,
+              "validator_rejects_null": false,
+              "schema": {
+                "type": "union",
+                "of": [
+                  {
+                    "type": "primitive",
+                    "of": {
+                      "prim": "int",
+                      "bits": 64,
+                      "signed": true
+                    }
+                  },
+                  {
+                    "type": "primitive",
+                    "of": {
+                      "prim": "float",
+                      "bits": 64
+                    }
+                  }
+                ]
+              },
+              "description": null,
+              "example": null
+            },
+            {
+              "json_name": "note",
+              "serializer_may_omit": true,
+              "deserializer_accepts_absent": true,
+              "deserializer_accepts_null": true,
+              "serializer_may_emit_null": true,
+              "validator_requires_presence": false,
+              "validator_rejects_null": false,
+              "schema": {
+                "type": "primitive",
+                "of": {
+                  "prim": "string"
+                }
+              },
+              "description": null,
+              "example": null
+            },
+            {
+              "json_name": "price",
+              "serializer_may_omit": false,
+              "deserializer_accepts_absent": false,
+              "deserializer_accepts_null": false,
+              "serializer_may_emit_null": false,
+              "validator_requires_presence": false,
+              "validator_rejects_null": false,
+              "schema": {
+                "type": "named",
+                "of": "app.dto.Price"
+              },
+              "description": null,
+              "example": null
+            },
+            {
+              "json_name": "quantity",
+              "serializer_may_omit": true,
+              "deserializer_accepts_absent": true,
+              "deserializer_accepts_null": false,
+              "serializer_may_emit_null": false,
+              "validator_requires_presence": false,
+              "validator_rejects_null": false,
+              "schema": {
+                "type": "primitive",
+                "of": {
+                  "prim": "int",
+                  "bits": 64,
+                  "signed": true
+                }
+              },
+              "description": null,
+              "example": null
+            },
+            {
+              "json_name": "tags",
+              "serializer_may_omit": true,
+              "deserializer_accepts_absent": true,
+              "deserializer_accepts_null": false,
+              "serializer_may_emit_null": false,
+              "validator_requires_presence": false,
+              "validator_rejects_null": false,
+              "schema": {
+                "type": "array",
+                "of": {
+                  "type": "primitive",
+                  "of": {
+                    "prim": "string"
+                  }
+                }
+              },
+              "description": null,
+              "example": null
+            }
+          ]
+        },
+        "provenance": {
+          "file": "app/dto.py",
+          "start_line": 60,
+          "end_line": 60
+        }
+      },
+      {
+        "id": "app.dto.Price",
+        "name": "Price",
+        "body": {
+          "type": "object",
+          "of": [
+            {
+              "json_name": "amount",
+              "serializer_may_omit": false,
+              "deserializer_accepts_absent": false,
+              "deserializer_accepts_null": false,
+              "serializer_may_emit_null": false,
+              "validator_requires_presence": false,
+              "validator_rejects_null": false,
+              "schema": {
+                "type": "primitive",
+                "of": {
+                  "prim": "float",
+                  "bits": 64
+                }
+              },
+              "description": null,
+              "example": null
+            },
+            {
+              "json_name": "currency",
+              "serializer_may_omit": false,
+              "deserializer_accepts_absent": false,
+              "deserializer_accepts_null": false,
+              "serializer_may_emit_null": false,
+              "validator_requires_presence": false,
+              "validator_rejects_null": false,
+              "schema": {
+                "type": "enum",
+                "of": [
+                  "eur",
+                  "usd"
+                ]
+              },
+              "description": null,
+              "example": null
+            }
+          ]
+        },
+        "provenance": {
+          "file": "app/dto.py",
+          "start_line": 49,
+          "end_line": 49
+        }
+      }
+    ],
+    "diagnostics": [
+      {
+        "code": "request.parameter.unresolved",
+        "severity": "WARN",
+        "category": "request_parameter",
+        "message": "untyped query param 'q' on GET /orders/: read via request.args.get with no annotation; param type/required-ness under-specified, type inferred as string only",
+        "file": "app/routes.py",
+        "line": 37,
+        "span": {
+          "file": "app/routes.py",
+          "start_line": 37,
+          "end_line": 37
+        },
+        "operation": "GET /orders/",
+        "subject": "q"
+      },
+      {
+        "code": "request.body.unresolved",
+        "severity": "WARN",
+        "category": "request_body",
+        "message": "untyped request body on POST /orders/raw: read via request.json with no typed DTO; body shape under-specified, no schema inferred",
+        "file": "app/routes.py",
+        "line": 66,
+        "span": {
+          "file": "app/routes.py",
+          "start_line": 66,
+          "end_line": 66
+        },
+        "operation": "POST /orders/raw",
+        "subject": "payload"
+      }
+    ],
+    "base_path": "/",
+    "title": "Bookstore Orders API",
+    "security": []
+  }
+}
