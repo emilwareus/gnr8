@@ -484,3 +484,166 @@ nothing here to *comply* with, because there is no single thing to comply with �
 is also what makes borrowing safe.
 
 ---
+
+### 5.2 Governance standards: audience and stability are two different dials
+
+**A correction to the brief's premise first: AIP-183 does not exist.** `https://google.aip.dev/183`
+returns 404, as does the raw `aip/general/0183.md`, and the AIP repository's general directory goes
+`0180.md, 0181.md, 0182.md, 0184.md, 0185.md`
+([aip-dev/google.aip.dev](https://github.com/aip-dev/google.aip.dev/tree/master/aip/general)). The
+relevant AIPs are 180, 181, and 185.
+
+**[AIP-180 "Backwards compatibility"](https://google.aip.dev/180)** states the obligation — "Existing
+client code **must not** be broken by a service updating to a new minor or patch release" — across
+three axes it names *source*, *wire*, and *semantic* compatibility. It contains no occurrence of
+"internal", "alpha", "beta", or "visibility". What it does contain is a scope note that is, almost
+word for word, Emil's problem:
+
+> This guidance assumes that APIs are intended to be called from a range of consumers … Any API which
+> has a more limited scope (for example, an API which is only called by client code written by the
+> same team as the API producer, or deployed in a way which can enforce updates) **should carefully
+> consider its own compatibility requirements.**
+
+**[AIP-181 "Stability levels"](https://google.aip.dev/181)** carries the per-level guarantees: alpha
+"undergoes rapid iteration with a known set of users who **must** be tolerant of change … Breaking
+changes **must** be both allowed and expected"; beta "**may** include backwards-incompatible changes …
+made only after a reasonable deprecation period"; stable "**must** be fully-supported over the
+lifetime of the major API version … there **must** be no breaking changes."
+
+**[AIP-185](https://google.aip.dev/185) §"Visibility-based versioning"** is where Google's actual
+visibility mechanism lives, and its framing is the sharpest sentence in this whole survey:
+
+> A visibility label is a case-sensitive string that can be used to tag any API element … An implicit
+> `PUBLIC` label is applied to all API elements unless an explicit visibility label is applied … Each
+> visibility label is an allow-list … **In other words, an API visibility label is like an ACL'ed API
+> version.**
+
+The wire form is
+[`google/api/visibility.proto`](https://github.com/googleapis/googleapis/blob/master/google/api/visibility.proto),
+six extensions sharing field number `72295727` (`api_visibility`, `method_visibility`,
+`message_visibility`, `field_visibility`, `enum_visibility`, `value_visibility`), carrying
+`VisibilityRule { selector, restriction }`. Two of its own doc comments matter here:
+
+> If an element and all its parents have no visibility label, its visibility is unconditionally
+> granted.
+
+> If a rule has multiple labels, removing one of the labels but not all of them **can break clients.**
+
+That second line is Google independently arriving at §2.4: narrowing a visibility label is a breaking
+change.
+
+**[Zalando's rule #219](https://opensource.zalando.com/restful-api-guidelines/#219)** is the closest
+thing to a standard `audience` field, and its shape is instructive precisely because it is *not* what
+gnr8 needs. `MUST provide API audience`, at `/info/x-audience`, `x-extensible-enum` over
+`component-internal`, `business-unit-internal`, `company-internal`, `external-partner`,
+`external-public` — five levels with "clear organisational and legal boundaries". But:
+
+> **Note:** Exactly *one audience* per API specification is allowed … **If parts of your API have a
+> different target audience, we recommend to split API specifications along the target audience** —
+> even if this creates redundancies.
+
+So Zalando's audience is **document-level and governance-facing**: it drives review process,
+publication obligation, naming rules, hostname conventions, and partner deprecation consent. It is
+explicitly *not* a compatibility dial — the word `audience` never appears in Zalando's
+`compatibility.adoc`. Its compatibility rule
+[#106](https://opensource.zalando.com/restful-api-guidelines/#106) is flat across audiences, and
+carries one hint gnr8 should read carefully:
+
+> Please note that the compatibility guarantees are for the 'on the wire' format. **Binary or source
+> compatibility of code generated from an API specification is not covered by these rules.**
+
+gnr8 *is* the code generator, so gnr8's diff must cover exactly what Zalando disclaims: operation-id
+renames, group renames, model-field optionality. That is a real difference in remit, not a detail.
+
+**[Microsoft's REST API Guidelines](https://github.com/microsoft/api-guidelines/blob/vNext/graph/Guidelines-deprecated.md)**
+take the opposite position and refuse to tier at all:
+
+> These guidelines are applicable to any REST API exposed publicly … **Private or internal APIs SHOULD
+> also try to follow these guidelines because internal services tend to eventually be exposed
+> publicly.**
+
+They also delegate the definition of breaking: "**Teams MAY define backwards compatibility as their
+business needs require** … Services MUST explicitly define their definition of a breaking change."
+(The top-level `Guidelines.md` on `vNext` is now a deprecation stub pointing at the Azure and Graph
+documents; [`azure/Guidelines.md`](https://github.com/microsoft/api-guidelines/blob/vNext/azure/Guidelines.md)
+is absolute — "**DO NOT** introduce any breaking changes into the service" — with preview status
+encoded in the `api-version` string, not in a label.)
+
+**[Kubernetes](https://kubernetes.io/docs/reference/using-api/#api-versioning)** ties the guarantee to
+the version identifier: alpha "may be dropped at any time without notice … may change in incompatible
+ways in a later software release without notice"; beta "maximum lifetime of 9 months or 3 minor
+releases … schema and/or semantics may change in incompatible ways in a subsequent beta or stable API
+version"; stable "remain available for all future releases within a Kubernetes major version". Its
+[deprecation policy](https://kubernetes.io/docs/reference/using-api/deprecation-policy/) Rule #1 is
+track-*independent*: "Once an API element has been added to an API group at a particular version, it
+can not be removed from that version or have its behavior significantly changed, **regardless of
+track**." Alpha is not mutable — an alpha *version* is immutable too; you are merely allowed to delete
+the whole version quickly.
+[`api_changes.md`](https://github.com/kubernetes/community/blob/master/contributors/devel/sig-architecture/api_changes.md#alpha-beta-and-stable-versions)
+does use the word **Audience** as one attribute of each maturity stage — "developers and expert users
+interested in giving early feedback" (alpha) up to "**all users**" (stable).
+
+**The finding that matters most for gnr8:** across all four, **nobody makes breaking-change policy a
+function of an audience label.** The differentiator is always a *stability level*, and in both Google
+and Kubernetes that level is carried by the version identifier itself (`v1alpha1`,
+`2021-06-04-preview`). Google's visibility labels are the single exception, and AIP-185 frames them as
+versioning by other means — an "ACL'ed API version" whose labels are removed entirely at GA.
+
+Issue #75's ask is therefore genuinely novel in one respect and conventional in another: gating CI on
+a *per-operation* classification is not attested anywhere, but the underlying idea — different parts
+of one surface carry different compatibility promises — is the consensus position everywhere.
+
+### 5.3 SDK generators: exclusion is a boolean everywhere but Fern
+
+| Tool | Mechanism | Shape | Effect |
+|---|---|---|---|
+| [Speakeasy](https://www.speakeasy.com/docs/speakeasy-reference/extensions) | `x-speakeasy-ignore` (operation *and* parameter) | boolean | "Exclude certain methods from your SDK with this extension." |
+| [Fern](https://buildwithfern.com/learn/api-definitions/openapi/extensions/audiences) | `x-fern-audiences` (server, operation, schema, property) + `x-fern-ignore` | **list of user-defined labels** | selected per generator group via `audiences:` in `generators.yml` / `docs.yml` |
+| [Stainless](https://www.stainless.com/docs/reference/config/) | `unspecified_endpoints: ["post /internal_endpoint", …]`, `skip`, `only` | list / boolean | skip list in config, no visibility concept |
+| [OpenAPI Generator](https://openapi-generator.tech/docs/customization/) | `x-internal: true` | boolean | **skips generation, on by default, no flag needed** |
+
+Three of these bear directly on decisions below.
+
+**OpenAPI Generator honours `x-internal` unconditionally.** `DefaultGenerator.java:1606` skips any
+operation whose extensions carry `x-internal: true`, logging "Operation ({} {} - {}) not generated
+since x-internal is set to true"; `:501` does the same for schemas. The `REMOVE_X_INTERNAL`
+normalizer rule *strips* the extension so the element is generated again — it is an opt-out of the
+hiding. Its `--openapi-normalizer FILTER=…` works by *writing* `x-internal: true` onto every operation
+that does not match. So if gnr8 emitted `x-internal` into its OpenAPI document, any downstream
+consumer running OpenAPI Generator would **silently lose those operations from their SDK**, with no
+flag involved.
+
+**Fern's audience model is element-level, list-valued, and fail-open**, and its own docs concede the
+consequence:
+
+> When you specify audiences, elements tagged with a matching audience are included, and elements
+> tagged only with other audiences are dropped. **Untagged elements aren't scoped to any audience, so
+> they're always included.**
+
+> **To keep internal endpoints out of partner-facing output entirely, split them into a separate API
+> definition or exclude their paths with `settings.filter` rather than relying on tags alone.**
+
+Google reaches the same default from the other direction ("If an element and all its parents have no
+visibility label, its visibility is unconditionally granted"). **A fail-closed visibility default is
+unattested in every source surveyed.** That is worth knowing because gnr8's safe default points the
+same way: unclassified ⇒ treated as a customer contract ⇒ visible *and* gating. The two polarities
+agree.
+
+**Speakeasy is the cautionary tale.**
+[`x-speakeasy-extension-rewrite`](https://www.speakeasy.com/docs/speakeasy-reference/extensions) is,
+verbatim, a compliance surface: "You can use `x-speakeasy-extension-rewrite` to map any extension from
+the wider OpenAPI ecosystem or another vendor to the equivalent Speakeasy extension. This allows you
+to use your existing OpenAPI spec without needing to make changes to it." Their own documented example
+maps `x-enum-varnames` — an OpenAPI Generator convention — onto a Speakeasy key. That is precisely the
+feature CLAUDE.md rule 0.1 forbids, in a shipped commercial product, so it is a useful concrete image
+of what the rule is protecting against rather than an abstraction.
+
+Also worth recording, because it corrects a common assumption: **Speakeasy does not derive SDK versions
+from a semantic spec diff.**
+[Their versioning docs](https://www.speakeasy.com/docs/sdks/manage/versioning) state "Speakeasy does
+not currently analyze the actual content of the OpenAPI document (such as added or removed
+operations). Only the `info.version` field and the overall document checksum are evaluated." Their
+[breaking-change tooling](https://www.speakeasy.com/docs/sdks/manage/breaking-changes) is separate and
+advisory. `gnr8 changes` would not be catching up to them; it would be doing something they don't.
+
+---
