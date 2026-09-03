@@ -351,6 +351,7 @@ fn compare_servers(
 ) {
     let base_urls = distinct_server_urls(base);
     let current_urls = distinct_server_urls(current);
+    let base_default = base_urls.first().copied().unwrap_or("/");
     let base_servers = server_descriptions(base);
     let current_servers = server_descriptions(current);
     for (url, descriptions) in &base_servers {
@@ -374,9 +375,8 @@ fn compare_servers(
     }
     for url in current_servers.keys() {
         if !base_servers.contains_key(url) {
-            let changes_default = !base_urls.is_empty()
-                && current_urls.first().copied() == Some(*url)
-                && base_urls.first() != current_urls.first();
+            let changes_default =
+                current_urls.first().copied() == Some(*url) && base_default != *url;
             out.push(
                 scope,
                 if changes_default {
@@ -1840,24 +1840,27 @@ fn schema_scope(
     let current_affected = current_side.as_ref().map(|(_, _, operations)| {
         affected_operations(current_index.graph, operations.iter().copied())
     });
-    let current_operation = current_affected
+    let has_multiple_operations = base_affected
         .as_ref()
-        .and_then(|operations| single_operation(operations));
-    let base_operation = base_affected
-        .as_ref()
-        .and_then(|operations| single_operation(operations));
-    Scope {
-        operation: current_operation
+        .is_some_and(|operations| operations.len() > 1)
+        || current_affected
             .as_ref()
-            .map(|operation| operation.operation.clone())
+            .is_some_and(|operations| operations.len() > 1);
+    let named_operation = if has_multiple_operations {
+        None
+    } else {
+        current_affected
+            .as_ref()
+            .and_then(|operations| single_operation(operations))
             .or_else(|| {
-                base_operation
+                base_affected
                     .as_ref()
-                    .map(|operation| operation.operation.clone())
-            }),
-        operation_id: current_operation
-            .map(|operation| operation.operation_id.clone())
-            .or_else(|| base_operation.map(|operation| operation.operation_id.clone())),
+                    .and_then(|operations| single_operation(operations))
+            })
+    };
+    Scope {
+        operation: named_operation.map(|operation| operation.operation.clone()),
+        operation_id: named_operation.map(|operation| operation.operation_id.clone()),
         affected_operations: Sides {
             base: base_affected,
             current: current_affected,
@@ -2761,6 +2764,41 @@ mod tests {
         );
     }
 
+    #[test]
+    fn asymmetric_schema_consumers_do_not_claim_one_operation() {
+        let base = request_graph(
+            &[],
+            "Shared::input",
+            vec![schema("Shared::input", vec![field("value")])],
+        );
+        let mut current = request_graph(
+            &[],
+            "Shared::input",
+            vec![schema("Shared::input", Vec::new())],
+        );
+        let mut second = operation();
+        second.id = "second".to_string();
+        second.path = "/second".to_string();
+        second.request_body = Some(SchemaRef {
+            ref_id: "Shared::input".to_string(),
+        });
+        current.operations.push(second);
+
+        let report = diff_graphs(&base, &current, &BTreeSet::new());
+        let finding = change(&report, "request.property.removed");
+        assert!(finding.operation.is_none());
+        assert!(finding.operation_id.is_none());
+        assert_eq!(
+            finding
+                .affected_operations
+                .current
+                .as_ref()
+                .expect("current consumers")
+                .len(),
+            2
+        );
+    }
+
     fn servers(urls: &[&str]) -> OpenApiMetadataPolicy {
         OpenApiMetadataPolicy {
             servers: urls.iter().map(|url| OpenApiServer::new(*url)).collect(),
@@ -2849,6 +2887,31 @@ mod tests {
         assert_eq!(
             change(
                 &diff_graphs(&base, &appended, &BTreeSet::new()),
+                "document.server.added"
+            )
+            .kind,
+            ChangeKind::Additive
+        );
+
+        let implicit_default = graph(&[], &[]);
+        let first_explicit = graph(&["https://one.example"], &[]);
+        assert_eq!(
+            change(
+                &diff_graphs(&implicit_default, &first_explicit, &BTreeSet::new()),
+                "document.server.added"
+            )
+            .kind,
+            ChangeKind::Breaking
+        );
+
+        let explicit_implicit_default = graph(&["/"], &[]);
+        assert_eq!(
+            change(
+                &diff_graphs(
+                    &implicit_default,
+                    &explicit_implicit_default,
+                    &BTreeSet::new()
+                ),
                 "document.server.added"
             )
             .kind,
