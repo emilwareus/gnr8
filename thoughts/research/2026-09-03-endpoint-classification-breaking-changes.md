@@ -647,3 +647,97 @@ operations). Only the `info.version` field and the overall document checksum are
 advisory. `gnr8 changes` would not be catching up to them; it would be doing something they don't.
 
 ---
+
+### 5.4 Diff tooling: severity vocabularies, exit codes, and — critically — how they exempt things
+
+Six tools, read from source rather than docs where the two disagree.
+
+**Severity vocabularies:**
+
+| Tool | Levels (verbatim) |
+|---|---|
+| [oasdiff](https://github.com/oasdiff/oasdiff) | `ERR` / `WARN` / `INFO` as flag values; `3` / `2` / `1` as the JSON `level` int; `error` / `warning` / `info` from `Level.String()` |
+| [Azure `oad`](https://github.com/Azure/openapi-diff) | `Info` / `Warning` / `Error` (`Category`), orthogonal to `Addition` / `Update` / `Removal` (`MessageType`) |
+| [Criteo openapi-comparator](https://github.com/criteo/openapi-comparator) | `Info` / `Warning` / `Error` (a C# re-implementation of Azure's, same 1000-series rule numbering) |
+| Atlassian `openapi-diff` (Bitbucket-only; `github.com/atlassian/openapi-diff` 404s) | `Breaking` / `Non-breaking` / **`Unclassified`** — "changes that have been detected by the tool but can't be classified" |
+| [OpenAPITools/openapi-diff](https://github.com/OpenAPITools/openapi-diff) | weighted enum `NO_CHANGES(0)`, **`METADATA(1)`**, `COMPATIBLE(2)`, `UNKNOWN(3)`, `INCOMPATIBLE(4)`; `isIncompatible() { weight > 2 }` |
+| [buf](https://buf.build/docs/breaking/) | **no severity at all** — strictness is category membership (`FILE`, `PACKAGE`, `WIRE`, `WIRE_JSON`, `CSR`) |
+
+Two structural observations. First, **four of the six carry an explicit "detected but undecidable"
+tier** — oasdiff's `WARN`, Atlassian's `Unclassified`, OpenAPITools' `UNKNOWN`. Issue #75's
+vocabulary has no such tier. Second, OpenAPITools' `METADATA` is exactly issue #75's DOC-ONLY, given
+first-class status *between* "nothing changed" and "changed compatibly".
+
+oasdiff's severity is **derived, not hand-assigned**, from a taxonomy of `effect` × `direction`
+(`checker/rules/derive.go`): a narrowing on the response side is `INFO` but on the request side is
+`ERR`; a widening is the mirror image. That asymmetry — request narrows break clients, response
+widens break clients — is a real insight for gnr8, whose graph already models direction explicitly
+(`graph/direction.rs`).
+
+**Exit codes diverge sharply**, and this is a genuine decision point:
+
+- **oasdiff**: `--fail-on ERR|WARN|INFO` → `1`; plus a dedicated error band `100`–`123` for distinct
+  failure modes, with a source comment noting `123` is "kept under 125 to stay clear of the shell's
+  reserved 126/127/128+ range".
+- **buf**: `0` clean, **`100`** violations, `1` tool/system error — "We use a different exit code to be
+  able to distinguish user-parsable errors from system errors."
+- **Atlassian**: fails automatically — "The command will exit with an exit code 1 if any breaking
+  changes were found, so that you can fail builds in CI."
+- **OpenAPITools**: default is *always* `0`; you must pass `--fail-on-incompatible`.
+- **Azure `oad` and Criteo**: never fail on findings at all. Gating is the caller's job.
+
+**Suppression, in increasing quality — this is the part gnr8 should learn from:**
+
+1. **Rendered-text matching.** oasdiff's `--err-ignore` / `--warn-ignore` files match on
+   `(path, operation, rendered message)` via `strings.Contains`, with no rule ID involved. Brittle by
+   construction: reword a message and every ignore line silently stops matching. (Their own
+   `examples/ignore-err-example.txt` calls the lines regexes; `checker/ignore.go` imports no `regexp`.)
+2. **Rule-ID × path map.** buf's `ignore_only: {FILE_SAME_TYPE: [foo/foo.proto, bar]}` is the only
+   mechanism among the six that gives per-check *and* per-location granularity. oasdiff cannot do
+   this: `--severity-levels` is global-per-ID, ignore files are per-path-with-no-ID, and the two axes
+   never meet.
+3. **Content-derived stable fingerprint.** oasdiff's `fingerprint` is
+   `SHA256("{id}:{operation}:{path}:{text}")[:12]`, documented as "stable across commits — the same
+   breaking change in a PR gets the same fingerprint regardless of which commit introduced it", built
+   so "if a reviewer approves a breaking change on commit A, the approval can be carried forward"
+   ([docs/FINGERPRINT.md](https://github.com/oasdiff/oasdiff/blob/main/docs/FINGERPRINT.md)). Its one
+   flaw is that `text` is in the hash, so a wording change invalidates every approval.
+
+**buf's hardest-won lesson, and it is exactly §2.4.** Path exclusions are tested against **both** sides
+of the diff — the current `FileLocation` *and* the `AgainstFileLocation` — because otherwise an
+exclusion cannot suppress a *deletion* at all: a deleted file has no current-side path. For the same
+reason buf **hardcodes comment-ignores off** for breaking checks (`AllowCommentIgnores: false`,
+`CommentIgnorePrefix: ""`), and there is no `buf:breaking:ignore` anywhere in the repo — a breaking
+violation may exist only on the against side, where there is no comment to carry a directive.
+
+(Noting the obvious for gnr8: buf's `// buf:lint:ignore RULE_ID` is precisely the in-comment key/value
+grammar CLAUDE.md rule 0.1 forbids gnr8 from reading *or* inventing. The transferable content is the
+shape of `use` / `except` / `ignore_only` and the both-sides rule, not the directive syntax.)
+
+**And the closest prior art to Emil's actual ask, which does exist:** oasdiff's
+[`x-stability-level`](https://github.com/oasdiff/oasdiff/blob/main/docs/STABILITY.md) — a per-endpoint
+in-spec label over `draft` → `alpha` → `beta` → `stable`, with `--stability-level` as the threshold.
+Verbatim from the docs, and verified in `checker/stability_level.go`:
+
+> By default, oasdiff uses a **beta** threshold: endpoints marked `draft` or `alpha` are excluded from
+> breaking-change detection, while `beta` and `stable` endpoints are checked.
+
+> Endpoints with **no** `x-stability-level` are treated as `stable` and are always included regardless
+> of the threshold.
+
+That is a per-operation exemption from CI gating, with a fail-closed default for unlabelled
+endpoints — the same polarity §6.5 recommends. And oasdiff closes the relabelling loophole the same
+way §2.4 does:
+
+> oasdiff detects changes to an endpoint's `x-stability-level` in **both** directions: **Decreased**
+> (`stable`→`beta`, `beta`→`alpha`, etc.) — reported as `api-stability-decreased` …
+> These changes are only reported when **the base stability (the level being left)** meets the
+> configured threshold.
+
+Two verified negatives worth not designing around: oasdiff has **no `--exclude-endpoints` flag**, and
+`--filter-extension` compiles its argument as a regex over extension **names**, never values
+(`diff/operations_diff.go`) — so `x-internal: false` is indistinguishable from `x-internal: true`.
+oasdiff does have `--attributes x-audience`, which copies an extension's value into the JSON
+`attributes` field for a downstream consumer to filter on; the tool itself never acts on it.
+
+---
