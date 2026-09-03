@@ -65,11 +65,11 @@ targets:
 Every one is `#[serde(default, skip_serializing_if = "Vec::is_empty")]`, sorted, and documented as
 "facts the typed source cannot express … CLAUDE.md rule 4" (`graph.rs:48-56`). This is the
 established shape for a new per-operation fact, and it is deliberately a *side-table*, not a field on
-`Operation`: `Operation`'s doc comment (`graph.rs:485-492`) states that every structural field on it
+`Operation`: `Operation`'s doc comment (`graph.rs:484-492`) states that every structural field on it
 is derived purely from source.
 
 `OperationDocsPolicy` carries the sharpest precedent for what NOT to do
-(`graph.rs:397-402`):
+(`graph.rs:399-402`):
 
 ```rust
 // NOTE: `summary`/`description` are deliberately NOT here. Prose lives on
@@ -112,7 +112,7 @@ The repo has **both** resolution styles already, and they are used for different
 - **First-match-wins, silent.** `GroupOperations` (`crates/gnr8-core/src/sdk/builtins.rs:2485-2528`)
   iterates rules in configuration order per operation and `break`s on the first match. Its SDK-side
   doc says so plainly: "Rules run in the order they are configured; the first match for an operation
-  wins" (`crates/gnr8-sdk/src/sdk/builtins.rs:1770-1771`).
+  wins" (`crates/gnr8-sdk/src/sdk/builtins.rs:1771`).
 - **Exactly-one-match-or-hard-error.** `find_selected_operation_index`
   (`crates/gnr8-core/src/sdk/builtins.rs:1941`) returns `CoreError::Config` for zero matches
   (`"… did not match any operation"`) and for many (`"… must match exactly one operation but matched
@@ -121,20 +121,20 @@ The repo has **both** resolution styles already, and they are used for different
 `DocumentOperation` is stricter still: it pre-scans every matched operation for a prose collision
 *before mutating any of them* — "so a transform that is going to fail leaves the graph exactly as it
 found it. A half-applied transform would make the error depend on operation order"
-(`crates/gnr8-core/src/sdk/builtins.rs:2176-2179`) — and errors if the operation already has prose
-from source, with the message "would be a second source for one fact" (`:2297-2302`). It also errors
-when the selector matches nothing (`:2237`).
+(`crates/gnr8-core/src/sdk/builtins.rs:2171-2174`) — and errors if the operation already has prose
+from source, with the message "would be a second source for one fact" (`:2296-2303`). It also errors
+when the selector matches nothing (`:2207`).
 
 That pre-scan-then-mutate discipline is the pattern any new classifying transform must copy.
 
 ### 1.6 Transform ordering is composition order, and nothing re-sorts it
 
 `crates/gnr8-core/src/pipeline/mod.rs:9`: "Stage order is composition order. A pipeline with no
-custom stages never sends a work frame." `build_ir` walks `plan.transforms` in order (`:263-268`),
+custom stages never sends a work frame." `build_ir` walks `plan.transforms` in order (`:265-270`),
 grouping consecutive custom stages into one round-trip but never reordering. So a classification
 transform's position is user-visible and load-bearing — exactly like `DiagnosticPolicy`, whose doc
 says "Place this transform after explicit correction transforms … and before targets"
-(`crates/gnr8-sdk/src/sdk/builtins.rs:332-334`).
+(`crates/gnr8-sdk/src/sdk/builtins.rs:333-335`).
 
 ### 1.7 The status quo for internal endpoints: delete them
 
@@ -152,7 +152,7 @@ impl Transform for DropDebugRoutes {
 ```
 
 The repo already knows this is the only option and says so in `RequireOperationDocs`'s doc comment
-(`crates/gnr8-sdk/src/sdk/builtins.rs:377-381`):
+(`crates/gnr8-sdk/src/sdk/builtins.rs:365-368`):
 
 > This is OPT-IN and a PIPELINE STAGE rather than a check inside a `Source`, because only the user's
 > own pipeline knows when their public-surface filtering has finished: **gnr8 has no built-in
@@ -386,7 +386,7 @@ and the null trio). A diff must therefore compare the *derived* value in the *sa
 raw field, or it will report phantom changes on a schema whose direction set changed.
 
 **`Operation::group` is not cosmetic.** `SdkFileLayout::split()` sets
-`OperationFileSplit::PerTag` (`crates/gnr8-sdk/src/sdk/layout.rs:33-42`), and per-tag emission puts
+`OperationFileSplit::PerTag` (`crates/gnr8-sdk/src/sdk/layout.rs:34-43`), and per-tag emission puts
 operations in a file named for the group, falling back to the synthetic `"default"` group
 (`layout.rs:73-77`, `:114`, `:192`). Renaming a group renames generated SDK files and, in Go and
 TypeScript, the symbols users import. That is why the issue lists it as a breaking-change category
@@ -795,7 +795,7 @@ pub enum Audience {
 Every detail here is copied from an existing decision, not invented:
 
 - **A side-table, not a field on `Operation`.** `Operation`'s doc comment says every structural field
-  on it is derived purely from source (`graph.rs:485-492`); audience is a rule-4 config fact. This is
+  on it is derived purely from source (`graph.rs:484-492`); audience is a rule-4 config fact. This is
   exactly `operation_security` / `operation_runtime` / `pagination` / `operation_docs` (§1.3).
 - **`#[serde(default, skip_serializing_if = "Vec::is_empty")]`** matches all four. And it does real
   work here: `ApiGraph` does **not** use `deny_unknown_fields` (verified: zero occurrences in
@@ -803,7 +803,7 @@ Every detail here is copied from an existing decision, not invented:
   with an empty table — every operation unclassified — which resolves to `Public`, the safe answer.
   Adding the field cannot retroactively exempt anything.
 - **Sorted by `operation_id`** on every write, as `upsert_operation_docs` does
-  (`crates/gnr8-core/src/sdk/builtins.rs:2331-2341`), so determinism holds.
+  (`crates/gnr8-core/src/sdk/builtins.rs:2354-2364`), so determinism holds.
 - **An enum, not a `bool`.** LoopBack rejected a boolean `x-internal` in review for the open-valued
   `x-visibility` ([PR #1896](https://github.com/loopbackio/loopback-next/pull/1896)); Zalando needed
   five values; Google's labels are arbitrary strings. Two variants is what gnr8 needs *today*, and an
@@ -843,13 +843,13 @@ Three rules, in this order, and nothing else:
 
 1. **Within one `ClassifyOperations`, the first matching rule wins**, in declaration order. This is
    verbatim the `GroupOperations` semantic — "Rules run in the order they are configured; the first
-   match for an operation wins" (`crates/gnr8-sdk/src/sdk/builtins.rs:1770-1771`), implemented as an
-   ordered scan with `break` (`crates/gnr8-core/src/sdk/builtins.rs:2489-2527`) — and it is already
+   match for an operation wins" (`crates/gnr8-sdk/src/sdk/builtins.rs:1771`), implemented as an
+   ordered scan with `break` (`crates/gnr8-core/src/sdk/builtins.rs:2487-2528`) — and it is already
    documented for users (`docs/pipeline/transforms.md:268-269`). Users put the exception before the
    general rule, exactly as they already do for grouping.
 2. **A rule that matches no operation is a hard error.** `CoreError::Config`, naming the selector.
-   This is `DocumentOperation`'s behaviour (`crates/gnr8-core/src/sdk/builtins.rs:2236-2240`) and
-   `find_selected_operation_index`'s (`:1955-1958`). A typo'd selector that silently classifies
+   This is `DocumentOperation`'s behaviour (`crates/gnr8-core/src/sdk/builtins.rs:2205-2209`) and
+   `find_selected_operation_index`'s (`:1956-1965`). A typo'd selector that silently classifies
    nothing would leave an endpoint gating when the author believed it exempt, or — worse in the other
    direction — a stale rule would keep exempting an endpoint that moved.
 3. **A second transform assigning a *different* audience to an already-classified operation is a hard
@@ -889,7 +889,7 @@ targets. Concretely, after `RenameOperation` (a rule keyed on an id must see the
 any custom filter, and before `RequireOperationDocs`.
 
 The point of ordering it late is one specific interaction. `RequireOperationDocs`'s own doc comment
-(`crates/gnr8-sdk/src/sdk/builtins.rs:377-381`) explains that it must run after public-surface
+(`crates/gnr8-sdk/src/sdk/builtins.rs:365-368`) explains that it must run after public-surface
 filtering because "gnr8 has no built-in operation-exclusion transform". Once audience exists, the
 obvious follow-on is `RequireOperationDocs::public_only()` — require prose on customer contracts, not
 on debug endpoints. That is a natural second-step feature, and it is listed in Open (§8.5) rather than
@@ -1179,7 +1179,7 @@ the customer contract, whatever else also uses it. Removing a field from it brea
 regardless of the debug endpoint that happens to share it.
 
 This is not new machinery. `graph::direction::schema_directions`
-(`crates/gnr8-core/src/graph/direction.rs:83-128`) already performs exactly this walk for a different
+(`crates/gnr8-core/src/graph/direction.rs:83-134`) already performs exactly this walk for a different
 question: it collects request roots and response roots from every operation's body, params, preserved
 `OpenAPI` fragments, and `graph.schema_uses`, then calls `reachable_schemas` over each root set and
 returns a `BTreeMap`. Audience is the same walk with the roots partitioned by audience instead of by
@@ -1224,7 +1224,7 @@ throughout, exactly as `direction.rs` does, so it is deterministic.
    this in code review for `x-visibility`, Zalando needed five values, and Google's labels are open
    strings. Two variants today, room for a third, no call-site churn when it arrives.
 6. **A field on `Operation` rather than a side-table.** Rejected: `Operation`'s doc comment reserves
-   it for facts "derived PURELY from source code" (`graph.rs:485-492`). Audience is a rule-4 config
+   it for facts "derived PURELY from source code" (`graph.rs:484-492`). Audience is a rule-4 config
    fact and belongs where the other four config side-tables live.
 7. **Rules in `.gnr8/` only, recomputed against the base graph.** Rejected in §3 — recomputation
    applies today's policy to yesterday's API, so relabelling an endpoint would retroactively claim it
@@ -1268,7 +1268,7 @@ throughout, exactly as `direction.rs` does, so it is deterministic.
    oasdiff `WARN` ("changes where the definition genuinely does not contain enough information to
    decide"), Atlassian `Unclassified`, OpenAPITools `UNKNOWN`. Issue #75's vocabulary has three
    values and no such slot. gnr8 has less undecidability than a general OpenAPI differ because it
-   diffs its own typed graph, but not none: `Type::Any {}` (`facts.rs:349`) is explicitly lossy, and
+   diffs its own typed graph, but not none: `Type::Any {}` (`facts.rs:350`) is explicitly lossy, and
    `Response::body_kind` (`graph.rs:598`) can record a dynamic body. Adding a fourth kind is a
    vocabulary change to issue #75 and should be decided there, not here.
 4. **A blanket allowance for a deliberate breaking release.** `--allow <id>` is right for one approved
@@ -1279,14 +1279,14 @@ throughout, exactly as `direction.rs` does, so it is deterministic.
    escape, and `OpenApiMetadataPolicy::version` already exists at `graph.rs:163`), or nothing.
 5. **`RequireOperationDocs` gaining an audience filter.** Its doc comment already explains that it
    must run after public-surface filtering because "gnr8 has no built-in operation-exclusion
-   transform" (`crates/gnr8-sdk/src/sdk/builtins.rs:377-381`). Once audience exists, "require prose on
+   transform" (`crates/gnr8-sdk/src/sdk/builtins.rs:365-368`). Once audience exists, "require prose on
    customer contracts only" is the obvious next step. Deliberately not recommended here — one feature
    at a time.
 6. **Whether an audience extension is ever emitted, and whether `OpenApi` source reads it back.**
    §6.10 recommends emitting nothing now. If that changes, note the rule-3 shape carefully: gnr8 could
    legitimately read its own emitted key for `OpenApi`-imported operations while using pipeline rules
    for source-extracted ones — that is exactly the one-source-per-operation structure `Operation`'s
-   `summary` already uses (`graph.rs:508-514`). It is defensible, but it is a second code path for one
+   `summary` already uses (`graph.rs:505-511`). It is defensible, but it is a second code path for one
    fact and should not be built speculatively. Also note oasdiff's `--attributes x-audience` copies an
    extension's value into its JSON output without acting on it (§5.4), so even a consumer that wanted
    this would get annotation, not behaviour.
