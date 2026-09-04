@@ -123,6 +123,7 @@ Use `gnr8 init --source fastapi --sdk python`, `--source flask --sdk python`, or
 | `gnr8 init` | Create the required `.gnr8/` pipeline crate. |
 | `gnr8 generate` | Generate all configured artifacts. |
 | `gnr8 check` | Fail when generated artifacts are stale or changed by hand. |
+| `gnr8 changes --base <ref>` | Classify API changes and gate checked breaking findings. |
 | `gnr8 watch` | Regenerate after source or pipeline changes. |
 | `gnr8 doctor` | Report toolchain, extraction, and output problems. |
 | `gnr8 inspect routes\|schemas\|graph` | Inspect facts from the pipeline or an explicit source path. |
@@ -142,9 +143,12 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v7
-      - uses: oaiz-io/gnr8@v0.10.1
+        with:
+          fetch-depth: 0
+      - uses: oaiz-io/gnr8@v0.11.0 # first release with API change reporting
         with:
           setup-go: "true"
+          report-api-changes: "true"
 ```
 
 Pin an exact released tag. For Python and TypeScript sources, use the matching setup input. See

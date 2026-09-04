@@ -1927,6 +1927,7 @@ fn operation_selector_matches(
             op.path.starts_with(prefix)
                 || joined_operation_path(base_path, &op.path).starts_with(prefix)
         }
+        OperationSelector::SourcePrefix(prefix) => op.provenance.file.starts_with(prefix),
         OperationSelector::Methods(methods) => methods.iter().any(|method| method == &op.method),
         OperationSelector::Middleware(symbol) => op
             .middleware
@@ -3908,11 +3909,12 @@ mod tests {
     #![allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
 
     use super::{
-        create_unique_postprocess_dir, go_gin_cache_path, load_go_gin_cache, save_go_gin_cache,
-        sdk_package, source_input_roots, ApiOverrides, ApplySecurity, ConfigurePagination,
-        ConfigureSdkRuntime, Cx, DiagnosticPolicy, EnumOrder, ExtractorIdentity, FastApi, Flask,
-        FormatCommand, GoGin, GoSdk, GroupOperations, Header, MarkIdempotent, NestJs, OpenApi31,
-        OpenApi31Json, OpenApiFieldPatch, OpenApiMetadata, OpenApiSchemaPatch, OperationSelector,
+        create_unique_postprocess_dir, go_gin_cache_path, load_go_gin_cache,
+        operation_selector_matches, save_go_gin_cache, sdk_package, source_input_roots,
+        ApiOverrides, ApplySecurity, ConfigurePagination, ConfigureSdkRuntime, Cx,
+        DiagnosticPolicy, EnumOrder, ExtractorIdentity, FastApi, Flask, FormatCommand, GoGin,
+        GoSdk, GroupOperations, Header, MarkIdempotent, NestJs, OpenApi31, OpenApi31Json,
+        OpenApiFieldPatch, OpenApiMetadata, OpenApiSchemaPatch, OperationSelector,
         ParameterOverride, PostExec, PySdk, RenameType, RequestParameter, ResponseOverride,
         SdkPackageMetadata, SecurityOverride, SetBasePath, SetEnumOrder,
         SetOperationSuccessResponse, SetSchemaFieldType, SetTitle, SourceExec, StaticFiles,
@@ -4512,6 +4514,28 @@ mod tests {
             security_overrides_global: false,
             provenance: span(),
         }
+    }
+
+    #[test]
+    fn source_prefix_selector_matches_provenance_file_exactly() {
+        let mut operation = selector_test_operation("listBooks", "GET", "/books");
+        operation.provenance.file = "internal/books/list.rs".to_string();
+
+        assert!(operation_selector_matches(
+            &OperationSelector::source_prefix("internal/books/"),
+            &operation,
+            ""
+        ));
+        assert!(!operation_selector_matches(
+            &OperationSelector::source_prefix("Internal/books/"),
+            &operation,
+            ""
+        ));
+        assert!(!operation_selector_matches(
+            &OperationSelector::source_prefix("books/"),
+            &operation,
+            ""
+        ));
     }
 
     fn grouped_test_operation(

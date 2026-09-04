@@ -1,0 +1,889 @@
+{
+  "schema_version": 1,
+  "graph": {
+    "module": "example.com/bookstore",
+    "operations": [
+      {
+        "id": "listBooks",
+        "method": "GET",
+        "path": "/books",
+        "handler": "listBooks",
+        "summary": "Returns every book in the catalogue.",
+        "description": "Pass a genre to narrow the results to one genre; omit it to list everything.",
+        "group": "books",
+        "params": [
+          {
+            "name": "genre",
+            "location": "query",
+            "required": false,
+            "schema": {
+              "type": "primitive",
+              "of": {
+                "prim": "string"
+              }
+            },
+            "provenance": {
+              "file": "main.go",
+              "start_line": 49,
+              "end_line": 49
+            }
+          }
+        ],
+        "request_body": null,
+        "responses": [
+          {
+            "status": 200,
+            "body": {
+              "ref_id": "BookList"
+            },
+            "content_types": [
+              "application/json"
+            ]
+          }
+        ],
+        "provenance": {
+          "file": "main.go",
+          "start_line": 25,
+          "end_line": 25
+        }
+      },
+      {
+        "id": "createBook",
+        "method": "POST",
+        "path": "/books",
+        "handler": "createBook",
+        "summary": "Adds a book to the catalogue.",
+        "description": "The book is stored immediately and returned with its generated identifier.",
+        "group": "books",
+        "params": [],
+        "request_body": {
+          "ref_id": "CreateBookRequest"
+        },
+        "request_body_content_type": "application/json",
+        "responses": [
+          {
+            "status": 201,
+            "body": {
+              "ref_id": "Book"
+            },
+            "content_types": [
+              "application/json"
+            ]
+          },
+          {
+            "status": 400,
+            "body": {
+              "ref_id": "ErrorResponse"
+            },
+            "content_types": [
+              "application/json"
+            ]
+          }
+        ],
+        "provenance": {
+          "file": "main.go",
+          "start_line": 24,
+          "end_line": 24
+        }
+      },
+      {
+        "id": "deleteBook",
+        "method": "DELETE",
+        "path": "/books/{id}",
+        "handler": "deleteBook",
+        "summary": "Permanently removes one book from the catalogue.",
+        "group": "books",
+        "params": [
+          {
+            "name": "id",
+            "location": "path",
+            "required": true,
+            "schema": {
+              "type": "primitive",
+              "of": {
+                "prim": "string"
+              }
+            },
+            "provenance": {
+              "file": "main.go",
+              "start_line": 79,
+              "end_line": 79
+            }
+          }
+        ],
+        "request_body": null,
+        "responses": [
+          {
+            "status": 200,
+            "body": {
+              "ref_id": "ErrorResponse"
+            },
+            "content_types": [
+              "application/json"
+            ]
+          }
+        ],
+        "provenance": {
+          "file": "main.go",
+          "start_line": 28,
+          "end_line": 28
+        }
+      },
+      {
+        "id": "getBook",
+        "method": "GET",
+        "path": "/books/{id}",
+        "handler": "getBook",
+        "summary": "Returns one book by its identifier.",
+        "group": "books",
+        "params": [
+          {
+            "name": "id",
+            "location": "path",
+            "required": true,
+            "schema": {
+              "type": "primitive",
+              "of": {
+                "prim": "string"
+              }
+            },
+            "provenance": {
+              "file": "main.go",
+              "start_line": 56,
+              "end_line": 56
+            }
+          }
+        ],
+        "request_body": null,
+        "responses": [
+          {
+            "status": 200,
+            "body": {
+              "ref_id": "Book"
+            },
+            "content_types": [
+              "application/json"
+            ]
+          },
+          {
+            "status": 404,
+            "body": {
+              "ref_id": "ErrorResponse"
+            },
+            "content_types": [
+              "application/json"
+            ]
+          }
+        ],
+        "provenance": {
+          "file": "main.go",
+          "start_line": 26,
+          "end_line": 26
+        }
+      },
+      {
+        "id": "updateBook",
+        "method": "PUT",
+        "path": "/books/{id}",
+        "handler": "updateBook",
+        "summary": "Replaces the mutable fields of one book.",
+        "description": "Fields omitted from the payload keep their current values.",
+        "group": "books",
+        "params": [
+          {
+            "name": "id",
+            "location": "path",
+            "required": true,
+            "schema": {
+              "type": "primitive",
+              "of": {
+                "prim": "string"
+              }
+            },
+            "provenance": {
+              "file": "main.go",
+              "start_line": 68,
+              "end_line": 68
+            }
+          }
+        ],
+        "request_body": {
+          "ref_id": "UpdateBookRequest"
+        },
+        "request_body_content_type": "application/json",
+        "responses": [
+          {
+            "status": 200,
+            "body": {
+              "ref_id": "Book"
+            },
+            "content_types": [
+              "application/json"
+            ]
+          },
+          {
+            "status": 404,
+            "body": {
+              "ref_id": "ErrorResponse"
+            },
+            "content_types": [
+              "application/json"
+            ]
+          }
+        ],
+        "provenance": {
+          "file": "main.go",
+          "start_line": 27,
+          "end_line": 27
+        }
+      }
+    ],
+    "schemas": [
+      {
+        "id": "Book",
+        "name": "Book",
+        "body": {
+          "type": "object",
+          "of": [
+            {
+              "json_name": "author",
+              "serializer_may_omit": false,
+              "deserializer_accepts_absent": true,
+              "deserializer_accepts_null": true,
+              "serializer_may_emit_null": false,
+              "validator_requires_presence": false,
+              "validator_rejects_null": false,
+              "schema": {
+                "type": "primitive",
+                "of": {
+                  "prim": "string"
+                }
+              },
+              "description": null,
+              "example": null
+            },
+            {
+              "json_name": "genre",
+              "serializer_may_omit": false,
+              "deserializer_accepts_absent": true,
+              "deserializer_accepts_null": true,
+              "serializer_may_emit_null": false,
+              "validator_requires_presence": false,
+              "validator_rejects_null": false,
+              "schema": {
+                "type": "named",
+                "of": "Genre"
+              },
+              "description": null,
+              "example": null
+            },
+            {
+              "json_name": "id",
+              "serializer_may_omit": false,
+              "deserializer_accepts_absent": true,
+              "deserializer_accepts_null": true,
+              "serializer_may_emit_null": false,
+              "validator_requires_presence": false,
+              "validator_rejects_null": false,
+              "schema": {
+                "type": "primitive",
+                "of": {
+                  "prim": "string"
+                }
+              },
+              "description": null,
+              "example": null
+            },
+            {
+              "json_name": "price",
+              "serializer_may_omit": false,
+              "deserializer_accepts_absent": true,
+              "deserializer_accepts_null": true,
+              "serializer_may_emit_null": false,
+              "validator_requires_presence": false,
+              "validator_rejects_null": false,
+              "schema": {
+                "type": "primitive",
+                "of": {
+                  "prim": "float",
+                  "bits": 64
+                }
+              },
+              "description": null,
+              "example": null
+            },
+            {
+              "json_name": "publishedAt",
+              "serializer_may_omit": false,
+              "deserializer_accepts_absent": true,
+              "deserializer_accepts_null": true,
+              "serializer_may_emit_null": false,
+              "validator_requires_presence": false,
+              "validator_rejects_null": false,
+              "schema": {
+                "type": "well_known",
+                "of": "date_time"
+              },
+              "description": null,
+              "example": null
+            },
+            {
+              "json_name": "publisher",
+              "serializer_may_omit": false,
+              "deserializer_accepts_absent": true,
+              "deserializer_accepts_null": true,
+              "serializer_may_emit_null": false,
+              "validator_requires_presence": false,
+              "validator_rejects_null": false,
+              "schema": {
+                "type": "named",
+                "of": "Publisher::output"
+              },
+              "description": null,
+              "example": null
+            },
+            {
+              "json_name": "subtitle",
+              "serializer_may_omit": true,
+              "deserializer_accepts_absent": true,
+              "deserializer_accepts_null": true,
+              "serializer_may_emit_null": false,
+              "validator_requires_presence": false,
+              "validator_rejects_null": false,
+              "schema": {
+                "type": "primitive",
+                "of": {
+                  "prim": "string"
+                }
+              },
+              "description": null,
+              "example": null
+            },
+            {
+              "json_name": "tags",
+              "serializer_may_omit": false,
+              "deserializer_accepts_absent": true,
+              "deserializer_accepts_null": true,
+              "serializer_may_emit_null": true,
+              "validator_requires_presence": false,
+              "validator_rejects_null": false,
+              "schema": {
+                "type": "array",
+                "of": {
+                  "type": "primitive",
+                  "of": {
+                    "prim": "string"
+                  }
+                }
+              },
+              "description": null,
+              "example": null
+            },
+            {
+              "json_name": "title",
+              "serializer_may_omit": false,
+              "deserializer_accepts_absent": true,
+              "deserializer_accepts_null": true,
+              "serializer_may_emit_null": false,
+              "validator_requires_presence": false,
+              "validator_rejects_null": false,
+              "schema": {
+                "type": "primitive",
+                "of": {
+                  "prim": "string"
+                }
+              },
+              "description": null,
+              "example": null
+            }
+          ]
+        },
+        "provenance": {
+          "file": "models.go",
+          "start_line": 27,
+          "end_line": 27
+        }
+      },
+      {
+        "id": "BookList",
+        "name": "BookList",
+        "body": {
+          "type": "object",
+          "of": [
+            {
+              "json_name": "books",
+              "serializer_may_omit": false,
+              "deserializer_accepts_absent": true,
+              "deserializer_accepts_null": true,
+              "serializer_may_emit_null": true,
+              "validator_requires_presence": false,
+              "validator_rejects_null": false,
+              "schema": {
+                "type": "array",
+                "of": {
+                  "type": "named",
+                  "of": "Book"
+                }
+              },
+              "description": null,
+              "example": null
+            }
+          ]
+        },
+        "provenance": {
+          "file": "models.go",
+          "start_line": 62,
+          "end_line": 62
+        }
+      },
+      {
+        "id": "CreateBookRequest",
+        "name": "CreateBookRequest",
+        "body": {
+          "type": "object",
+          "of": [
+            {
+              "json_name": "author",
+              "serializer_may_omit": false,
+              "deserializer_accepts_absent": true,
+              "deserializer_accepts_null": true,
+              "serializer_may_emit_null": false,
+              "validator_requires_presence": true,
+              "validator_rejects_null": true,
+              "schema": {
+                "type": "primitive",
+                "of": {
+                  "prim": "string"
+                }
+              },
+              "description": null,
+              "example": null
+            },
+            {
+              "json_name": "genre",
+              "serializer_may_omit": false,
+              "deserializer_accepts_absent": true,
+              "deserializer_accepts_null": true,
+              "serializer_may_emit_null": false,
+              "validator_requires_presence": true,
+              "validator_rejects_null": true,
+              "schema": {
+                "type": "named",
+                "of": "Genre"
+              },
+              "description": null,
+              "example": null
+            },
+            {
+              "json_name": "price",
+              "serializer_may_omit": false,
+              "deserializer_accepts_absent": true,
+              "deserializer_accepts_null": true,
+              "serializer_may_emit_null": false,
+              "validator_requires_presence": false,
+              "validator_rejects_null": false,
+              "schema": {
+                "type": "primitive",
+                "of": {
+                  "prim": "float",
+                  "bits": 64
+                }
+              },
+              "description": null,
+              "example": null
+            },
+            {
+              "json_name": "publisher",
+              "serializer_may_omit": false,
+              "deserializer_accepts_absent": true,
+              "deserializer_accepts_null": true,
+              "serializer_may_emit_null": false,
+              "validator_requires_presence": false,
+              "validator_rejects_null": false,
+              "schema": {
+                "type": "named",
+                "of": "Publisher::input"
+              },
+              "description": null,
+              "example": null
+            },
+            {
+              "json_name": "subtitle",
+              "serializer_may_omit": true,
+              "deserializer_accepts_absent": true,
+              "deserializer_accepts_null": true,
+              "serializer_may_emit_null": false,
+              "validator_requires_presence": false,
+              "validator_rejects_null": false,
+              "schema": {
+                "type": "primitive",
+                "of": {
+                  "prim": "string"
+                }
+              },
+              "description": null,
+              "example": null
+            },
+            {
+              "json_name": "tags",
+              "serializer_may_omit": false,
+              "deserializer_accepts_absent": true,
+              "deserializer_accepts_null": true,
+              "serializer_may_emit_null": true,
+              "validator_requires_presence": false,
+              "validator_rejects_null": false,
+              "schema": {
+                "type": "array",
+                "of": {
+                  "type": "primitive",
+                  "of": {
+                    "prim": "string"
+                  }
+                }
+              },
+              "description": null,
+              "example": null
+            },
+            {
+              "json_name": "title",
+              "serializer_may_omit": false,
+              "deserializer_accepts_absent": true,
+              "deserializer_accepts_null": true,
+              "serializer_may_emit_null": false,
+              "validator_requires_presence": true,
+              "validator_rejects_null": true,
+              "schema": {
+                "type": "primitive",
+                "of": {
+                  "prim": "string"
+                }
+              },
+              "description": null,
+              "example": null
+            }
+          ]
+        },
+        "provenance": {
+          "file": "models.go",
+          "start_line": 41,
+          "end_line": 41
+        }
+      },
+      {
+        "id": "ErrorResponse",
+        "name": "ErrorResponse",
+        "body": {
+          "type": "object",
+          "of": [
+            {
+              "json_name": "code",
+              "serializer_may_omit": false,
+              "deserializer_accepts_absent": true,
+              "deserializer_accepts_null": true,
+              "serializer_may_emit_null": false,
+              "validator_requires_presence": false,
+              "validator_rejects_null": false,
+              "schema": {
+                "type": "primitive",
+                "of": {
+                  "prim": "string"
+                }
+              },
+              "description": null,
+              "example": null
+            },
+            {
+              "json_name": "message",
+              "serializer_may_omit": false,
+              "deserializer_accepts_absent": true,
+              "deserializer_accepts_null": true,
+              "serializer_may_emit_null": false,
+              "validator_requires_presence": false,
+              "validator_rejects_null": false,
+              "schema": {
+                "type": "primitive",
+                "of": {
+                  "prim": "string"
+                }
+              },
+              "description": null,
+              "example": null
+            }
+          ]
+        },
+        "provenance": {
+          "file": "models.go",
+          "start_line": 67,
+          "end_line": 67
+        }
+      },
+      {
+        "id": "Genre",
+        "name": "Genre",
+        "body": {
+          "type": "enum",
+          "of": [
+            "fiction",
+            "mystery",
+            "nonfiction",
+            "romance",
+            "scifi"
+          ]
+        },
+        "enum_source_order": [
+          "fiction",
+          "mystery",
+          "nonfiction",
+          "romance",
+          "scifi"
+        ],
+        "provenance": {
+          "file": "models.go",
+          "start_line": 7,
+          "end_line": 7
+        }
+      },
+      {
+        "id": "Publisher::input",
+        "name": "PublisherInput",
+        "body": {
+          "type": "object",
+          "of": [
+            {
+              "json_name": "country",
+              "serializer_may_omit": false,
+              "deserializer_accepts_absent": true,
+              "deserializer_accepts_null": true,
+              "serializer_may_emit_null": false,
+              "validator_requires_presence": false,
+              "validator_rejects_null": false,
+              "schema": {
+                "type": "primitive",
+                "of": {
+                  "prim": "string"
+                }
+              },
+              "description": null,
+              "example": null
+            },
+            {
+              "json_name": "name",
+              "serializer_may_omit": false,
+              "deserializer_accepts_absent": true,
+              "deserializer_accepts_null": true,
+              "serializer_may_emit_null": false,
+              "validator_requires_presence": false,
+              "validator_rejects_null": false,
+              "schema": {
+                "type": "primitive",
+                "of": {
+                  "prim": "string"
+                }
+              },
+              "description": null,
+              "example": null
+            }
+          ]
+        },
+        "provenance": {
+          "file": "models.go",
+          "start_line": 19,
+          "end_line": 19
+        }
+      },
+      {
+        "id": "Publisher::output",
+        "name": "PublisherOutput",
+        "body": {
+          "type": "object",
+          "of": [
+            {
+              "json_name": "country",
+              "serializer_may_omit": false,
+              "deserializer_accepts_absent": true,
+              "deserializer_accepts_null": true,
+              "serializer_may_emit_null": false,
+              "validator_requires_presence": false,
+              "validator_rejects_null": false,
+              "schema": {
+                "type": "primitive",
+                "of": {
+                  "prim": "string"
+                }
+              },
+              "description": null,
+              "example": null
+            },
+            {
+              "json_name": "name",
+              "serializer_may_omit": false,
+              "deserializer_accepts_absent": true,
+              "deserializer_accepts_null": true,
+              "serializer_may_emit_null": false,
+              "validator_requires_presence": false,
+              "validator_rejects_null": false,
+              "schema": {
+                "type": "primitive",
+                "of": {
+                  "prim": "string"
+                }
+              },
+              "description": null,
+              "example": null
+            }
+          ]
+        },
+        "provenance": {
+          "file": "models.go",
+          "start_line": 19,
+          "end_line": 19
+        }
+      },
+      {
+        "id": "UpdateBookRequest",
+        "name": "UpdateBookRequest",
+        "body": {
+          "type": "object",
+          "of": [
+            {
+              "json_name": "author",
+              "serializer_may_omit": true,
+              "deserializer_accepts_absent": true,
+              "deserializer_accepts_null": true,
+              "serializer_may_emit_null": false,
+              "validator_requires_presence": false,
+              "validator_rejects_null": false,
+              "schema": {
+                "type": "primitive",
+                "of": {
+                  "prim": "string"
+                }
+              },
+              "description": null,
+              "example": null
+            },
+            {
+              "json_name": "genre",
+              "serializer_may_omit": true,
+              "deserializer_accepts_absent": true,
+              "deserializer_accepts_null": true,
+              "serializer_may_emit_null": false,
+              "validator_requires_presence": false,
+              "validator_rejects_null": false,
+              "schema": {
+                "type": "named",
+                "of": "Genre"
+              },
+              "description": null,
+              "example": null
+            },
+            {
+              "json_name": "price",
+              "serializer_may_omit": true,
+              "deserializer_accepts_absent": true,
+              "deserializer_accepts_null": true,
+              "serializer_may_emit_null": false,
+              "validator_requires_presence": false,
+              "validator_rejects_null": false,
+              "schema": {
+                "type": "primitive",
+                "of": {
+                  "prim": "float",
+                  "bits": 64
+                }
+              },
+              "description": null,
+              "example": null
+            },
+            {
+              "json_name": "subtitle",
+              "serializer_may_omit": true,
+              "deserializer_accepts_absent": true,
+              "deserializer_accepts_null": true,
+              "serializer_may_emit_null": false,
+              "validator_requires_presence": false,
+              "validator_rejects_null": false,
+              "schema": {
+                "type": "primitive",
+                "of": {
+                  "prim": "string"
+                }
+              },
+              "description": null,
+              "example": null
+            },
+            {
+              "json_name": "tags",
+              "serializer_may_omit": true,
+              "deserializer_accepts_absent": true,
+              "deserializer_accepts_null": true,
+              "serializer_may_emit_null": false,
+              "validator_requires_presence": false,
+              "validator_rejects_null": false,
+              "schema": {
+                "type": "array",
+                "of": {
+                  "type": "primitive",
+                  "of": {
+                    "prim": "string"
+                  }
+                }
+              },
+              "description": null,
+              "example": null
+            },
+            {
+              "json_name": "title",
+              "serializer_may_omit": true,
+              "deserializer_accepts_absent": true,
+              "deserializer_accepts_null": true,
+              "serializer_may_emit_null": false,
+              "validator_requires_presence": false,
+              "validator_rejects_null": false,
+              "schema": {
+                "type": "primitive",
+                "of": {
+                  "prim": "string"
+                }
+              },
+              "description": null,
+              "example": null
+            }
+          ]
+        },
+        "provenance": {
+          "file": "models.go",
+          "start_line": 52,
+          "end_line": 52
+        }
+      }
+    ],
+    "diagnostics": [
+      {
+        "code": "request.parameter.unresolved",
+        "severity": "WARN",
+        "category": "request_parameter",
+        "message": "untyped query param 'genre' on GET /books: read via c.Query with no binding struct; param type/required-ness under-specified, type inferred as string only (TARGET-API.md §5.4)",
+        "file": "main.go",
+        "line": 49,
+        "span": {
+          "file": "main.go",
+          "start_line": 49,
+          "end_line": 49
+        },
+        "operation": "GET /books",
+        "subject": "genre"
+      }
+    ],
+    "base_path": "/",
+    "title": "Bookstore API",
+    "security": [
+      {
+        "id": "ApiKeyAuth",
+        "kind": "apiKey",
+        "location": "header",
+        "name": "X-API-Key"
+      }
+    ]
+  }
+}

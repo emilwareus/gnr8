@@ -15,10 +15,11 @@
 //!
 //!   * gnr8 built-ins — `GoGin` (source), `SetBasePath`/`SetTitle`/`ApplySecurity` (transforms),
 //!     `OpenApi31`/`GoSdk` (targets), `Header::generated()` (post-process);
-//!   * a USER-DEFINED `Transform` — [`DropDebugRoutes`], which edits the IR in Rust before generation;
+//!   * standard operation tags — the `_debug` route remains generated but is marked `internal` for
+//!     an explicit `gnr8 changes --exempt-tag internal` gate policy;
 //!   * a USER-DEFINED `Target` — [`ApiMarkdown`], a ~30-line generator that writes an `API.md` summary.
 //!
-//! The two user-defined stages are composed with `Custom(...)`; the built-ins are not.
+//! The user-defined target is composed with `Custom(...)`; the built-ins are not.
 //!
 //! Run it from the taskflow module root so `GoGin::new().inputs(["."])` analyzes the Go module here:
 //!
@@ -34,25 +35,6 @@
 use gnr8::graph::{ApiGraph, Type};
 use gnr8::sdk::prelude::*;
 use gnr8::Error;
-
-// ---------------------------------------------------------------------------------------------------
-// A custom Transform: edit the IR in Rust before generation.
-// ---------------------------------------------------------------------------------------------------
-
-/// Drop every internal `_debug` route from the API model.
-///
-/// The Go service registers a real `GET /tasks/_debug` diagnostics endpoint, but it should not appear
-/// in the public OpenAPI document or the generated SDK. A `Transform` receives the IR by `&mut`, so we
-/// just filter the operations — this is "edit the IR in code," the seam that replaces a config DSL.
-/// Every later stage (OpenApi31, GoSdk, ApiMarkdown) sees the already-filtered model.
-struct DropDebugRoutes;
-
-impl Transform for DropDebugRoutes {
-    fn apply(&self, ir: &mut ApiGraph, _cx: &Cx) -> Result<(), Error> {
-        ir.operations.retain(|op| !op.path.contains("_debug"));
-        Ok(())
-    }
-}
 
 // ---------------------------------------------------------------------------------------------------
 // A custom Target: write your own generator in ~30 lines.
@@ -136,11 +118,14 @@ fn main() -> std::process::ExitCode {
         Pipeline::new()
             // Source: read the Go + Gin service in this module (built-in).
             .source(GoGin::new().inputs(["."]))
-            // Transforms: metadata the typed Go source can't express (built-ins) + our own edit.
+            // Transforms: metadata and standard operation tags the typed Go source can't express.
             .transform(SetBasePath::new("/"))
             .transform(SetTitle::new("Taskflow API"))
             .transform(ApplySecurity::api_key("ApiKeyAuth", "X-API-Key"))
-            .transform(Custom(DropDebugRoutes)) // <-- yours: drop the internal /tasks/_debug route
+            .transform(
+                DocumentOperation::when(OperationSelector::get("/tasks/_debug"))
+                    .tags(["tasks", "internal"]),
+            )
             // Targets: the standard OpenAPI + Go SDK (built-ins) AND our own Markdown generator.
             .target(OpenApi31::new().to("generated/openapi.yaml"))
             .target(GoSdk::new().module("example.com/taskflow/sdk").to("generated/sdk"))

@@ -234,7 +234,7 @@ pub(crate) fn snake(name: &str) -> String {
 }
 
 pub(crate) fn operation_method_name(op: &Operation) -> String {
-    snake(&op.handler)
+    snake(&op.id)
 }
 
 /// Convert an enum member value to a `SCREAMING_SNAKE` identifier: `out-of-stock` → `OUT_OF_STOCK`.
@@ -2379,7 +2379,7 @@ fn emit_operation(
     base_path: &str,
     model_style: PyModelStyle,
 ) -> Result<(), CoreError> {
-    let method_name = snake(&op.handler);
+    let method_name = operation_method_name(op);
     let abs = join_path(base_path, &op.path);
     let tokens = path_tokens(&abs);
 
@@ -4077,6 +4077,18 @@ mod tests {
         }
 
         use super::ApiGraph;
+
+        #[test]
+        fn operation_method_name_uses_the_canonical_id() {
+            let mut graph = ops_graph();
+            graph.operations[0].id = "submitBook".to_string();
+            let operation = &graph.operations[0];
+            assert_eq!(operation.handler, "createBook");
+
+            let output = emit_operations(&graph, "bookstore", "/", &[operation]).unwrap();
+            assert!(output.contains("def submit_book("), "{output}");
+            assert!(!output.contains("def create_book("), "{output}");
+        }
 
         #[test]
         fn body_op_has_snake_method_typed_body_and_typed_return() {

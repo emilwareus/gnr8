@@ -68,6 +68,13 @@ routes <path>` analyzes a source tree without touching `.gnr8/`.
 Artifacts stay sorted by path. Every transition records the prior and new producer. A target should
 normally create; a post-processor should rewrite. Collisions or missing overlay/rewrite targets fail.
 
+Every successful pipeline also creates `generated/gnr8.graph.json`. This always-on, projected graph
+snapshot is written after transforms and post-processors and participates in the same ownership,
+protected-edit, stale-file, and `gnr8 check` lifecycle as target output. Its envelope currently has
+`schema_version: 1`; readers reject any other version. Commit it with the other generated artifacts:
+`gnr8 changes --base <ref>` reads this exact file from the named Git revision and never executes that
+revision's pipeline.
+
 ## Host write safety
 
 gnr8 stores last-written path/hash records in `.gnr8/cache/manifest.json` (gitignored). The planner
@@ -123,6 +130,7 @@ an explicit script/program that performs discovery.
 | Path | Purpose | Commit? |
 |---|---|---:|
 | `.gnr8/Cargo.lock` | exact generator dependency graph | yes |
+| `generated/gnr8.graph.json` | versioned projected graph used by API change analysis | yes |
 | `.gnr8/target/` | compiled project-local generator | no |
 | `.gnr8/cache/manifest.json` | generated ownership hashes | no |
 | `.gnr8/cache/sources/` | source analysis cache | no |
@@ -244,7 +252,9 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v7
-      - uses: oaiz-io/gnr8@v0.10.1 # pin an exact released Action tag
+        with:
+          fetch-depth: 0
+      - uses: oaiz-io/gnr8@v0.11.0 # first release with API change reporting
         with:
           working-directories: |
             services/books
@@ -253,6 +263,11 @@ jobs:
           setup-go: "true"
           setup-python: "true"
           setup-node: "true"
+          report-api-changes: "true"
+          base-ref: origin/main
+          exempt-tags: |
+            internal
+            beta
 ```
 
 Action inputs:
@@ -264,6 +279,9 @@ Action inputs:
 | `install-method` | `release` | `release`, `source`, or `path` |
 | `version` | `lock` | exact release or version resolved from every `.gnr8/Cargo.lock` |
 | `extra-args` | empty | shell-split arguments passed to `gnr8 check` |
+| `report-api-changes` | `false` | publish Markdown/JSON change reports and fail on gating breaking changes |
+| `base-ref` | `origin/main` | revision containing each project's committed graph artifact |
+| `exempt-tags` | empty | newline-separated exact operation tags exempted from the change gate |
 | `cache` | `true` | cache `.gnr8/cache` and `.gnr8/target` |
 | `cache-key-prefix` | `gnr8` | cache-key prefix |
 | `setup-rust` / `rust-toolchain` | `true` / `auto` | generator toolchain; `auto` honors a repository-root `rust-toolchain.toml` (or `rust-toolchain`) pin and installs `stable` when there is none |
@@ -272,6 +290,15 @@ Action inputs:
 | `setup-node` / `node-version` | `false` / `lts/*` | NestJS source toolchain |
 
 Outputs are `binary` (resolved executable path) and `cache-hit`.
+
+Change reporting requires checkout history, so use `actions/checkout` with `fetch-depth: 0`. Missing
+base history fails with an error that names this requirement. The action writes a combined Markdown
+report with affected SDK operations and current source locations to the job summary, uploads the
+Markdown and JSON reports, and creates or updates its marker-owned pull-request comment when the
+workflow token permits comments. A comment permission failure does not hide or weaken the gate.
+
+Both reports are rendered by `gnr8 changes` itself — `--json` and `--markdown` — so the published
+Markdown is the CLI's own output rather than a second rendering of the JSON.
 
 The release installer rejects `latest`: generated checks must use an exact version. `version: lock`
 uses `cargo tree --locked` to find the direct normal `gnr8` dependency. Every working directory must

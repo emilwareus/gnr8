@@ -28,9 +28,11 @@ pub mod error;
 pub use error::CoreError;
 
 pub mod analyze;
+pub mod changes;
 pub mod diagnostics;
 pub mod gosdk;
 pub mod graph;
+pub mod graph_artifact;
 pub mod lifecycle;
 pub mod lower;
 pub mod manifest;

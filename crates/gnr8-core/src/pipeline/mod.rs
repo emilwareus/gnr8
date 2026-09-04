@@ -170,13 +170,16 @@ pub struct PipelineOutcome {
 /// The loop-safety anchors a plan's targets declare, plus gnr8's own workspace directory.
 #[must_use]
 pub fn output_anchors(plan: &StagePlan) -> Vec<String> {
-    plan.targets
+    let mut anchors: Vec<String> = plan
+        .targets
         .iter()
         .flat_map(|stage| match stage {
             PlanStage::Builtin(spec) => builtins::target_output_anchors(spec),
             PlanStage::Custom { output_anchors, .. } => output_anchors.clone(),
         })
-        .collect()
+        .collect();
+    anchors.push(crate::graph_artifact::GRAPH_ARTIFACT_PATH.to_string());
+    anchors
 }
 
 /// The readiness checks a plan's targets declare.
@@ -318,12 +321,14 @@ pub fn run(
     let diagnostics: Vec<Diagnostic> = ir.diagnostics.clone();
     let source_files = distinct_source_files(&ir);
 
+    // Projection belongs at the artifact boundary. The graph artifact is always emitted, including
+    // for a pipeline with no configured targets, so it follows the same one deterministic path.
+    let mut generation_ir = crate::graph::projection::into_generation(ir)?;
     let mut files: Vec<Artifact> = Vec::new();
     if !plan.targets.is_empty() {
         // Every target, including a user-defined one, receives the same canonical directional
         // graph. `build_ir` and `inspect` intentionally retain the unsplit source facts; the
         // projection belongs at the artifact boundary.
-        let mut generation_ir = crate::graph::projection::into_generation(ir)?;
         let spans = stage_spans(&plan.targets);
         // The frozen graph is the same for every target, so it crosses to the worker once rather
         // than riding along with each run.
@@ -393,6 +398,12 @@ pub fn run(
             }
         }
     }
+
+    // This internal artifact is intentionally created after post-processors. Formatters and banner
+    // writers apply to user-configured target output; the versioned graph must remain exact JSON.
+    artifacts.begin_stage("gnr8:GraphArtifact");
+    let graph_json = crate::graph_artifact::GraphArtifact::new(generation_ir).to_json()?;
+    artifacts.create(crate::graph_artifact::GRAPH_ARTIFACT_PATH, graph_json)?;
 
     let artifacts = artifacts.into_files();
     validate_artifact_paths(&artifacts)?;
@@ -639,7 +650,10 @@ mod tests {
 
     use super::{build_ir, resolve_security_diagnostics, run, NoCustomStages, StageRunner};
     use crate::graph::{ApiGraph, SecurityScheme};
-    use crate::sdk::{builtins as decl, Artifact, Custom, Cx, Pipeline, Target, Transform};
+    use crate::graph_artifact::{GraphArtifact, GRAPH_ARTIFACT_PATH};
+    use crate::sdk::{
+        builtins as decl, Artifact, Custom, Cx, Pipeline, PostProcess, Target, Transform,
+    };
     use crate::CoreError;
     use gnr8::sdk::{Artifacts, StagePlan};
 
@@ -742,6 +756,13 @@ mod tests {
         }
     }
 
+    struct CustomPost;
+    impl PostProcess for CustomPost {
+        fn run(&self, _out: &mut Artifacts, _cx: &Cx) -> Result<(), gnr8::Error> {
+            Ok(())
+        }
+    }
+
     fn graph_with_authorization_diagnostic() -> ApiGraph {
         serde_json::from_str(
             r#"{
@@ -817,6 +838,19 @@ mod tests {
         Cx::new(std::env::temp_dir())
     }
 
+    fn unique_temp_dir(label: &str) -> std::path::PathBuf {
+        let nanos = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let root = std::env::temp_dir().join(format!(
+            "gnr8-pipeline-{label}-{}-{nanos}",
+            std::process::id()
+        ));
+        std::fs::create_dir_all(&root).unwrap();
+        root
+    }
+
     #[test]
     fn a_plan_with_no_source_is_a_config_error() {
         let err = build_ir(&StagePlan::default(), &cx(), &mut NoCustomStages, None).unwrap_err();
@@ -857,14 +891,20 @@ mod tests {
                 "targets[0]"
             ]
         );
-        assert_eq!(outcome.artifacts.len(), 1);
+        assert_eq!(outcome.artifacts.len(), 2);
         assert_eq!(outcome.artifacts[0].path, "generated/custom-0.md");
         // The built-in transform ran host-side, between the two worker calls.
         assert_eq!(outcome.artifacts[0].text, "# Renamed+t2\n");
         assert_eq!(
             outcome.output_anchors,
-            vec!["generated/custom-0.md".to_string()]
+            vec![
+                "generated/custom-0.md".to_string(),
+                GRAPH_ARTIFACT_PATH.to_string()
+            ]
         );
+        let graph_artifact: GraphArtifact =
+            serde_json::from_str(&outcome.artifacts[1].text).unwrap();
+        assert_eq!(Some(&graph_artifact.graph), runner.frozen.as_ref());
     }
 
     /// Built-in targets are produced ahead of the loop that places them, so the set they land in
@@ -971,6 +1011,7 @@ mod tests {
             vec![
                 "generated/a-openapi.yaml",
                 "generated/custom-1.md",
+                GRAPH_ARTIFACT_PATH,
                 "generated/z-openapi.json"
             ]
         );
@@ -982,7 +1023,70 @@ mod tests {
             .map(|artifact| artifact.producer.as_str())
             .collect();
         assert_eq!(producers[0], "target[0]:OpenApi31");
-        assert_eq!(producers[2], "target[2]:OpenApi31Json");
+        assert_eq!(producers[2], "gnr8:GraphArtifact");
+        assert_eq!(producers[3], "target[2]:OpenApi31Json");
+    }
+
+    #[test]
+    fn graph_artifact_is_always_emitted_after_post_processors() {
+        let plan = Pipeline::new()
+            .source(Custom(CustomSource))
+            .target(Custom(CustomTarget))
+            .post(Custom(CustomPost))
+            .plan();
+        let mut runner = RecordingRunner::default();
+        let outcome = run(&plan, &cx(), &mut runner, None).unwrap();
+
+        assert_eq!(
+            runner.calls,
+            vec!["source[0]", "freeze", "targets[0]", "posts[0]"]
+        );
+        let target = outcome
+            .artifacts
+            .iter()
+            .find(|artifact| artifact.path == "generated/custom-0.md")
+            .unwrap();
+        assert!(target.text.starts_with("//post\n"));
+        let graph = outcome
+            .artifacts
+            .iter()
+            .find(|artifact| artifact.path == GRAPH_ARTIFACT_PATH)
+            .unwrap();
+        assert!(!graph.text.starts_with("//post\n"));
+        let decoded: GraphArtifact = serde_json::from_str(&graph.text).unwrap();
+        assert_eq!(decoded.graph.title, "from-worker");
+    }
+
+    #[test]
+    fn graph_artifact_uses_the_generated_output_lifecycle() {
+        let plan = Pipeline::new().source(Custom(CustomSource)).plan();
+        let outcome = run(&plan, &cx(), &mut RecordingRunner::default(), None).unwrap();
+        assert_eq!(outcome.artifacts.len(), 1);
+        assert_eq!(outcome.artifacts[0].path, GRAPH_ARTIFACT_PATH);
+
+        let root = unique_temp_dir("graph-lifecycle");
+        std::fs::create_dir_all(root.join(".gnr8")).unwrap();
+        let first = crate::lifecycle::regenerate_with_anchors(
+            &root,
+            &outcome.artifacts,
+            &outcome.output_anchors,
+            false,
+        )
+        .unwrap();
+        assert_eq!(first.written, vec![GRAPH_ARTIFACT_PATH]);
+
+        let path = root.join(GRAPH_ARTIFACT_PATH);
+        std::fs::write(&path, "user edit\n").unwrap();
+        let protected = crate::lifecycle::regenerate_with_anchors(
+            &root,
+            &outcome.artifacts,
+            &outcome.output_anchors,
+            false,
+        )
+        .unwrap();
+        assert_eq!(protected.skipped, vec![GRAPH_ARTIFACT_PATH]);
+        assert_eq!(std::fs::read_to_string(path).unwrap(), "user edit\n");
+        std::fs::remove_dir_all(root).unwrap();
     }
 
     #[test]

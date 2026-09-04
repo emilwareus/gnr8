@@ -54,8 +54,9 @@ gnr8 check                # CI gate: exit 1 if any output is stale/drifted, else
 ```
 
 ## CLI
-All commands except `inspect` operate on the **current project** (cwd must hold the `.gnr8/` crate, i.e.
-`.gnr8/Cargo.toml`). `generate`/`check`/`watch`/`doctor` run the project's **worker**: the host builds
+Project commands other than an explicit-path `inspect` operate on the **current project** (cwd must
+hold the `.gnr8/` crate, i.e. `.gnr8/Cargo.toml`).
+`generate`/`check`/`changes`/`watch`/`doctor` run the project's **worker**: the host builds
 `.gnr8/` once with `cargo build` (and skips that build entirely while `.gnr8/` is unchanged), starts
 the resulting binary with `cwd = project root`, and drives a framed protocol over its stdio. The host
 executes every built-in stage itself and asks the worker only for the stages you wrote. Global flags:
@@ -63,15 +64,17 @@ executes every built-in stage itself and asks the worker only for the stages you
 
 | Command | Args/flags | Reads | Writes | Exit |
 |---|---|---|---|---|
-| `gnr8 guide` | `[go-gin-to-python-typescript\|python-apis-to-python-sdk\|nestjs-to-typescript-sdk]` | bundled docs | — (prints basic or scenario-specific agent guide) | 0 |
-| `gnr8 init` | `--source go-gin\|fastapi\|flask\|nestjs`, `--sdk go\|python\|typescript` | — | `.gnr8/Cargo.toml`, `.gnr8/src/main.rs`, `.gnr8/README.md`, `.gnr8/.gitignore` (skips existing — idempotent) | 0; 1 on error |
-| `gnr8 generate` | `--force` | `.gnr8/` crate, the source dirs its `Source` reads | the paths the pipeline's targets declare, `.gnr8/cache/manifest.json` | 0 when fully reconciled; 1 on protected outputs or error |
-| `gnr8 check` | — | `.gnr8/` crate, src, manifest | — (dry run) | **0 up-to-date; 1 stale/drifted**; 1 on error |
-| `gnr8 watch` | `--debounce-ms N` (def 200) | `.gnr8/` crate (incl. `.gnr8/src/`), src | same as generate, on each change | 0 on Ctrl-C; 1 on error |
-| `gnr8 doctor` | — | `.gnr8/` crate, src, manifest | — | **0 healthy; 1 actionable problem**; never crashes |
+| `gnr8 guide` | `[go-gin-to-python-typescript\|python-apis-to-python-sdk\|nestjs-to-typescript-sdk]` | bundled docs | — (prints basic or scenario-specific agent guide) | 0; 2 on error |
+| `gnr8 init` | `--source go-gin\|fastapi\|flask\|nestjs`, `--sdk go\|python\|typescript` | — | `.gnr8/Cargo.toml`, `.gnr8/src/main.rs`, `.gnr8/README.md`, `.gnr8/.gitignore` (skips existing — idempotent) | 0; 2 on error |
+| `gnr8 generate` | `--force` | `.gnr8/` crate, the source dirs its `Source` reads | target paths, `generated/gnr8.graph.json`, `.gnr8/cache/manifest.json` | 0 reconciled; 1 protected output; 2 on error |
+| `gnr8 check` | — | `.gnr8/` crate, src, manifest | — (dry run) | **0 up-to-date; 1 stale/drifted**; 2 on error |
+| `gnr8 changes` | `--base <ref>`, repeatable `--exempt-tag <name>`, `--markdown` | current pipeline plus the base commit's `generated/gnr8.graph.json` | — | **0 gate passed; 1 checked breaking finding**; 2 on error |
+| `gnr8 watch` | `--debounce-ms N` (def 200) | `.gnr8/` crate (incl. `.gnr8/src/`), src | same as generate, on each change | 0 on Ctrl-C; 2 on error |
+| `gnr8 doctor` | — | `.gnr8/` crate, src, manifest | — | **0 healthy; 1 actionable problem**; 2 on error |
+| `gnr8 inspect routes\|schemas\|graph` | `[<dir>]` (positional, defaults to bundled fixture) | the `<dir>` Go module | — (prints) | 0; 2 on error |
+
 `doctor` probes the **source toolchain** for the detected source language (`go`/`python3`/`node`) — it
 reports `source_toolchain` + the `language` field, not a hardcoded Go probe.
-| `gnr8 inspect routes\|schemas\|graph` | `[<dir>]` (positional, defaults to bundled fixture) | the `<dir>` Go module | — (prints) | 0; 1 on error |
 
 Notes:
 - Missing local cache state is safe: generate adopts byte-identical outputs without rewriting and

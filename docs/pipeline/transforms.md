@@ -16,6 +16,7 @@ OperationSelector::route("GET", "/books")
 OperationSelector::get("/books")
 OperationSelector::post("/books")
 OperationSelector::path_prefix("/admin")
+OperationSelector::source_prefix("internal/admin/")
 OperationSelector::methods(["POST", "PUT", "PATCH"])
 OperationSelector::middleware("RequireAuth")
 OperationSelector::any([
@@ -30,7 +31,9 @@ OperationSelector::all([
 
 `put`, `patch`, and `delete` shortcuts are also available. Route paths are graph paths; prefix
 selection checks both graph paths and base-path-joined paths. Typed parameter, security, and response
-overrides must select exactly one operation. Policy transforms may intentionally match many.
+overrides must select exactly one operation. Source-prefix selection compares
+`op.provenance.file.starts_with(prefix)` exactly; moving a handler file can therefore change which
+operations it selects. Policy transforms may intentionally match many.
 
 ## Document and path metadata
 

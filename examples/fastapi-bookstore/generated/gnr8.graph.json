@@ -1,0 +1,680 @@
+{
+  "schema_version": 1,
+  "graph": {
+    "module": "fastapi-bookstore",
+    "operations": [
+      {
+        "id": "list_books",
+        "method": "GET",
+        "path": "/books/",
+        "handler": "list_books",
+        "summary": "List books in one genre.",
+        "description": "Results are ordered by title and paginated with an opaque cursor. Pass the\ncursor from the previous page to continue; omit it to start from the\nbeginning.",
+        "params": [
+          {
+            "name": "cursor",
+            "location": "query",
+            "required": false,
+            "schema": {
+              "type": "primitive",
+              "of": {
+                "prim": "string"
+              }
+            },
+            "provenance": {
+              "file": "app/main.py",
+              "start_line": 41,
+              "end_line": 41
+            }
+          },
+          {
+            "name": "genre",
+            "location": "query",
+            "required": true,
+            "schema": {
+              "type": "primitive",
+              "of": {
+                "prim": "string"
+              }
+            },
+            "provenance": {
+              "file": "app/main.py",
+              "start_line": 39,
+              "end_line": 39
+            }
+          },
+          {
+            "name": "sort",
+            "location": "query",
+            "required": false,
+            "schema": {
+              "type": "primitive",
+              "of": {
+                "prim": "string"
+              }
+            },
+            "provenance": {
+              "file": "app/main.py",
+              "start_line": 40,
+              "end_line": 40
+            }
+          }
+        ],
+        "request_body": null,
+        "responses": [
+          {
+            "status": 200,
+            "body": {
+              "ref_id": "app.models.ListBooksResponse"
+            },
+            "content_types": [
+              "application/json"
+            ]
+          }
+        ],
+        "provenance": {
+          "file": "app/main.py",
+          "start_line": 38,
+          "end_line": 38
+        }
+      },
+      {
+        "id": "create_book",
+        "method": "POST",
+        "path": "/books/",
+        "handler": "create_book",
+        "summary": "Add a book to the catalogue.",
+        "description": "The book is created immediately and its generated identifier is returned.",
+        "params": [],
+        "request_body": {
+          "ref_id": "app.models.Book"
+        },
+        "request_body_content_type": "application/json",
+        "responses": [
+          {
+            "status": 201,
+            "body": {
+              "ref_id": "app.models.CreatedMessage"
+            },
+            "content_types": [
+              "application/json"
+            ]
+          }
+        ],
+        "provenance": {
+          "file": "app/main.py",
+          "start_line": 54,
+          "end_line": 54
+        }
+      },
+      {
+        "id": "get_book",
+        "method": "GET",
+        "path": "/books/{book_id}",
+        "handler": "get_book",
+        "summary": "Fetch one book by its identifier.",
+        "description": "Returns the book when it is in stock, and an out-of-stock notice otherwise.",
+        "params": [
+          {
+            "name": "book_id",
+            "location": "path",
+            "required": true,
+            "schema": {
+              "type": "primitive",
+              "of": {
+                "prim": "int",
+                "bits": 64,
+                "signed": true
+              }
+            },
+            "provenance": {
+              "file": "app/main.py",
+              "start_line": 64,
+              "end_line": 64
+            }
+          },
+          {
+            "name": "fmt",
+            "location": "query",
+            "required": false,
+            "schema": {
+              "type": "named",
+              "of": "app.models.BookFormat"
+            },
+            "provenance": {
+              "file": "app/main.py",
+              "start_line": 64,
+              "end_line": 64
+            }
+          }
+        ],
+        "request_body": null,
+        "responses": [
+          {
+            "status": 200,
+            "body": {
+              "ref_id": "app.models.BookOrError"
+            },
+            "content_types": [
+              "application/json"
+            ]
+          }
+        ],
+        "provenance": {
+          "file": "app/main.py",
+          "start_line": 63,
+          "end_line": 63
+        }
+      },
+      {
+        "id": "update_book",
+        "method": "PUT",
+        "path": "/books/{book_id}",
+        "handler": "update_book",
+        "summary": "Update the stored filters for one book.",
+        "description": "Filters left unset in the payload keep their current values.",
+        "params": [
+          {
+            "name": "book_id",
+            "location": "path",
+            "required": true,
+            "schema": {
+              "type": "primitive",
+              "of": {
+                "prim": "int",
+                "bits": 64,
+                "signed": true
+              }
+            },
+            "provenance": {
+              "file": "app/main.py",
+              "start_line": 75,
+              "end_line": 75
+            }
+          }
+        ],
+        "request_body": {
+          "ref_id": "app.models.BookFilters"
+        },
+        "request_body_content_type": "application/json",
+        "responses": [
+          {
+            "status": 200,
+            "body": {
+              "ref_id": "app.models.CreatedMessage"
+            },
+            "content_types": [
+              "application/json"
+            ]
+          }
+        ],
+        "provenance": {
+          "file": "app/main.py",
+          "start_line": 74,
+          "end_line": 74
+        }
+      }
+    ],
+    "schemas": [
+      {
+        "id": "app.models.Author",
+        "name": "Author",
+        "body": {
+          "type": "object",
+          "of": [
+            {
+              "json_name": "bio",
+              "serializer_may_omit": false,
+              "deserializer_accepts_absent": false,
+              "deserializer_accepts_null": true,
+              "serializer_may_emit_null": true,
+              "validator_requires_presence": false,
+              "validator_rejects_null": false,
+              "schema": {
+                "type": "primitive",
+                "of": {
+                  "prim": "string"
+                }
+              },
+              "description": null,
+              "example": null
+            },
+            {
+              "json_name": "name",
+              "serializer_may_omit": false,
+              "deserializer_accepts_absent": false,
+              "deserializer_accepts_null": false,
+              "serializer_may_emit_null": false,
+              "validator_requires_presence": false,
+              "validator_rejects_null": false,
+              "schema": {
+                "type": "primitive",
+                "of": {
+                  "prim": "string"
+                }
+              },
+              "description": null,
+              "example": null
+            }
+          ]
+        },
+        "provenance": {
+          "file": "app/models.py",
+          "start_line": 53,
+          "end_line": 53
+        }
+      },
+      {
+        "id": "app.models.Book",
+        "name": "Book",
+        "body": {
+          "type": "object",
+          "of": [
+            {
+              "json_name": "author",
+              "serializer_may_omit": false,
+              "deserializer_accepts_absent": false,
+              "deserializer_accepts_null": false,
+              "serializer_may_emit_null": false,
+              "validator_requires_presence": false,
+              "validator_rejects_null": false,
+              "schema": {
+                "type": "named",
+                "of": "app.models.Author"
+              },
+              "description": null,
+              "example": null
+            },
+            {
+              "json_name": "format",
+              "serializer_may_omit": false,
+              "deserializer_accepts_absent": false,
+              "deserializer_accepts_null": false,
+              "serializer_may_emit_null": false,
+              "validator_requires_presence": false,
+              "validator_rejects_null": false,
+              "schema": {
+                "type": "named",
+                "of": "app.models.BookFormat"
+              },
+              "description": null,
+              "example": null
+            },
+            {
+              "json_name": "id",
+              "serializer_may_omit": false,
+              "deserializer_accepts_absent": false,
+              "deserializer_accepts_null": false,
+              "serializer_may_emit_null": false,
+              "validator_requires_presence": false,
+              "validator_rejects_null": false,
+              "schema": {
+                "type": "primitive",
+                "of": {
+                  "prim": "int",
+                  "bits": 64,
+                  "signed": true
+                }
+              },
+              "description": null,
+              "example": null
+            },
+            {
+              "json_name": "rating",
+              "serializer_may_omit": true,
+              "deserializer_accepts_absent": true,
+              "deserializer_accepts_null": true,
+              "serializer_may_emit_null": true,
+              "validator_requires_presence": false,
+              "validator_rejects_null": false,
+              "schema": {
+                "type": "union",
+                "of": [
+                  {
+                    "type": "primitive",
+                    "of": {
+                      "prim": "int",
+                      "bits": 64,
+                      "signed": true
+                    }
+                  },
+                  {
+                    "type": "primitive",
+                    "of": {
+                      "prim": "float",
+                      "bits": 64
+                    }
+                  }
+                ]
+              },
+              "description": null,
+              "example": null
+            },
+            {
+              "json_name": "tags",
+              "serializer_may_omit": true,
+              "deserializer_accepts_absent": true,
+              "deserializer_accepts_null": false,
+              "serializer_may_emit_null": false,
+              "validator_requires_presence": false,
+              "validator_rejects_null": false,
+              "schema": {
+                "type": "array",
+                "of": {
+                  "type": "primitive",
+                  "of": {
+                    "prim": "string"
+                  }
+                }
+              },
+              "description": null,
+              "example": null
+            },
+            {
+              "json_name": "title",
+              "serializer_may_omit": false,
+              "deserializer_accepts_absent": false,
+              "deserializer_accepts_null": false,
+              "serializer_may_emit_null": false,
+              "validator_requires_presence": false,
+              "validator_rejects_null": false,
+              "schema": {
+                "type": "primitive",
+                "of": {
+                  "prim": "string"
+                }
+              },
+              "description": null,
+              "example": null
+            }
+          ]
+        },
+        "provenance": {
+          "file": "app/models.py",
+          "start_line": 64,
+          "end_line": 64
+        }
+      },
+      {
+        "id": "app.models.BookFilters",
+        "name": "BookFilters",
+        "body": {
+          "type": "object",
+          "of": [
+            {
+              "json_name": "genre",
+              "serializer_may_omit": false,
+              "deserializer_accepts_absent": false,
+              "deserializer_accepts_null": false,
+              "serializer_may_emit_null": false,
+              "validator_requires_presence": false,
+              "validator_rejects_null": false,
+              "schema": {
+                "type": "primitive",
+                "of": {
+                  "prim": "string"
+                }
+              },
+              "description": null,
+              "example": null
+            },
+            {
+              "json_name": "in_stock",
+              "serializer_may_omit": true,
+              "deserializer_accepts_absent": true,
+              "deserializer_accepts_null": false,
+              "serializer_may_emit_null": false,
+              "validator_requires_presence": false,
+              "validator_rejects_null": false,
+              "schema": {
+                "type": "primitive",
+                "of": {
+                  "prim": "bool"
+                }
+              },
+              "description": null,
+              "example": null
+            },
+            {
+              "json_name": "published",
+              "serializer_may_omit": false,
+              "deserializer_accepts_absent": false,
+              "deserializer_accepts_null": true,
+              "serializer_may_emit_null": true,
+              "validator_requires_presence": false,
+              "validator_rejects_null": false,
+              "schema": {
+                "type": "primitive",
+                "of": {
+                  "prim": "int",
+                  "bits": 64,
+                  "signed": true
+                }
+              },
+              "description": null,
+              "example": null
+            },
+            {
+              "json_name": "sort",
+              "serializer_may_omit": true,
+              "deserializer_accepts_absent": true,
+              "deserializer_accepts_null": true,
+              "serializer_may_emit_null": true,
+              "validator_requires_presence": false,
+              "validator_rejects_null": false,
+              "schema": {
+                "type": "enum",
+                "of": [
+                  "asc",
+                  "desc"
+                ]
+              },
+              "description": null,
+              "example": null
+            }
+          ]
+        },
+        "provenance": {
+          "file": "app/models.py",
+          "start_line": 95,
+          "end_line": 95
+        }
+      },
+      {
+        "id": "app.models.BookFormat",
+        "name": "BookFormat",
+        "body": {
+          "type": "enum",
+          "of": [
+            "hardcover",
+            "paperback"
+          ]
+        },
+        "enum_source_order": [
+          "hardcover",
+          "paperback"
+        ],
+        "provenance": {
+          "file": "app/models.py",
+          "start_line": 33,
+          "end_line": 33
+        }
+      },
+      {
+        "id": "app.models.BookOrError",
+        "name": "BookOrError",
+        "body": {
+          "type": "union",
+          "of": [
+            {
+              "type": "named",
+              "of": "app.models.Book"
+            },
+            {
+              "type": "named",
+              "of": "app.models.OutOfStock"
+            }
+          ]
+        },
+        "provenance": {
+          "file": "app/models.py",
+          "start_line": 130,
+          "end_line": 130
+        }
+      },
+      {
+        "id": "app.models.CreatedMessage",
+        "name": "CreatedMessage",
+        "body": {
+          "type": "object",
+          "of": [
+            {
+              "json_name": "id",
+              "serializer_may_omit": false,
+              "deserializer_accepts_absent": false,
+              "deserializer_accepts_null": false,
+              "serializer_may_emit_null": false,
+              "validator_requires_presence": false,
+              "validator_rejects_null": false,
+              "schema": {
+                "type": "primitive",
+                "of": {
+                  "prim": "int",
+                  "bits": 64,
+                  "signed": true
+                }
+              },
+              "description": null,
+              "example": null
+            },
+            {
+              "json_name": "message",
+              "serializer_may_omit": false,
+              "deserializer_accepts_absent": false,
+              "deserializer_accepts_null": false,
+              "serializer_may_emit_null": false,
+              "validator_requires_presence": false,
+              "validator_rejects_null": false,
+              "schema": {
+                "type": "primitive",
+                "of": {
+                  "prim": "string"
+                }
+              },
+              "description": null,
+              "example": null
+            }
+          ]
+        },
+        "provenance": {
+          "file": "app/models.py",
+          "start_line": 113,
+          "end_line": 113
+        }
+      },
+      {
+        "id": "app.models.ListBooksResponse",
+        "name": "ListBooksResponse",
+        "body": {
+          "type": "object",
+          "of": [
+            {
+              "json_name": "books",
+              "serializer_may_omit": false,
+              "deserializer_accepts_absent": false,
+              "deserializer_accepts_null": false,
+              "serializer_may_emit_null": false,
+              "validator_requires_presence": false,
+              "validator_rejects_null": false,
+              "schema": {
+                "type": "array",
+                "of": {
+                  "type": "named",
+                  "of": "app.models.Book"
+                }
+              },
+              "description": null,
+              "example": null
+            },
+            {
+              "json_name": "next_cursor",
+              "serializer_may_omit": false,
+              "deserializer_accepts_absent": false,
+              "deserializer_accepts_null": true,
+              "serializer_may_emit_null": true,
+              "validator_requires_presence": false,
+              "validator_rejects_null": false,
+              "schema": {
+                "type": "primitive",
+                "of": {
+                  "prim": "string"
+                }
+              },
+              "description": null,
+              "example": null
+            },
+            {
+              "json_name": "total",
+              "serializer_may_omit": false,
+              "deserializer_accepts_absent": false,
+              "deserializer_accepts_null": false,
+              "serializer_may_emit_null": false,
+              "validator_requires_presence": false,
+              "validator_rejects_null": false,
+              "schema": {
+                "type": "primitive",
+                "of": {
+                  "prim": "int",
+                  "bits": 64,
+                  "signed": true
+                }
+              },
+              "description": null,
+              "example": null
+            }
+          ]
+        },
+        "provenance": {
+          "file": "app/models.py",
+          "start_line": 135,
+          "end_line": 135
+        }
+      },
+      {
+        "id": "app.models.OutOfStock",
+        "name": "OutOfStock",
+        "body": {
+          "type": "object",
+          "of": [
+            {
+              "json_name": "reason",
+              "serializer_may_omit": false,
+              "deserializer_accepts_absent": false,
+              "deserializer_accepts_null": false,
+              "serializer_may_emit_null": false,
+              "validator_requires_presence": false,
+              "validator_rejects_null": false,
+              "schema": {
+                "type": "primitive",
+                "of": {
+                  "prim": "string"
+                }
+              },
+              "description": null,
+              "example": null
+            }
+          ]
+        },
+        "provenance": {
+          "file": "app/models.py",
+          "start_line": 124,
+          "end_line": 124
+        }
+      }
+    ],
+    "diagnostics": [],
+    "base_path": "/",
+    "title": "Bookstore API",
+    "security": []
+  }
+}

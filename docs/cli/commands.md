@@ -15,7 +15,7 @@ Run commands from the application repository root. Global options are:
 -V, --version   print the CLI version
 ```
 
-`generate`, `check`, `watch`, `doctor`, and `inspect` without a path all build and run the project's
+`generate`, `check`, `changes`, `watch`, `doctor`, and `inspect` without a path all build and run the project's
 `.gnr8` worker. That compiles and executes Rust from the repository — build scripts, proc macros, and
 the pipeline itself — with your privileges, and is not sandboxed. `--no-build` withholds the compile
 step; `--no-execute` withholds both. `gnr8 inspect routes <path>` analyzes a source tree without
@@ -33,6 +33,7 @@ diagnostics.
 | `generate` | Run the pipeline and reconcile generated files | yes |
 | `watch` | Regenerate after source changes | yes |
 | `check` | Detect generated drift without writing | no |
+| `changes` | Classify API changes against a committed graph artifact | no |
 | `inspect` | Explain extracted routes, schemas, or graph | no |
 | `doctor` | Diagnose workspace, output, and pipeline health | no |
 
@@ -117,6 +118,141 @@ gnr8 generate   # developer: inspect and commit the result
 gnr8 check      # CI: fail on uncommitted generated drift
 ```
 
+## `changes`
+
+```bash
+gnr8 changes --base origin/main
+gnr8 changes --base origin/main --exempt-tag internal --exempt-tag beta
+gnr8 --json changes --base origin/main
+gnr8 changes --base origin/main --markdown
+```
+
+Runs the current project pipeline without writing, then compares its projected graph with
+`generated/gnr8.graph.json` committed at `--base`. The base pipeline is never executed. If that
+revision has no graph artifact, run `gnr8 generate` on that revision and commit the artifact before
+using it as a base.
+
+Findings are classified as `BREAKING`, `ADDITIVE`, or `DOC-ONLY`. A breaking finding exits `1` only
+when it is in the checked scope. `--exempt-tag` removes operations carrying an exact,
+case-sensitive matching standard OpenAPI tag from that scope; it is repeatable, and untagged
+operations remain checked. Findings are always reported, including exempt ones. Schema findings use
+their most checked transitive consumer on each graph side.
+
+`ConfigurePagination` and `ConfigureSdkRuntime` policy is not yet compared, so a change to
+pagination, retry, or timeout configuration alters generated SDK methods without producing a
+finding. Response headers and the schemas of additional request-body variants are likewise outside
+this comparison; their media types still participate in `request.body.media_type.*`.
+
+`--markdown` prints the same report as a Markdown block for a job summary or a pull-request
+comment: the base revision, the exempt-tag policy, the summary counts, and the findings in an
+indented code block with their affected SDK operations and source locations. It selects the report
+format, so it cannot be combined with `--json`. The GitHub Action publishes this output rather than
+formatting one of its own.
+
+JSON contains the requested and resolved base revision, sorted exempt-tag policy, summary counts,
+and deterministically sorted changes with stable dotted codes, effective tags and exemption state
+for both graph sides, the derived `gating` result, affected SDK operations on both extant sides, and
+current source locations where available.
+
+Human output keeps the three columns — kind, operation, message — and appends an exemption suffix
+when a breaking finding is not gating. When a current source location exists, it also appends
+`file:line` (or `file` when the line is unknown):
+
+```text
+BREAKING  POST /books         request field `title` became required  handlers.go:42
+BREAKING  GET /tasks/_debug   response field `count` removed  (exempt on both sides; not gating)
+ADDITIVE  GET /books          optional response field `nextCursor` added  handlers.go:88
+```
+
+The dotted codes are a stable machine-facing taxonomy:
+
+```text
+document.base_path.changed
+document.metadata.changed
+document.server.added
+document.server.description.changed
+document.server.order.changed
+document.server.removed
+document.title.changed
+operation.added
+operation.documentation.changed
+operation.exemption.added
+operation.exemption.removed
+operation.method.changed
+operation.name.changed
+operation.path.changed
+operation.removed
+operation.tags.changed
+request.body.added
+request.body.media_type.added
+request.body.media_type.removed
+request.body.removed
+request.body.required.added
+request.body.required.removed
+request.body.schema.changed
+request.enum.value.added
+request.enum.value.removed
+request.parameter.added
+request.parameter.default.changed
+request.parameter.documentation.changed
+request.parameter.removed
+request.parameter.required.added
+request.parameter.required.removed
+request.parameter.serialization.changed
+request.property.added
+request.property.constraints.changed
+request.property.nullability.added
+request.property.nullability.removed
+request.property.removed
+request.property.required.added
+request.property.required.removed
+request.type.changed
+response.body.added
+response.body.kind.changed
+response.body.removed
+response.body.schema.changed
+response.enum.value.added
+response.enum.value.removed
+response.media_type.added
+response.media_type.removed
+response.property.added
+response.property.constraints.changed
+response.property.nullability.added
+response.property.nullability.removed
+response.property.removed
+response.property.required.added
+response.property.required.removed
+response.status.added
+response.status.removed
+response.type.changed
+schema.added
+schema.enum.order.changed
+schema.enum.value.added
+schema.enum.value.removed
+schema.name.changed
+schema.property.added
+schema.property.constraints.changed
+schema.property.documentation.changed
+schema.property.nullability.added
+schema.property.nullability.removed
+schema.property.removed
+schema.property.required.added
+schema.property.required.removed
+schema.removed
+schema.type.changed
+sdk.group.changed
+security.global.changed
+security.operation.added
+security.operation.changed
+security.operation.removed
+security.scheme.added
+security.scheme.changed
+security.scheme.removed
+```
+
+The committed base must be reachable in the local Git checkout. In CI, configure checkout with full
+history (`fetch-depth: 0`) before invoking this command.
+
 ## `inspect`
 
 ```bash
@@ -150,7 +286,7 @@ means at least one actionable lifecycle or output problem exists.
 | Status | Meaning |
 |---:|---|
 | `0` | command completed and its gate passed |
-| `1` | generated drift or an actionable doctor finding |
+| `1` | a command's domain gate failed: generated drift, an actionable doctor finding, or a gating API change |
 | other nonzero | invalid invocation or execution/configuration failure |
 
 Do not infer success from parseable JSON alone; always inspect the process status.

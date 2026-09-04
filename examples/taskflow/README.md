@@ -1,7 +1,7 @@
 # taskflow — a gnr8 example that shows the power of code-as-config
 
 A small Gin "tasks" service, plus a `.gnr8/` lifecycle that mixes gnr8's **built-in** stages with
-**your own Rust** — a custom transform and a custom generator. The configuration is *code*, not TOML.
+**your own Rust** — a custom generator. The configuration is *code*, not TOML.
 
 ```
 examples/taskflow/
@@ -9,9 +9,10 @@ examples/taskflow/
 ├── models.go            # DTOs + the Status enum
 ├── .gnr8/
 │   ├── Cargo.toml       # a tiny binary crate that depends on gnr8-core
-│   └── src/main.rs      # THE CONFIG: built-ins + a custom Transform + a custom Target
+│   └── src/main.rs      # THE CONFIG: built-ins + a custom Target
 └── generated/           # committed REAL output of `gnr8 generate`
     ├── openapi.yaml
+    ├── gnr8.graph.json  # committed comparison source for `gnr8 changes --base ...`
     ├── sdk/*.go
     └── API.md           # written by the custom generator in .gnr8/src/main.rs
 ```
@@ -19,8 +20,9 @@ examples/taskflow/
 ## The input (plain Go, zero annotations)
 
 One Gin route group, registered with ordinary idioms gnr8 reads directly — `c.ShouldBindJSON`,
-`c.Param`, `c.Query`, `c.JSON(http.StatusXxx, …)`. Note the internal `/_debug` route: it is real code,
-but the `.gnr8/` lifecycle's custom transform drops it before generation.
+`c.Param`, `c.Query`, `c.JSON(http.StatusXxx, …)`. The internal `/_debug` route is real code and stays
+in every generated artifact; the pipeline gives it the standard `internal` operation tag so an
+explicit `gnr8 changes --exempt-tag internal` invocation can make its breaks non-gating.
 
 ```go
 func registerRoutes(r *gin.Engine) {
@@ -31,7 +33,7 @@ func registerRoutes(r *gin.Engine) {
 		tasks.GET("/:id", getTask)
 		tasks.PUT("/:id", updateTask)
 		tasks.DELETE("/:id", deleteTask)
-		tasks.GET("/_debug", debugTasks) // internal — dropped by the custom transform
+		tasks.GET("/_debug", debugTasks) // tagged by the .gnr8 pipeline; never dropped
 	}
 }
 ```
@@ -70,16 +72,7 @@ use gnr8::graph::ApiGraph;
 use gnr8::sdk::prelude::*;
 use gnr8::Error;
 
-// 1) A custom Transform — edit the IR in Rust before generation.
-struct DropDebugRoutes;
-impl Transform for DropDebugRoutes {
-    fn apply(&self, ir: &mut ApiGraph, _cx: &Cx) -> Result<(), Error> {
-        ir.operations.retain(|op| !op.path.contains("_debug"));
-        Ok(())
-    }
-}
-
-// 2) A custom Target — write your own generator in ~30 lines. Emits API.md.
+// A custom Target — write your own generator in ~30 lines. Emits API.md.
 struct ApiMarkdown { path: String }
 impl Target for ApiMarkdown {
     fn generate(&self, ir: &ApiGraph, out: &mut Artifacts, _cx: &Cx) -> Result<(), Error> {
@@ -96,10 +89,13 @@ fn main() -> std::process::ExitCode {
     gnr8::worker::run(
         Pipeline::new()
             .source(GoGin::new().inputs(["."]))                                   // built-in source
-            .transform(SetBasePath::new("/tasks"))                               // built-in transforms
+            .transform(SetBasePath::new("/"))                                    // built-in transforms
             .transform(SetTitle::new("Taskflow API"))
             .transform(ApplySecurity::api_key("ApiKeyAuth", "X-API-Key"))
-            .transform(Custom(DropDebugRoutes))                                  // <-- YOUR transform
+            .transform(
+                DocumentOperation::when(OperationSelector::get("/tasks/_debug"))
+                    .tags(["tasks", "internal"]),
+            )
             .target(OpenApi31::new().to("generated/openapi.yaml"))               // built-in targets
             .target(GoSdk::new().module("example.com/taskflow/sdk").to("generated/sdk"))
             .target(Custom(ApiMarkdown { path: "generated/API.md".into() }))  // <-- YOUR generator
@@ -108,8 +104,8 @@ fn main() -> std::process::ExitCode {
 }
 ```
 
-(The real file in [`.gnr8/src/main.rs`](.gnr8/src/main.rs) is the same, with fuller comments and an
-absolute-path helper so the Markdown paths match the spec.)
+(The real file in [`.gnr8/src/main.rs`](.gnr8/src/main.rs) is the same, with fuller comments, schema
+output, and a path-joining helper so the Markdown paths match the spec.)
 
 ## The command
 
@@ -119,21 +115,29 @@ From this directory:
 gnr8 generate
 ```
 
-That compiles + runs `.gnr8/`, then writes `generated/openapi.yaml`, `generated/sdk/*.go`, and
-`generated/API.md`. Running it again over unchanged source is a byte-identical no-op.
+That compiles + runs `.gnr8/`, then writes `generated/openapi.yaml`, `generated/sdk/*.go`,
+`generated/API.md`, and the always-on `generated/gnr8.graph.json` comparison artifact. Running it
+again over unchanged source is a byte-identical no-op.
 
-## The output (all three artifacts)
+## The output (three human-facing artifacts)
 
-**OpenAPI** — paths mounted under `/tasks`, `status` is a `$ref` to the code-defined enum, security
-from `ApplySecurity`. The dropped `/tasks/_debug` route is **absent**:
+**OpenAPI** — source-derived paths remain under `/tasks`, `status` is a `$ref` to the code-defined
+enum, and security comes from `ApplySecurity`. The `/_debug` operation remains present with its
+effective standard tags:
 
 ```yaml
 paths:
-  '/tasks/':
+  '/tasks':
     get:
       operationId: listTasks
       parameters:
       - { name: status, in: query, required: false, schema: { type: string } }
+      responses:
+        '200': { content: { application/json: { schema: { $ref: '#/components/schemas/TaskList' } } } }
+  '/tasks/_debug':
+    get:
+      operationId: debugTasks
+      tags: [internal, tasks]
       responses:
         '200': { content: { application/json: { schema: { $ref: '#/components/schemas/TaskList' } } } }
 components:
@@ -147,24 +151,26 @@ components:
 base path and sets the `X-API-Key` header:
 
 ```go
-func (c *Client) CreateTask(ctx context.Context, in CreateTaskRequest) (Task, error)
-func (c *Client) GetTask(ctx context.Context, id string) (Task, error)
-func (c *Client) ListTasks(ctx context.Context, params ListTasksParams) (TaskList, error)
+func (c *Client) CreateTask(ctx context.Context, in CreateTaskRequest, opts ...RequestOption) (Task, error)
+func (c *Client) DebugTasks(ctx context.Context, opts ...RequestOption) (TaskList, error)
+func (c *Client) GetTask(ctx context.Context, id string, opts ...RequestOption) (Task, error)
+func (c *Client) ListTasks(ctx context.Context, params ListTasksParams, opts ...RequestOption) (TaskList, error)
 ```
 
-**API.md** — emitted by the custom `ApiMarkdown` target (no `_debug` row — the transform removed it):
+**API.md** — emitted by the custom `ApiMarkdown` target from the same complete graph:
 
 ```markdown
 # Taskflow API
 
-Base path: `/tasks`
+Base path: `/`
 
 ## Operations
 
 | Method | Path | Operation |
 |--------|------|-----------|
-| GET    | `/tasks/`     | listTasks  |
-| POST   | `/tasks/`     | createTask |
+| GET    | `/tasks`      | listTasks  |
+| POST   | `/tasks`      | createTask |
+| GET    | `/tasks/_debug` | debugTasks |
 | DELETE | `/tasks/{id}` | deleteTask |
 | GET    | `/tasks/{id}` | getTask    |
 | PUT    | `/tasks/{id}` | updateTask |
@@ -173,11 +179,12 @@ Base path: `/tasks`
 ## What this showcases
 
 - **Built-ins + your own Rust, composed freely.** The same pipeline mixes `GoGin`, `SetBasePath`,
-  `SetTitle`, `ApplySecurity`, `OpenApi31`, `GoSdk`, and `Header` with a `Transform` and a `Target` you
-  wrote inline. Implement one trait, add one `.transform(...)` / `.target(...)` — no forking a generator.
-- **Edit the IR in code.** `DropDebugRoutes` mutates `ir.operations` directly; every later stage sees
-  the filtered model, so the internal route never reaches the spec, the SDK, or `API.md`.
-- **Write your own generator.** `ApiMarkdown` reads the frozen IR and `out.write`s a file — a complete
+  `SetTitle`, `ApplySecurity`, `DocumentOperation`, `OpenApi31`, `GoSdk`, and `Header` with a `Target`
+  you wrote inline. Implement one trait and add one `.target(...)` — no forking a generator.
+- **One complete API surface, explicit gate policy.** `DocumentOperation` assigns standard tags while
+  every target still receives `/_debug`; `gnr8 changes --exempt-tag internal` affects only whether a
+  reported break gates, never whether an artifact contains the operation.
+- **Write your own generator.** `ApiMarkdown` reads the frozen IR and `out.create`s a file — a complete
   custom emitter in ~30 lines, generated in the same pass as OpenAPI and the SDK.
 - **No TOML.** `.gnr8/src/main.rs` is the entire configuration surface. `gnr8 generate` compiles and
   runs it; the host owns writing (ownership tracking, no-op detection, edit protection).

@@ -42,6 +42,11 @@ gnr8 doctor
 gnr8 check
 ```
 
+Before merging API-shape changes, gate them: `gnr8 changes --base <ref>` classifies every graph
+change as `BREAKING`/`ADDITIVE`/`DOC-ONLY` and exits `1` on a checked breaking change. Repeat
+`--exempt-tag <name>` to keep operations tagged with that standard OpenAPI tag (for example
+`internal`) out of the gate. See [CLI command reference](docs/cli/commands.md).
+
 ## Scenario Guides
 
 Run `gnr8 guide <topic>` for concrete examples beyond this basic workflow:

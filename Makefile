@@ -95,6 +95,8 @@ tsextract-test: tsextract-deps
 action-test:
 	bash scripts/test-action-version.sh
 	bash scripts/test-action-toolchain.sh
+	bash scripts/test-action-changes.sh
+	bash scripts/test-action-comment.sh
 
 # Keep release publication tied to a dated changelog section with an empty Unreleased section.
 release-notes-test:

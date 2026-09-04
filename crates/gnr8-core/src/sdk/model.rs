@@ -60,7 +60,7 @@ pub struct SdkService {
 pub struct SdkOperation {
     /// Stable operation id.
     pub id: String,
-    /// Handler-derived method name source.
+    /// Original source handler symbol.
     pub handler: String,
     /// HTTP method.
     pub method: String,
@@ -336,6 +336,7 @@ impl SdkModel {
         let mut services: BTreeMap<String, Vec<String>> = BTreeMap::new();
         let mut error_responses = Vec::new();
         let mut operation_docs = Vec::with_capacity(graph.operations.len());
+        let effective_tags = crate::graph::EffectiveOperationTags::new(graph);
         for op in &graph.operations {
             let service = op.group.clone().unwrap_or_else(|| "default".to_string());
             services
@@ -384,18 +385,7 @@ impl SdkModel {
                 .operation_docs
                 .iter()
                 .find(|policy| policy.operation_id == op.id);
-            let tags = docs_policy
-                .filter(|policy| !policy.tags.is_empty())
-                .map_or_else(
-                    || {
-                        if service == "default" {
-                            Vec::new()
-                        } else {
-                            vec![service.clone()]
-                        }
-                    },
-                    |policy| policy.tags.clone(),
-                );
+            let tags = effective_tags.resolve(op).to_vec();
             operation_docs.push(SdkOperationDocs {
                 operation_id: op.id.clone(),
                 service: service.clone(),

@@ -73,7 +73,7 @@ pub(crate) fn camel(name: &str) -> String {
 }
 
 pub(crate) fn operation_method_name(op: &Operation) -> String {
-    camel(&op.handler)
+    camel(&op.id)
 }
 
 fn upper_camel_first(name: &str) -> String {
@@ -1356,7 +1356,7 @@ fn emit_group_getters(out: &mut String, ops: &[&Operation]) -> Result<(), CoreEr
     if groups.is_empty() {
         return Ok(());
     }
-    let method_names: BTreeSet<String> = ops.iter().map(|op| camel(&op.handler)).collect();
+    let method_names: BTreeSet<String> = ops.iter().map(|op| operation_method_name(op)).collect();
     let mut properties: BTreeSet<String> = [
         "_apiKey",
         "_request",
@@ -1406,7 +1406,7 @@ fn emit_group_facades(out: &mut String, ops: &[&Operation]) -> Result<(), CoreEr
         writeln!(out, "\nexport class {} {{", api_class_name(&group)).map_err(sink)?;
         writeln!(out, "  constructor(private readonly client: Client) {{}}").map_err(sink)?;
         for op in group_ops {
-            let method = camel(&op.handler);
+            let method = operation_method_name(op);
             let lit = ts_string_literal(&method);
             out.push('\n');
             emit_facade_signature(out, &method, &lit)?;
@@ -4162,6 +4162,18 @@ mod tests {
                 .iter()
                 .filter(|o| o.handler == handler)
                 .collect()
+        }
+
+        #[test]
+        fn operation_method_name_uses_the_canonical_id() {
+            let mut graph = ops_graph();
+            graph.operations[0].id = "submitBook".to_string();
+            let operation = &graph.operations[0];
+            assert_eq!(operation.handler, "createBook");
+
+            let output = emit_operations(&graph, "bookstore", "/", &[operation]).unwrap();
+            assert!(output.contains("async submitBook("), "{output}");
+            assert!(!output.contains("async createBook("), "{output}");
         }
 
         /// The exact query-serialization block the emitter produces at `indent` spaces.

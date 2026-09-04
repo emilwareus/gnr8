@@ -114,6 +114,15 @@ fn run_gnr8(root: &Path, args: &[&str]) -> (bool, String, String) {
     run_gnr8_sharing_through(root, args, &root.join("gnr8-store"))
 }
 
+fn gnr8_output(root: &Path, args: &[&str]) -> std::process::Output {
+    Command::new(GNR8_BIN)
+        .args(args)
+        .current_dir(root)
+        .env("GNR8_CACHE_STORE", root.join("gnr8-store"))
+        .output()
+        .expect("spawn the gnr8 host binary")
+}
+
 /// Run `gnr8 <args...>` against `root`, sharing through the store at `store`.
 fn run_gnr8_sharing_through(root: &Path, args: &[&str], store: &Path) -> (bool, String, String) {
     let output = Command::new(GNR8_BIN)
@@ -348,10 +357,17 @@ fn assert_protection_and_force(root: &Path) {
     std::fs::write(root.join("sdk/package.json"), "{\"private\":true}\n")
         .expect("write unrelated support file");
 
-    let (ok, out, err) = run_gnr8(root, &["generate", "--json"]);
+    let output = gnr8_output(root, &["generate", "--json"]);
+    let out = String::from_utf8_lossy(&output.stdout).into_owned();
+    let err = String::from_utf8_lossy(&output.stderr).into_owned();
     assert!(
-        !ok && err.contains("generation incomplete"),
+        !output.status.success() && err.contains("generation incomplete"),
         "generate must fail when preserving divergent output.\nstdout:\n{out}\nstderr:\n{err}"
+    );
+    assert_eq!(
+        output.status.code(),
+        Some(1),
+        "protected output is a domain gate, not an execution error: {err}"
     );
     let report: serde_json::Value =
         serde_json::from_str(&out).expect("generate JSON remains valid");

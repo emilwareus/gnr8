@@ -1,8 +1,8 @@
 //! The gnr8 command-line surface, defined with the clap derive API.
 //!
 //! Commands either scaffold/teach (`init`, `guide`), run the project-local `.gnr8` pipeline
-//! (`generate`, `check`, `watch`, `doctor`), or inspect source facts directly (`inspect`). The global
-//! `--json` flag gives agents machine-readable output where useful.
+//! (`generate`, `check`, `changes`, `watch`, `doctor`), or inspect source facts directly (`inspect`).
+//! The global `--json` flag gives agents machine-readable output where useful.
 
 use clap::{Parser, Subcommand, ValueEnum};
 
@@ -85,6 +85,22 @@ pub(crate) enum Commands {
     },
     /// Verify generated outputs are up to date.
     Check,
+    /// Classify API changes against a committed graph artifact.
+    Changes {
+        /// Git revision whose committed graph artifact is the comparison base.
+        #[arg(long)]
+        base: String,
+
+        /// Exact, case-sensitive operation tag to exempt from the breaking-change gate.
+        #[arg(long, value_parser = non_empty_tag)]
+        exempt_tag: Vec<String>,
+
+        /// Print the report as Markdown for a job summary or pull-request comment.
+        ///
+        /// Selects the report format, so it cannot be combined with the global --json.
+        #[arg(long)]
+        markdown: bool,
+    },
     /// Explain inferred API facts and diagnostics.
     Inspect {
         /// What to inspect.
@@ -151,6 +167,12 @@ pub(crate) enum InspectAction {
     },
 }
 
+fn non_empty_tag(value: &str) -> Result<String, String> {
+    gnr8_engine::sdk::builtins::validate_metadata_value("tag", value)
+        .map(|()| value.to_string())
+        .map_err(|error| error.to_string())
+}
+
 #[cfg(test)]
 mod tests {
     // Tests legitimately use unwrap/expect/panic (rust-best-practices skill ch.4); scope the allow to
@@ -209,6 +231,26 @@ mod tests {
             Cli::try_parse_from(["gnr8", "check"]).unwrap().command,
             Commands::Check
         ));
+        let cli = Cli::try_parse_from([
+            "gnr8",
+            "changes",
+            "--base",
+            "origin/main",
+            "--exempt-tag",
+            "internal",
+            "--exempt-tag",
+            "beta",
+        ])
+        .unwrap();
+        assert!(matches!(
+            cli.command,
+            Commands::Changes {
+                base,
+                exempt_tag,
+                markdown: false
+            } if base == "origin/main" && exempt_tag == ["internal", "beta"]
+        ));
+        assert!(Cli::try_parse_from(["gnr8", "changes"]).is_err());
         assert!(matches!(
             Cli::try_parse_from(["gnr8", "doctor"]).unwrap().command,
             Commands::Doctor
@@ -224,6 +266,51 @@ mod tests {
             Commands::Guide {
                 topic: Some(GuideTopic::GoGinToPythonTypescript)
             }
+        ));
+    }
+
+    #[test]
+    fn changes_exempt_tags_use_the_metadata_value_contract() {
+        for invalid in ["", "   ", "internal\npartner", "internal\rpartner"] {
+            assert!(Cli::try_parse_from([
+                "gnr8",
+                "changes",
+                "--base",
+                "main",
+                "--exempt-tag",
+                invalid,
+            ])
+            .is_err());
+        }
+        assert!(Cli::try_parse_from([
+            "gnr8",
+            "changes",
+            "--base",
+            "main",
+            "--exempt-tag",
+            "partner APIs",
+        ])
+        .is_ok());
+    }
+
+    #[test]
+    fn changes_parses_the_markdown_report_format() {
+        // Which formats may be combined is `changes::ReportFormat`'s rule, not clap's: `--json` is
+        // global, so a derive-level conflict would only catch the spelling that writes both flags
+        // after the subcommand. Both spellings must parse here and be rejected there.
+        assert!(matches!(
+            Cli::try_parse_from(["gnr8", "changes", "--base", "main", "--markdown"])
+                .unwrap()
+                .command,
+            Commands::Changes { markdown: true, .. }
+        ));
+        let cli =
+            Cli::try_parse_from(["gnr8", "--json", "changes", "--base", "main", "--markdown"])
+                .unwrap();
+        assert!(cli.json);
+        assert!(matches!(
+            cli.command,
+            Commands::Changes { markdown: true, .. }
         ));
     }
 

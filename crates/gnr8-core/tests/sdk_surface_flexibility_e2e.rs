@@ -74,6 +74,9 @@ fn add_runtime_metadata(ir: &mut gnr8_engine::graph::ApiGraph) {
         .by_path_prefix("/list", "queries")
         .apply(ir, &Cx::new(FIXTURE_DIR))
         .expect("group operations");
+    RenameOperation::new("createGoal", "submitGoal")
+        .apply(ir, &Cx::new(FIXTURE_DIR))
+        .expect("rename operation");
 }
 
 #[test]
@@ -122,13 +125,15 @@ fn generated_sdks_support_configurable_surface_and_compile() {
 
     write_artifacts(&out, &root);
 
-    let go_op = std::fs::read_to_string(root.join("go-sdk/api_goals_create_goal.go"))
+    let go_op = std::fs::read_to_string(root.join("go-sdk/api_goals_submit_goal.go"))
         .expect("read grouped Go operation");
     assert!(go_op.contains("authorization"), "{go_op}");
+    assert!(go_op.contains("func (c *Client) SubmitGoal("), "{go_op}");
 
     let py_op = std::fs::read_to_string(root.join("pysdk/api_goals.py"))
         .expect("read grouped Python operation");
     assert!(py_op.contains("authorization"), "{py_op}");
+    assert!(py_op.contains("def submit_goal("), "{py_op}");
     let py_model = std::fs::read_to_string(root.join("pysdk/models/create_goal_input.py"))
         .expect("read py model");
     assert!(py_model.contains("BaseModel"), "{py_model}");
@@ -138,6 +143,10 @@ fn generated_sdks_support_configurable_surface_and_compile() {
     let ts_op = std::fs::read_to_string(root.join("ts-sdk/api_goals.ts"))
         .expect("read grouped TypeScript operation");
     assert!(ts_op.contains("authorization"), "{ts_op}");
+    assert!(
+        ts_op.contains("export const submitGoal = async function ("),
+        "{ts_op}"
+    );
 
     if command_available("go", "version") {
         std::fs::write(root.join("go-sdk/go.mod"), "module sdktest\n\ngo 1.26\n")

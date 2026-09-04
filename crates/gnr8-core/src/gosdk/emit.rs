@@ -90,6 +90,10 @@ pub(crate) fn exported(name: &str) -> String {
     out
 }
 
+fn operation_method_name(op: &Operation) -> String {
+    exported(&op.id)
+}
+
 /// Map a neutral graph [`Type`] to its Go SDK type (TARGET-API.md §4), resolving refs to model names.
 ///
 /// ALL Go-specific type mapping lives HERE — this is the correct home for per-target mapping (IR-03 /
@@ -1414,7 +1418,7 @@ fn emit_group_facades(
     let mut groups = BTreeMap::new();
     let mut facade_methods = BTreeMap::new();
     let mut facade_types = BTreeMap::new();
-    let method_names: BTreeSet<String> = ops.iter().map(|op| exported(&op.handler)).collect();
+    let method_names: BTreeSet<String> = ops.iter().map(|op| operation_method_name(op)).collect();
     let schema_names: BTreeSet<&str> = graph
         .schemas
         .iter()
@@ -1617,7 +1621,7 @@ fn emit_operation(
     graph: &ApiGraph,
     base_path: &str,
 ) -> Result<(), CoreError> {
-    let method_name = exported(&op.handler);
+    let method_name = operation_method_name(op);
     let ordered_path_params = ordered_path_params(op)?;
     let path_params: Vec<&str> = ordered_path_params
         .iter()
@@ -1799,7 +1803,7 @@ fn emit_pagination_helpers(
     let Some(policy) = pagination_policy_for(graph, op) else {
         return Ok(());
     };
-    let method_name = exported(&op.handler);
+    let method_name = operation_method_name(op);
     let pages_name = format!("{method_name}Pages");
     let items_name = format!("Iterate{method_name}");
     let info = go_pagination_info(graph, op, policy)?;
@@ -2038,7 +2042,7 @@ struct PaginationArgs {
 }
 
 fn go_pagination_args(op: &Operation, graph: &ApiGraph) -> Result<PaginationArgs, CoreError> {
-    let method_name = exported(&op.handler);
+    let method_name = operation_method_name(op);
     let ordered_path_params = ordered_path_params(op)?;
     let request_params: Vec<&crate::graph::Param> =
         op.params.iter().filter(|p| p.location != "path").collect();
@@ -3745,6 +3749,18 @@ mod tests {
     fn sample_graph() -> ApiGraph {
         let facts = serde_json::from_slice(SAMPLE).unwrap();
         ApiGraph::from_facts(facts, "/root")
+    }
+
+    #[test]
+    fn operation_method_name_uses_the_canonical_id() {
+        let mut graph = sample_graph();
+        graph.operations[0].id = "submitGoal".to_string();
+        let operation = &graph.operations[0];
+        assert_eq!(operation.handler, "createGoal");
+
+        let output = emit_operations(&graph, "goalservice", "/goal", &[operation]).unwrap();
+        assert!(output.contains("func (c *Client) SubmitGoal("), "{output}");
+        assert!(!output.contains("func (c *Client) CreateGoal("), "{output}");
     }
 
     /// A minimal graph with ONE GET operation whose `400` response references an error model named

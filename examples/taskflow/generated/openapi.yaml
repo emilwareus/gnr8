@@ -48,6 +48,19 @@ paths:
             application/json:
               schema:
                 $ref: '#/components/schemas/ErrorResponse'
+  '/tasks/_debug':
+    get:
+      operationId: debugTasks
+      summary: Handles the internal GET /tasks/_debug endpoint.
+      description: "The .gnr8/ pipeline\nkeeps this route generated so change reporting can apply explicit tag-based gate policy."
+      tags: [internal, tasks]
+      responses:
+        '200':
+          description: Response 200
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/TaskList'
   '/tasks/{id}':
     get:
       operationId: getTask

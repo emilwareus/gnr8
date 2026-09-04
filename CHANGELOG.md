@@ -9,6 +9,45 @@ must move the minor version.
 
 ## Unreleased
 
+### Breaking
+
+- **`OperationSelector` adds the `SourcePrefix` variant.** Custom Rust code that exhaustively matches
+  this public enum must handle the new source-file selector. The host/worker protocol is now version
+  7 so a worker and CLI cannot silently disagree about the stage-plan shape.
+- **`RenameOperation` now controls generated SDK method names in every built-in SDK target.** The
+  transform already changed the canonical graph id and operation file names; Go, Python, and
+  TypeScript emitters now use that same id instead of retaining the original handler symbol.
+- **Execution and configuration failures now exit with status 2.** Status 1 is reserved for a
+  command's domain gate: generated drift, actionable doctor findings, or checked breaking API
+  changes. This aligns the executable with the documented distinction between gate and command
+  failure.
+- **Every successful pipeline emits the versioned `generated/gnr8.graph.json` artifact.** It is the
+  sole historical source `gnr8 changes` compares against, so it uses the ordinary generated-output
+  lifecycle and must be committed with the OpenAPI and SDK artifacts. Because the file is new to
+  every project, existing projects must run `gnr8 generate` and commit before `gnr8 check` passes.
+- **`sdk/reference.md` documents an operation's effective tags.** The operation documentation
+  section previously printed only tags a `DocumentOperation` policy set, so an operation that
+  inherits its tags from its group carried none; it now prints the same effective tags OpenAPI and
+  the change gate use, and an operation whose only documented fact is those tags gains a section.
+  Existing projects must run `gnr8 generate` and commit before `gnr8 check` passes.
+
+### Added
+
+- **`gnr8 changes --base <ref> [--exempt-tag <name>]...` classifies committed API changes.** It
+  compares the current projected graph with `generated/gnr8.graph.json` at the base commit, reports
+  breaking, additive, and documentation-only findings in human or JSON form, and exits 1 only when a
+  checked breaking finding exists. The human report is the three-column kind/operation/message
+  layout; a current `file:line` is appended when the finding has one. Exact standard operation tags
+  can exempt a finding only when every extant side is exempt; schema scope follows all transitive
+  consumers independently on both graphs.
+- **`gnr8 changes --markdown` prints the report as Markdown.** It carries the base revision, the
+  exempt-tag policy, the summary counts, and every finding with its affected SDK operations and
+  source location, ready for a job summary or a pull-request comment. It selects the report format,
+  so it cannot be combined with `--json`.
+- **The GitHub Action can publish API-change reports.** `report-api-changes`, `base-ref`, and
+  `exempt-tags` add Markdown/JSON artifacts, a job summary, a marker-owned pull-request comment when
+  permitted, and a final checked-breaking gate.
+
 ## 0.11.0 — 2026-09-04
 
 ### Breaking

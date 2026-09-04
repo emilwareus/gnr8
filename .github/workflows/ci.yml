@@ -8,6 +8,14 @@ on:
 permissions:
   contents: read
 
+# npm's post-install audit round-trip, not the install itself, is what makes
+# `npm ci` slow here: tsextract's two locked packages restore in ~0.7s without it
+# and in 1-4 minutes with it. Every npm call in this workflow gets the same
+# treatment, including the one `make tsextract-test` runs for itself.
+env:
+  NPM_CONFIG_AUDIT: "false"
+  NPM_CONFIG_FUND: "false"
+
 concurrency:
   group: ci-${{ github.workflow }}-${{ github.ref }}
   cancel-in-progress: true
