@@ -51,28 +51,40 @@ jobs:
       fail-fast: false
       matrix:
         include:
+          # `report_changes` runs the action's changes mode against the real binary. One project is
+          # enough — that path is language-agnostic — and one keeps the pull-request comment step
+          # from racing five jobs over the same marker comment.
           - project: bookstore
             setup_go: "true"
             setup_python: "false"
             setup_node: "false"
+            report_changes: "true"
           - project: taskflow
             setup_go: "true"
             setup_python: "false"
             setup_node: "false"
+            report_changes: "false"
           - project: fastapi-bookstore
             setup_go: "false"
             setup_python: "true"
             setup_node: "false"
+            report_changes: "false"
           - project: flask-bookstore
             setup_go: "false"
             setup_python: "true"
             setup_node: "false"
+            report_changes: "false"
           - project: nestjs-bookstore
             setup_go: "false"
             setup_python: "false"
             setup_node: "true"
+            report_changes: "false"
     steps:
+      # Change reporting reads the base revision's committed graph artifact out of history, which
+      # is the `fetch-depth: 0` the action documents for its callers.
       - uses: actions/checkout@v7
+        with:
+          fetch-depth: 0
 
       - uses: actions/download-artifact@v6
         with:
@@ -108,6 +120,16 @@ jobs:
           setup-node: "false"
           node-version: "24"
           cache-key-prefix: gnr8-${{ matrix.project }}
+          # The workflow token is contents:read, so the action's pull-request comment step cannot
+          # post and degrades to its documented warning. That is deliberate: this repository's own
+          # pull requests do not want the comment, and the report still reaches the job summary and
+          # the uploaded artifact, which is what this job asserts the composite path produces.
+          report-api-changes: ${{ matrix.report_changes }}
+          # HEAD, not origin/main: the base must already carry the committed graph artifact this
+          # release introduces, and main does not until this branch merges. HEAD asserts that the
+          # committed artifact matches a fresh projection, which is deterministic before and after
+          # the merge; switch it to origin/main once main carries the artifacts.
+          base-ref: HEAD
 
   check:
     name: gnr8 check
