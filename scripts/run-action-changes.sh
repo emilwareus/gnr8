@@ -21,7 +21,15 @@ while IFS= read -r dir || [[ -n "$dir" ]]; do
   dirs+=("$dir")
 done <<< "$WORKING_DIRECTORIES"
 
-change_args=()
+if [[ "${#dirs[@]}" -eq 0 ]]; then
+  echo "gnr8 action: no working directories configured" >&2
+  exit 2
+fi
+
+# Seeded with the fixed argv so the array is never empty: expanding "${empty[@]}" under `set -u`
+# is an unbound-variable error in bash 3.2, the bash GitHub's macOS runners provide, and the
+# default configuration (no exempt-tags) appends nothing to it.
+change_args=(--json changes --base "$BASE_REF")
 while IFS= read -r tag || [[ -n "$tag" ]]; do
   # Tag matching is exact. Empty lines separate values; every byte on a non-empty line belongs to
   # the OpenAPI tag, including leading/trailing spaces and a leading '#'. The CLI performs the one
@@ -47,8 +55,7 @@ for dir in "${dirs[@]}"; do
 
   echo "::group::gnr8 changes $dir"
   set +e
-  (cd "$dir" && "$GNR8_BIN" --json changes --base "$BASE_REF" "${change_args[@]}") \
-    > "$json" 2> "$stderr"
+  (cd "$dir" && "$GNR8_BIN" "${change_args[@]}") > "$json" 2> "$stderr"
   status=$?
   set -e
   if [[ -s "$stderr" ]]; then

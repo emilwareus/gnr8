@@ -74,6 +74,34 @@ report_root="$(sed -n 's/^report-root=//p' "$output")"
 test -s "$report_root/001/report.json"
 test -s "$report_root/001/report.md"
 
+# The default configuration exempts nothing, which leaves the tag loop appending no arguments at
+# all. Expanding an empty array under `set -u` is fatal on bash 3.2 (GitHub's macOS runners), so
+# the empty case must run the binary, not merely parse.
+empty_output="$tmp/output-empty"
+empty_summary="$tmp/summary-empty"
+empty_log="$tmp/args-empty"
+: > "$empty_output"
+: > "$empty_summary"
+: > "$empty_log"
+
+GNR8_BIN="$fake" \
+BASE_REF=HEAD \
+EXEMPT_TAGS="" \
+WORKING_DIRECTORIES="$repo_root/examples/bookstore" \
+RUNNER_TEMP="$tmp" \
+GITHUB_OUTPUT="$empty_output" \
+GITHUB_STEP_SUMMARY="$empty_summary" \
+GITHUB_JOB=test \
+FAKE_LOG="$empty_log" \
+  "$runner"
+
+grep -Fx 'gating=true' "$empty_output" >/dev/null
+grep -F -- '--base HEAD' "$empty_log" >/dev/null
+if grep -F -- '--exempt-tag' "$empty_log" >/dev/null; then
+  echo "empty exempt-tags must not pass --exempt-tag" >&2
+  exit 1
+fi
+
 stderr="$tmp/missing-stderr"
 if GNR8_BIN="$fake" \
   BASE_REF=refs/heads/not-present \
