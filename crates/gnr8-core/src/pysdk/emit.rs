@@ -1691,8 +1691,13 @@ class _SafeRedirectHandler(urllib.request.HTTPRedirectHandler):
         sensitive.update((\"Authorization\", \"Cookie\", \"Proxy-Authorization\"))
         setattr(redirected, \"_gnr8_sensitive_headers\", tuple(sensitive))
         if _origin(req.full_url) != _origin(newurl):
-            for name in sensitive:
-                redirected.remove_header(name)
+            # Request.add_header() stores keys capitalize()-normalized while
+            # remove_header() pops the exact key, so a configured spelling such as
+            # X-API-Key never matches what is stored. Match the stored names.
+            unwanted = {{name.lower() for name in sensitive}}
+            for name, _value in redirected.header_items():
+                if name.lower() in unwanted:
+                    redirected.remove_header(name)
         return redirected
 
 

@@ -1223,7 +1223,7 @@ func (a *Analyzer) Analyze(route routes.Route, diags *diag.Accumulator) CodeFact
 	hasBodyBind := false
 	allBodyBindsOptional := true
 	delegatedResponseSeen := map[string]bool{}
-	responseHeaders := a.collectResponseHeadersByStatus(h)
+	responseHeaders := a.collectResponseHeadersByStatus(h, route, diags)
 
 	ast.Inspect(h.decl.Body, func(n ast.Node) bool {
 		call, ok := n.(*ast.CallExpr)
@@ -3293,16 +3293,28 @@ type responseHeaderFlow struct {
 }
 
 type responseHeaderCollector struct {
-	analyzer *Analyzer
-	byStatus map[uint16]responseHeaderSet
-	stack    map[string]bool
+	analyzer    *Analyzer
+	byStatus    map[uint16]responseHeaderSet
+	stack       map[string]bool
+	route       routes.Route
+	diagnostics *diag.Accumulator
+	// A helper reached from two call sites is walked twice, so an unresolved name is
+	// reported once per source position rather than once per walk.
+	reported map[token.Pos]bool
 }
 
-func (a *Analyzer) collectResponseHeadersByStatus(h handlerDecl) map[uint16][]facts.ResponseHeaderFact {
+func (a *Analyzer) collectResponseHeadersByStatus(
+	h handlerDecl,
+	route routes.Route,
+	diags *diag.Accumulator,
+) map[uint16][]facts.ResponseHeaderFact {
 	collector := responseHeaderCollector{
-		analyzer: a,
-		byStatus: map[uint16]responseHeaderSet{},
-		stack:    map[string]bool{},
+		analyzer:    a,
+		byStatus:    map[uint16]responseHeaderSet{},
+		stack:       map[string]bool{},
+		route:       route,
+		diagnostics: diags,
+		reported:    map[token.Pos]bool{},
 	}
 	collector.analyzeFunction(
 		helperFrame{decl: h, bindings: map[gotypes.Object]helperBinding{}},
@@ -3537,6 +3549,8 @@ func (c *responseHeaderCollector) analyzeNodeCalls(
 			if name == "Header" {
 				if header, ok := frameCallStringArg(frame, call, 0); ok {
 					addResponseHeader(headers, header)
+				} else {
+					c.reportUnresolvedHeaderName(frame, call.Pos(), "Header")
 				}
 				return true
 			}
@@ -3554,6 +3568,8 @@ func (c *responseHeaderCollector) analyzeNodeCalls(
 		if responseHeaderMutation(frame.decl, call) {
 			if header, ok := frameCallStringArg(frame, call, 0); ok {
 				addResponseHeader(headers, header)
+			} else {
+				c.reportUnresolvedHeaderName(frame, call.Pos(), selectorName(call.Fun))
 			}
 			return true
 		}
@@ -3605,12 +3621,38 @@ func (c *responseHeaderCollector) recordGinResponse(
 			addResponseHeader(responseHeaders, "Content-Length")
 		}
 		if len(call.Args) > 4 {
-			for _, header := range stringMapLiteralKeys(call.Args[4]) {
+			extra, resolved := stringMapLiteralKeys(call.Args[4])
+			for _, header := range extra {
 				addResponseHeader(responseHeaders, header)
+			}
+			if !resolved {
+				c.reportUnresolvedHeaderName(frame, call.Args[4].Pos(), "DataFromReader")
 			}
 		}
 	}
 	c.record(status, responseHeaders)
+}
+
+// reportUnresolvedHeaderName records a response header write whose name is not a
+// constant. The header is dropped rather than guessed (rule 3), so the omission
+// has to be visible or the generated contract silently loses it.
+func (c *responseHeaderCollector) reportUnresolvedHeaderName(
+	frame helperFrame,
+	pos token.Pos,
+	subject string,
+) {
+	if c.diagnostics == nil || c.reported[pos] {
+		return
+	}
+	c.reported[pos] = true
+	file, line := positionOf(frame.decl.fset, pos)
+	c.diagnostics.ResponseHeaderUnresolved(
+		c.route.Method,
+		untypedRouteLabel(c.route),
+		subject+" writes a response header under a name that is not a constant",
+		file,
+		line,
+	)
 }
 
 func (c *responseHeaderCollector) record(status uint16, headers responseHeaderSet) {
@@ -3665,22 +3707,33 @@ func nonNegativeIntegerConstant(info *gotypes.Info, expr ast.Expr) bool {
 	return exact && integer >= 0
 }
 
-func stringMapLiteralKeys(expr ast.Expr) []string {
+// stringMapLiteralKeys reads the keys of a literal string map. The second result
+// reports whether the whole map was readable: an explicit nil states "no extra
+// headers", a literal with literal keys states exactly those, and anything else
+// is a name typed source cannot state.
+func stringMapLiteralKeys(expr ast.Expr) ([]string, bool) {
+	if isNilIdent(expr) {
+		return nil, true
+	}
 	literal, ok := expr.(*ast.CompositeLit)
 	if !ok {
-		return nil
+		return nil, false
 	}
 	keys := make([]string, 0, len(literal.Elts))
+	resolved := true
 	for _, element := range literal.Elts {
 		pair, ok := element.(*ast.KeyValueExpr)
 		if !ok {
+			resolved = false
 			continue
 		}
 		if key, ok := stringKey(pair.Key); ok {
 			keys = append(keys, key)
+		} else {
+			resolved = false
 		}
 	}
-	return keys
+	return keys, resolved
 }
 
 func responseHeaderMutation(h handlerDecl, call *ast.CallExpr) bool {

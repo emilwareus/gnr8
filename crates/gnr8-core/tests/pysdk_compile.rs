@@ -209,6 +209,10 @@ fn materialize_sdk() -> PathBuf {
     materialize_sdk_from_graph("ok", &graph, &graph.base_path)
 }
 
+#[expect(
+    clippy::too_many_lines,
+    reason = "the auth graph is an explicit JSON fixture covering query, header, bearer, and basic credentials across same- and cross-origin redirects"
+)]
 fn auth_graph() -> gnr8_engine::graph::ApiGraph {
     serde_json::from_str(
         r#"{
@@ -263,6 +267,32 @@ fn auth_graph() -> gnr8_engine::graph::ApiGraph {
               "security": ["BearerAuth"],
               "security_overrides_global": true,
               "provenance": { "file": "main.py", "start_line": 4, "end_line": 4 }
+            },
+            {
+              "id": "getHeaderKeyRedirect",
+              "method": "GET",
+              "path": "/header-redirect",
+              "handler": "getHeaderKeyRedirect",
+              "params": [],
+              "request_body": null,
+              "request_body_required": true,
+              "responses": [ { "status": 302, "body": null } ],
+              "security": ["HeaderAuth"],
+              "security_overrides_global": true,
+              "provenance": { "file": "main.py", "start_line": 5, "end_line": 5 }
+            },
+            {
+              "id": "getSameOriginRedirect",
+              "method": "GET",
+              "path": "/same-origin-redirect",
+              "handler": "getSameOriginRedirect",
+              "params": [],
+              "request_body": null,
+              "request_body_required": true,
+              "responses": [ { "status": 302, "body": null } ],
+              "security": ["HeaderAuth"],
+              "security_overrides_global": true,
+              "provenance": { "file": "main.py", "start_line": 6, "end_line": 6 }
             }
           ],
           "schemas": [],
@@ -276,6 +306,13 @@ fn auth_graph() -> gnr8_engine::graph::ApiGraph {
               "location": "query",
               "name": "api_key",
               "global": true
+            },
+            {
+              "id": "HeaderAuth",
+              "kind": "apiKey",
+              "location": "header",
+              "name": "X-API-Key",
+              "global": false
             },
             {
               "id": "BearerAuth",
@@ -916,16 +953,39 @@ from http.server import BaseHTTPRequestHandler, HTTPServer
 
 import bookstore
 
+SENSITIVE = ("Authorization", "X-API-Key", "Proxy-Authorization")
+
+
+def _sensitive(headers):
+    """The sensitive headers actually present, keyed by their canonical spelling.
+
+    urllib normalizes header names on the way out, so compare case-insensitively
+    rather than trusting the spelling the client was configured with.
+    """
+    seen = {}
+    for name in SENSITIVE:
+        for key, value in headers.items():
+            if key.lower() == name.lower():
+                seen[name] = value
+    return seen
+
 
 class _Handler(BaseHTTPRequestHandler):
     seen = []
     destination_port = 0
+    same_origin_final = None
 
     def log_message(self, *args):
         pass
 
     def _send_no_content(self):
         self.send_response(204)
+        self.send_header("Content-Length", "0")
+        self.end_headers()
+
+    def _redirect_to(self, location):
+        self.send_response(302)
+        self.send_header("Location", location)
         self.send_header("Content-Length", "0")
         self.end_headers()
 
@@ -941,29 +1001,41 @@ class _Handler(BaseHTTPRequestHandler):
             assert self.headers.get("Authorization") == "Basic dXNlcjpwYXNz", self.headers
         elif parsed.path == "/api/redirect":
             assert self.headers.get("Authorization") == "Bearer secret-token", self.headers
-            self.send_response(302)
-            self.send_header(
-                "Location", f"http://127.0.0.1:{_Handler.destination_port}/final"
-            )
-            self.send_header("Content-Length", "0")
-            self.end_headers()
+            self._redirect_to(f"http://127.0.0.1:{_Handler.destination_port}/final")
             return
+        elif parsed.path == "/api/header-redirect":
+            # The configured spelling is X-API-Key; urllib stores it as X-api-key.
+            assert _sensitive(self.headers) == {
+                "X-API-Key": "secret-header",
+                "Proxy-Authorization": "proxy-secret",
+            }, dict(self.headers)
+            self._redirect_to(f"http://127.0.0.1:{_Handler.destination_port}/final")
+            return
+        elif parsed.path == "/api/same-origin-redirect":
+            self._redirect_to("/api/same-origin-final")
+            return
+        elif parsed.path == "/api/same-origin-final":
+            _Handler.same_origin_final = _sensitive(self.headers)
         else:
             raise AssertionError(f"unexpected path {parsed.path}")
         self._send_no_content()
 
 
 class _DestinationHandler(BaseHTTPRequestHandler):
-    authorization = "unseen"
+    received = []
 
     def log_message(self, *args):
         pass
 
     def do_GET(self):
-        _DestinationHandler.authorization = self.headers.get("Authorization")
+        _DestinationHandler.received.append(_sensitive(self.headers))
         self.send_response(204)
         self.send_header("Content-Length", "0")
         self.end_headers()
+
+
+def _add_proxy_authorization(_context, req):
+    req.add_header("Proxy-Authorization", "proxy-secret")
 
 
 def main():
@@ -979,21 +1051,36 @@ def main():
         client = bookstore.Client(
             f"http://127.0.0.1:{port}",
             api_key="secret",
+            api_keys={"HeaderAuth": "secret-header"},
             bearer_token="secret-token",
             basic_auth=("user", "pass"),
             opener=urllib.request.build_opener(),
+            hooks=bookstore.ClientHooks(request=[_add_proxy_authorization]),
         )
+        follow = bookstore.RequestOptions(follow_redirects=True)
         assert client.list_items() is None
         assert client.get_bearer() is None
         assert client.get_basic() is None
-        assert client.get_redirect(bookstore.RequestOptions(follow_redirects=True)) is None
+        assert client.get_redirect(follow) is None
+        assert client.get_header_key_redirect(follow) is None
+        assert client.get_same_origin_redirect(follow) is None
         assert _Handler.seen == [
             "/api/items",
             "/api/bearer",
             "/api/basic",
             "/api/redirect",
+            "/api/header-redirect",
+            "/api/same-origin-redirect",
+            "/api/same-origin-final",
         ], _Handler.seen
-        assert _DestinationHandler.authorization is None, _DestinationHandler.authorization
+        # A cross-origin hop drops every sensitive header regardless of the spelling
+        # the client stored it under.
+        assert _DestinationHandler.received == [{}, {}], _DestinationHandler.received
+        # A same-origin hop keeps them: stripping there would break ordinary redirects.
+        assert _Handler.same_origin_final == {
+            "X-API-Key": "secret-header",
+            "Proxy-Authorization": "proxy-secret",
+        }, _Handler.same_origin_final
     finally:
         server.shutdown()
         server.server_close()

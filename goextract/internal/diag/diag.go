@@ -202,6 +202,22 @@ func (a *Accumulator) ResponseMediaTypeUnresolved(method, route, reason, file st
 	})
 }
 
+// ResponseHeaderUnresolved records a response header the handler writes under a
+// name typed source cannot state. The header is omitted rather than guessed, so
+// the operation identity lets a response override declare it explicitly.
+func (a *Accumulator) ResponseHeaderUnresolved(method, route, reason, file string, line uint32) {
+	a.items = append(a.items, facts.DiagnosticFact{
+		Code:      "response.header.unresolved",
+		Severity:  severityWarn,
+		Category:  categoryResponse,
+		Message:   reason,
+		File:      file,
+		Line:      line,
+		EndLine:   line,
+		Operation: method + " " + route,
+	})
+}
+
 // UnsupportedRoutePattern records a Gin route registration shape that cannot be
 // lowered faithfully. The route is skipped rather than guessed so migration
 // review can fix the source pattern or add an explicit custom Source/Transform.

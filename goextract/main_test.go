@@ -62,6 +62,7 @@ func TestGinContractRegressionFacts(t *testing.T) {
 	}
 	wantDiagnostics := map[string]string{
 		"response.missing":             "GET /v1/items/raw-stream",
+		"response.header.unresolved":   "GET /v1/files/{fileId}/dynamic-header",
 		"request.parameter.unresolved": "POST /v1/files/dynamic-upload",
 		"request.body.unresolved":      "POST /v1/files/dynamic-upload",
 		"security.requirement.missing": "GET /v1/items/request-observations",
@@ -122,6 +123,13 @@ func TestGinContractRegressionFacts(t *testing.T) {
 	for _, name := range []string{"Content-Disposition", "Content-Length", "Content-Type", "X-Session-ID"} {
 		assertResponseHeader(t, reader, 200, name)
 		assertNoResponseHeader(t, reader, 404, name)
+	}
+	dynamicHeader := routeByHandler(t, doc, "dynamicHeaderFile")
+	assertBodylessStatus(t, dynamicHeader, 204)
+	for _, response := range dynamicHeader.Responses {
+		if len(response.Headers) != 0 {
+			t.Fatalf("a dynamic response header name must be diagnosed, never guessed: %+v", response.Headers)
+		}
 	}
 	redirect := routeByHandler(t, doc, "redirectFile")
 	assertBodylessStatus(t, redirect, 307)

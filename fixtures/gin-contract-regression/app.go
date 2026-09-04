@@ -102,6 +102,7 @@ func RegisterRoutes(r *gin.Engine, h *Handler) {
 	files.GET("/:fileId/open", h.openFile)
 	files.GET("/:fileId/stream", h.streamFile)
 	files.GET("/:fileId/read", h.readFile)
+	files.GET("/:fileId/dynamic-header", h.dynamicHeaderFile)
 	files.GET("/:fileId/redirect", h.redirectFile)
 	files.GET("/:fileId/helper-redirect", h.helperRedirectFile)
 	files.POST("/upload", h.uploadFile)
@@ -196,6 +197,15 @@ func (h *Handler) readFile(c *gin.Context) {
 		"Content-Disposition": `attachment; filename="report.pdf"`,
 		"X-Session-ID":        "session-123",
 	})
+}
+
+func (h *Handler) dynamicHeaderFile(c *gin.Context) {
+	c.Header(sessionHeaderName(), "session-123")
+	c.Status(http.StatusNoContent)
+}
+
+func sessionHeaderName() string {
+	return fmt.Sprintf("X-Session-%d", time.Now().Year())
 }
 
 func (h *Handler) redirectFile(c *gin.Context) {
