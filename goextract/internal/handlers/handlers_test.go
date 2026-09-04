@@ -1640,7 +1640,7 @@ func (s Server) search(c *gin.Context) {
 	}
 	for _, headerName := range []string{"X-Direct", "X-Request-Direct"} {
 		header, exists := paramByName(code.Params, headerName)
-		if !exists || header.Location != "header" || !header.Required {
+		if !exists || header.Location != "header" || header.Required {
 			t.Fatalf("missing direct header %s: %+v", headerName, code.Params)
 		}
 	}
@@ -1650,7 +1650,7 @@ func (s Server) search(c *gin.Context) {
 		}
 	}
 	cookie, _ := paramByName(code.Params, "session")
-	if cookie.Location != "cookie" || !cookie.Required {
+	if cookie.Location != "cookie" || cookie.Required {
 		t.Fatalf("cookie mismatch: %+v", cookie)
 	}
 

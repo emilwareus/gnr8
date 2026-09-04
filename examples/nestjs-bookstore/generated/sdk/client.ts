@@ -12,6 +12,7 @@ export interface RequestOptions {
   headers?: Record<string, string>;
   metadata?: Record<string, string>;
   signal?: AbortSignal;
+  followRedirects?: boolean;
 }
 
 export interface HookContext {
@@ -60,6 +61,7 @@ interface RuntimeRequestContext {
   pathTemplate: string;
   idempotent?: boolean;
   idempotencyKeyHeader?: string;
+  successStatuses?: readonly number[];
 }
 
 interface AuthRequirement {
@@ -332,6 +334,7 @@ export class Client {
         method,
         headers,
         body: bodyPayload ?? null,
+        redirect: options.followRedirects === true ? "follow" : "manual",
         signal:
           signals.length > 1 ? AbortSignal.any(signals) : (signals[0] ?? null),
       };
@@ -414,7 +417,10 @@ export class Client {
         await this._waitBeforeRetry(delayMs, options.signal, hookContext);
         continue;
       }
-      if (response.status < 200 || response.status >= 300) {
+      if (
+        (response.status < 200 || response.status >= 300) &&
+        !(context.successStatuses ?? []).includes(response.status)
+      ) {
         const error = new ApiError(response.status, {
           headers: response.headers,
           requestId: response.headers.get("x-request-id") ?? undefined,
@@ -561,6 +567,7 @@ export class Client {
         pathTemplate: "/books/",
         idempotent: false,
         idempotencyKeyHeader: "Idempotency-Key",
+        successStatuses: [200],
       },
       options,
     );
@@ -603,6 +610,7 @@ export class Client {
         pathTemplate: "/books/",
         idempotent: false,
         idempotencyKeyHeader: "Idempotency-Key",
+        successStatuses: [201],
       },
       options,
     );
@@ -660,6 +668,7 @@ export class Client {
         pathTemplate: "/books/{bookId}",
         idempotent: false,
         idempotencyKeyHeader: "Idempotency-Key",
+        successStatuses: [200],
       },
       options,
     );
@@ -703,6 +712,7 @@ export class Client {
         pathTemplate: "/books/{bookId}",
         idempotent: false,
         idempotencyKeyHeader: "Idempotency-Key",
+        successStatuses: [200],
       },
       options,
     );

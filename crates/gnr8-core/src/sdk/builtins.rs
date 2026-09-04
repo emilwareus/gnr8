@@ -204,7 +204,7 @@ fn single_input_cache_root(
 }
 
 /// The envelope schema version for a stored Go source-analysis graph.
-const GO_GIN_SOURCE_CACHE_VERSION: u32 = 1;
+const GO_GIN_SOURCE_CACHE_VERSION: u32 = 2;
 
 /// One stored Go source-analysis result, with the key it was computed under.
 ///
@@ -885,6 +885,7 @@ impl TransformExec for SetOperationSuccessResponse {
             body_kind: "json".to_string(),
             content_type: None,
             content_types: vec!["application/json".to_string()],
+            headers: Vec::new(),
         });
         op.responses.sort_by_key(|response| response.status);
         Ok(())
@@ -1549,6 +1550,7 @@ fn apply_response_override(
             override_.content_type.as_deref(),
             &override_.content_types,
         ),
+        headers: Vec::new(),
     };
     if ir.operations[op_index]
         .responses
@@ -1609,6 +1611,7 @@ fn apply_default_response_override(
             body_kind: override_.body_kind.clone(),
             content_type: override_.content_type.clone(),
             content_types: content_types.clone(),
+            headers: Vec::new(),
         });
         op.responses.sort_by_key(|response| response.status);
     }
@@ -2264,6 +2267,7 @@ fn apply_documented_error_responses(
             body_kind: "json".to_string(),
             content_type: None,
             content_types: vec!["application/json".to_string()],
+            headers: Vec::new(),
         });
         op.responses.sort_by_key(|existing| existing.status);
     }
@@ -4461,6 +4465,7 @@ mod tests {
             body_kind: "empty".to_string(),
             content_type: None,
             content_types: Vec::new(),
+            headers: Vec::new(),
         }
     }
 
@@ -4501,6 +4506,7 @@ mod tests {
             request_body: None,
             request_body_required: true,
             request_body_content_type: None,
+            request_body_variants: Vec::new(),
             responses: vec![],
             security: Vec::new(),
             security_overrides_global: false,
@@ -4528,6 +4534,7 @@ mod tests {
             request_body: None,
             request_body_required: true,
             request_body_content_type: None,
+            request_body_variants: Vec::new(),
             responses: Vec::new(),
             security: Vec::new(),
             security_overrides_global: false,
@@ -4631,6 +4638,7 @@ mod tests {
                     request_body: None,
                     request_body_required: true,
                     request_body_content_type: None,
+                    request_body_variants: Vec::new(),
                     responses: vec![bodyless_response(204)],
                     security: Vec::new(),
                     security_overrides_global: false,
@@ -4649,6 +4657,7 @@ mod tests {
                     request_body: None,
                     request_body_required: true,
                     request_body_content_type: None,
+                    request_body_variants: Vec::new(),
                     responses: vec![bodyless_response(204)],
                     security: Vec::new(),
                     security_overrides_global: false,
@@ -4667,6 +4676,7 @@ mod tests {
                     request_body: None,
                     request_body_required: true,
                     request_body_content_type: None,
+                    request_body_variants: Vec::new(),
                     responses: vec![bodyless_response(204)],
                     security: Vec::new(),
                     security_overrides_global: false,
@@ -4726,6 +4736,7 @@ mod tests {
                     request_body: None,
                     request_body_required: true,
                     request_body_content_type: None,
+                    request_body_variants: Vec::new(),
                     responses: vec![],
                     security: Vec::new(),
                     security_overrides_global: false,
@@ -4744,6 +4755,7 @@ mod tests {
                     request_body: None,
                     request_body_required: true,
                     request_body_content_type: None,
+                    request_body_variants: Vec::new(),
                     responses: vec![],
                     security: Vec::new(),
                     security_overrides_global: false,
@@ -4762,6 +4774,7 @@ mod tests {
                     request_body: None,
                     request_body_required: true,
                     request_body_content_type: None,
+                    request_body_variants: Vec::new(),
                     responses: vec![],
                     security: Vec::new(),
                     security_overrides_global: false,
@@ -4878,6 +4891,7 @@ mod tests {
                     }),
                     request_body_required: true,
                     request_body_content_type: Some("application/json".to_string()),
+                    request_body_variants: Vec::new(),
                     responses: vec![bodyless_response(204)],
                     security: Vec::new(),
                     security_overrides_global: false,
@@ -4896,6 +4910,7 @@ mod tests {
                     request_body: None,
                     request_body_required: true,
                     request_body_content_type: None,
+                    request_body_variants: Vec::new(),
                     responses: vec![],
                     security: Vec::new(),
                     security_overrides_global: false,
@@ -4914,6 +4929,7 @@ mod tests {
                     request_body: None,
                     request_body_required: true,
                     request_body_content_type: None,
+                    request_body_variants: Vec::new(),
                     responses: vec![],
                     security: Vec::new(),
                     security_overrides_global: false,
@@ -5208,6 +5224,7 @@ mod tests {
                     request_body: None,
                     request_body_required: true,
                     request_body_content_type: None,
+                    request_body_variants: Vec::new(),
                     responses: vec![],
                     security: Vec::new(),
                     security_overrides_global: false,
@@ -5226,6 +5243,7 @@ mod tests {
                     request_body: None,
                     request_body_required: true,
                     request_body_content_type: None,
+                    request_body_variants: Vec::new(),
                     responses: vec![],
                     security: Vec::new(),
                     security_overrides_global: false,
@@ -5246,6 +5264,7 @@ mod tests {
                     }),
                     request_body_required: true,
                     request_body_content_type: None,
+                    request_body_variants: Vec::new(),
                     responses: vec![],
                     security: Vec::new(),
                     security_overrides_global: false,
@@ -5306,6 +5325,7 @@ mod tests {
                 request_body: None,
                 request_body_required: true,
                 request_body_content_type: None,
+                request_body_variants: Vec::new(),
                 responses: vec![],
                 security: Vec::new(),
                 security_overrides_global: false,
@@ -5452,6 +5472,7 @@ mod tests {
                 request_body: None,
                 request_body_required: true,
                 request_body_content_type: None,
+                request_body_variants: Vec::new(),
                 responses: vec![bodyless_response(200)],
                 security: Vec::new(),
                 security_overrides_global: false,
@@ -5507,6 +5528,7 @@ mod tests {
                 request_body: None,
                 request_body_required: true,
                 request_body_content_type: None,
+                request_body_variants: Vec::new(),
                 responses: vec![],
                 security: Vec::new(),
                 security_overrides_global: false,
@@ -5590,6 +5612,7 @@ mod tests {
                     request_body: None,
                     request_body_required: true,
                     request_body_content_type: None,
+                    request_body_variants: Vec::new(),
                     responses: vec![Response {
                         status: 200,
                         body: Some(SchemaRef {
@@ -5598,6 +5621,7 @@ mod tests {
                         body_kind: "json".to_string(),
                         content_type: None,
                         content_types: vec!["application/json".to_string()],
+                        headers: Vec::new(),
                     }],
                     security: Vec::new(),
                     security_overrides_global: false,
@@ -5616,12 +5640,14 @@ mod tests {
                     request_body: None,
                     request_body_required: true,
                     request_body_content_type: None,
+                    request_body_variants: Vec::new(),
                     responses: vec![Response {
                         status: 400,
                         body: None,
                         body_kind: "empty".to_string(),
                         content_type: None,
                         content_types: Vec::new(),
+                        headers: Vec::new(),
                     }],
                     security: Vec::new(),
                     security_overrides_global: false,
@@ -5738,6 +5764,7 @@ mod tests {
                 request_body: None,
                 request_body_required: true,
                 request_body_content_type: None,
+                request_body_variants: Vec::new(),
                 responses: Vec::new(),
                 security: Vec::new(),
                 security_overrides_global: false,
@@ -5823,6 +5850,7 @@ mod tests {
             body_kind: "json".to_string(),
             content_type: None,
             content_types: vec!["application/json".to_string()],
+            headers: Vec::new(),
         }];
         let mut create =
             grouped_test_operation("createBook", "POST", "/books", Some("Books"), "books.py");
@@ -5832,6 +5860,7 @@ mod tests {
             body_kind: "empty".to_string(),
             content_type: None,
             content_types: Vec::new(),
+            headers: Vec::new(),
         }];
         let mut ir = ApiGraph {
             operations: vec![create, list],
@@ -5976,6 +6005,7 @@ mod tests {
                 request_body: None,
                 request_body_required: true,
                 request_body_content_type: None,
+                request_body_variants: Vec::new(),
                 responses: vec![
                     crate::graph::Response {
                         status: 200,
@@ -5983,6 +6013,7 @@ mod tests {
                         body_kind: "empty".to_string(),
                         content_type: None,
                         content_types: Vec::new(),
+                        headers: Vec::new(),
                     },
                     crate::graph::Response {
                         status: 404,
@@ -5990,6 +6021,7 @@ mod tests {
                         body_kind: "empty".to_string(),
                         content_type: None,
                         content_types: Vec::new(),
+                        headers: Vec::new(),
                     },
                 ],
                 security: Vec::new(),
@@ -6045,6 +6077,7 @@ mod tests {
                 request_body: None,
                 request_body_required: true,
                 request_body_content_type: None,
+                request_body_variants: Vec::new(),
                 responses: vec![],
                 security: Vec::new(),
                 security_overrides_global: false,
@@ -6578,12 +6611,14 @@ mod tests {
                     request_body: Some(json_body("dto.Shared")),
                     request_body_required: true,
                     request_body_content_type: Some("application/json".to_string()),
+                    request_body_variants: Vec::new(),
                     responses: vec![Response {
                         status: 204,
                         body: None,
                         body_kind: "empty".to_string(),
                         content_type: None,
                         content_types: Vec::new(),
+                        headers: Vec::new(),
                     }],
                     security: Vec::new(),
                     security_overrides_global: false,
@@ -6602,12 +6637,14 @@ mod tests {
                     request_body: None,
                     request_body_required: true,
                     request_body_content_type: None,
+                    request_body_variants: Vec::new(),
                     responses: vec![Response {
                         status: 200,
                         body: Some(json_body("dto.Shared")),
                         body_kind: "json".to_string(),
                         content_type: Some("application/json".to_string()),
                         content_types: vec!["application/json".to_string()],
+                        headers: Vec::new(),
                     }],
                     security: Vec::new(),
                     security_overrides_global: false,

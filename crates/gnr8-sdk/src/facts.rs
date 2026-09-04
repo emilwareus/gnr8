@@ -88,6 +88,9 @@ pub struct RouteFact {
     /// The request body media type when source analysis can infer it.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub request_body_content_type: Option<String>,
+    /// Additional request media-type/schema pairs accepted by this operation.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub request_body_variants: Vec<RequestBodyVariantFact>,
     /// Responses keyed by HTTP status.
     pub responses: Vec<ResponseFact>,
     /// Source provenance for the route registration.
@@ -146,6 +149,25 @@ pub struct ResponseFact {
     /// Response media types, used by custom targets that need first-class raw/binary metadata.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub content_types: Vec<String>,
+    /// Response headers written by the handler.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub headers: Vec<ResponseHeaderFact>,
+}
+
+/// One additional request media-type/schema pair.
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct RequestBodyVariantFact {
+    pub body: TypeRef,
+    pub content_type: String,
+}
+
+/// One response header written by a source handler.
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ResponseHeaderFact {
+    pub name: String,
+    pub schema: Type,
 }
 
 fn default_response_body_kind() -> String {

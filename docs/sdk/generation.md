@@ -246,6 +246,23 @@ All built-in SDKs share graph semantics for path, query, header, cookie, body, s
 style/explode, `allowReserved`, and defaults. If a generated request differs from the service
 contract, correct the graph parameter/body/security fact rather than patching one emitter.
 
+When an operation accepts more than one request content choice, the call requires an explicit typed
+selection:
+
+- Go emits an `{Operation}Body` interface with one `{Operation}{Media}Body` value type per choice.
+- TypeScript emits a discriminated `{Operation}Body` union keyed by `contentType`.
+- Python accepts a union of `(Literal[content_type], Model)` tuples.
+
+JSON, `application/*+json`, form, multipart, text, and binary choices use the same shared encoding
+classification in every target. Multipart array fields become repeated parts; absent or null fields
+are omitted.
+
+Declared 3xx responses are successful operation outcomes. Their status and headers are visible to
+response hooks. Generated clients do not follow redirects by default, so a download location or
+session header is not silently lost. Callers opt in per request with `WithFollowRedirects(true)` in
+Go, `{ followRedirects: true }` in TypeScript, or
+`RequestOptions(follow_redirects=True)` in Python.
+
 ## Static companion files
 
 `StaticFiles` copies declared files into the artifact set:

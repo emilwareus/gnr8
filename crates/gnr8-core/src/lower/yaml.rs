@@ -231,15 +231,19 @@ fn write_request_body(out: &mut String, body: &RequestBody, depth: usize) {
     let _ = writeln!(out, "{pad}requestBody:");
     let _ = writeln!(out, "{pad}{INDENT}required: {}", body.required);
     let _ = writeln!(out, "{pad}{INDENT}content:");
-    for content_type in &body.content_types {
-        let _ = writeln!(out, "{pad}{INDENT}{INDENT}{}:", map_key(content_type));
+    for content in &body.contents {
+        let _ = writeln!(
+            out,
+            "{pad}{INDENT}{INDENT}{}:",
+            map_key(&content.content_type)
+        );
         let _ = writeln!(out, "{pad}{INDENT}{INDENT}{INDENT}schema:");
         let _ = writeln!(
             out,
             "{pad}{INDENT}{INDENT}{INDENT}{INDENT}$ref: {}",
-            ref_pointer(&body.schema_ref)
+            ref_pointer(&content.schema_ref)
         );
-        write_examples(out, &body.examples, content_type, depth + 3);
+        write_examples(out, &body.examples, &content.content_type, depth + 3);
     }
 }
 
@@ -263,6 +267,18 @@ fn write_responses(out: &mut String, responses: &[(String, ResponseObj)], depth:
             "{pad}{INDENT}{INDENT}description: {}",
             scalar(&resp.description)
         );
+        if !resp.headers.is_empty() {
+            let _ = writeln!(out, "{pad}{INDENT}{INDENT}headers:");
+            for header in &resp.headers {
+                let _ = writeln!(
+                    out,
+                    "{pad}{INDENT}{INDENT}{INDENT}{}:",
+                    map_key(&header.name)
+                );
+                let _ = writeln!(out, "{pad}{INDENT}{INDENT}{INDENT}{INDENT}schema:");
+                write_schema(out, &header.schema, depth + 5);
+            }
+        }
         if resp.binary {
             let _ = writeln!(out, "{pad}{INDENT}{INDENT}content:");
             for content_type in response_media_types(resp, "application/octet-stream") {
@@ -668,8 +684,8 @@ mod tests {
     use super::write;
     use crate::analyze::facts::LiteralValue;
     use crate::lower::model::{
-        Components, Info, OpenApiDoc, Operation, PathItem, RequestBody, ResponseObj, SchemaObject,
-        SecurityRequirement, SecurityScheme,
+        Components, Info, OpenApiDoc, Operation, PathItem, RequestBody, RequestBodyContent,
+        ResponseObj, SchemaObject, SecurityRequirement, SecurityScheme,
     };
     use std::io::Write as _;
     use std::path::Path;
@@ -689,8 +705,10 @@ mod tests {
             parameters: vec![],
             request_body: Some(RequestBody {
                 required: true,
-                content_types: vec!["application/json".to_string()],
-                schema_ref: "CreateGoalInput".to_string(),
+                contents: vec![RequestBodyContent {
+                    content_type: "application/json".to_string(),
+                    schema_ref: "CreateGoalInput".to_string(),
+                }],
                 examples: Vec::new(),
             }),
             responses: vec![(
@@ -703,6 +721,7 @@ mod tests {
                     binary: false,
                     event_stream: false,
                     examples: Vec::new(),
+                    headers: Vec::new(),
                 },
             )],
         };

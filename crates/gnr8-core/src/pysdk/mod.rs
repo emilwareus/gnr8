@@ -132,6 +132,7 @@ pub(crate) fn generate_files_with_options(
         emit::client_referenced_models(graph, &ops)?
     };
     let http_auth = http_auth_features(graph)?;
+    let has_multiple_request_bodies = emit::operations_have_multiple_request_bodies(&ops, graph)?;
     let mut client = emit::emit_client_with_models(
         package,
         &model_module,
@@ -142,8 +143,10 @@ pub(crate) fn generate_files_with_options(
         &model_refs,
         &graph.runtime,
         !split_operations && !graph.pagination.is_empty(),
-        !split_operations && emit::operations_need_parameter_literals(&ops),
-        !split_operations && emit::operations_need_parameter_unions(&ops),
+        !split_operations
+            && (has_multiple_request_bodies || emit::operations_need_parameter_literals(&ops)),
+        !split_operations
+            && (has_multiple_request_bodies || emit::operations_need_parameter_unions(&ops)),
     );
     if split_operations {
         client.push_str(&emit_operation_module_imports(layout, graph)?);

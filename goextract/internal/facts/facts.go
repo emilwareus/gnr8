@@ -58,20 +58,21 @@ type GoFacts struct {
 // nothing structural. Every field above them stays code-inferred and a doc comment can
 // neither set nor override any of them.
 type RouteFact struct {
-	Method                 string         `json:"method"`
-	Path                   string         `json:"path"`
-	Handler                string         `json:"handler"`
-	OperationID            string         `json:"operation_id"`
-	Summary                string         `json:"summary,omitempty"`
-	Description            string         `json:"description,omitempty"`
-	Group                  string         `json:"group,omitempty"`
-	Middleware             []string       `json:"middleware,omitempty"`
-	Params                 []ParamFact    `json:"params"`
-	RequestBody            *TypeRef       `json:"request_body"`
-	RequestBodyRequired    bool           `json:"request_body_required"`
-	RequestBodyContentType string         `json:"request_body_content_type,omitempty"`
-	Responses              []ResponseFact `json:"responses"`
-	Span                   SourceSpan     `json:"span"`
+	Method                 string                   `json:"method"`
+	Path                   string                   `json:"path"`
+	Handler                string                   `json:"handler"`
+	OperationID            string                   `json:"operation_id"`
+	Summary                string                   `json:"summary,omitempty"`
+	Description            string                   `json:"description,omitempty"`
+	Group                  string                   `json:"group,omitempty"`
+	Middleware             []string                 `json:"middleware,omitempty"`
+	Params                 []ParamFact              `json:"params"`
+	RequestBody            *TypeRef                 `json:"request_body"`
+	RequestBodyRequired    bool                     `json:"request_body_required"`
+	RequestBodyContentType string                   `json:"request_body_content_type,omitempty"`
+	RequestBodyVariants    []RequestBodyVariantFact `json:"request_body_variants,omitempty"`
+	Responses              []ResponseFact           `json:"responses"`
+	Span                   SourceSpan               `json:"span"`
 }
 
 // ParamFact describes a path or query parameter, derived purely from code. Path
@@ -91,11 +92,26 @@ type ParamFact struct {
 
 // ResponseFact describes one response keyed by HTTP status.
 type ResponseFact struct {
-	Status       uint16   `json:"status"`
-	Body         *TypeRef `json:"body"`
-	BodyKind     string   `json:"body_kind,omitempty"`
-	ContentType  string   `json:"content_type,omitempty"`
-	ContentTypes []string `json:"content_types,omitempty"`
+	Status       uint16               `json:"status"`
+	Body         *TypeRef             `json:"body"`
+	BodyKind     string               `json:"body_kind,omitempty"`
+	ContentType  string               `json:"content_type,omitempty"`
+	ContentTypes []string             `json:"content_types,omitempty"`
+	Headers      []ResponseHeaderFact `json:"headers,omitempty"`
+}
+
+// RequestBodyVariantFact is one additional media-type/schema pair accepted by
+// an operation. The long-standing RouteFact request-body fields remain the
+// primary entry so existing generator crates keep their source-facing view.
+type RequestBodyVariantFact struct {
+	Body        TypeRef `json:"body"`
+	ContentType string  `json:"content_type"`
+}
+
+// ResponseHeaderFact is one response header declared by source behavior.
+type ResponseHeaderFact struct {
+	Name   string `json:"name"`
+	Schema Type   `json:"schema"`
 }
 
 // SchemaFact is one extracted named type. Its body is carried by the neutral Type
@@ -416,7 +432,18 @@ func sortRoute(r *RouteFact) {
 	for i := range r.Params {
 		sortType(&r.Params[i].Schema)
 	}
+	sort.Slice(r.RequestBodyVariants, func(a, b int) bool {
+		return r.RequestBodyVariants[a].ContentType < r.RequestBodyVariants[b].ContentType
+	})
 	sort.Slice(r.Responses, func(a, b int) bool {
 		return r.Responses[a].Status < r.Responses[b].Status
 	})
+	for i := range r.Responses {
+		sort.Slice(r.Responses[i].Headers, func(a, b int) bool {
+			return r.Responses[i].Headers[a].Name < r.Responses[i].Headers[b].Name
+		})
+		for j := range r.Responses[i].Headers {
+			sortType(&r.Responses[i].Headers[j].Schema)
+		}
+	}
 }

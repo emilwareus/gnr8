@@ -9,6 +9,30 @@ must move the minor version.
 
 ## Unreleased
 
+### Breaking
+
+- **Operations with more than one request representation now require an explicit typed body selection in generated SDKs.** Go uses `{Operation}Body` wrappers, TypeScript uses a `contentType` union, and Python uses `(Literal[content_type], Model)` tuples.
+- **Generated clients no longer follow redirects by default.** Callers opt in per request with `WithFollowRedirects(true)` in Go, `{ followRedirects: true }` in TypeScript, or `RequestOptions(follow_redirects=True)` in Python.
+- **The public graph gained request-body variant and response-header fields.** Rust code using exhaustive graph patterns or struct literals must account for them; existing serialized graphs remain readable because both collections default to empty.
+- **The host-worker protocol is now version 6.** A stale worker is rejected instead of reading the expanded graph incorrectly; a normal generation run rebuilds it, while `--no-build` requires it to have been rebuilt already.
+
+### Fixed
+
+- **Go/Gin extraction preserves JSON and multipart request representations on the same operation instead of reporting conflicting body evidence.**
+- **Literal multipart file-map access such as `form.File["files"]` becomes an optional repeated binary field; computed keys remain diagnosed because they do not define a bounded request shape.**
+- **Optional numeric query helpers may return zero without making their parameter required, while helpers that reject absence remain required.**
+- **Header and cookie reads are optional observations unless the handler rejects an absent value with a 4xx response.**
+- **Constant Gin and `net/http` redirects, including statuses passed through bounded helpers, now reach the graph and OpenAPI document.**
+- **Supported response header writes now preserve `Location`, `Content-Disposition`, `Content-Length`, `Content-Type`, and static custom headers through OpenAPI and SDK response hooks.**
+- **Reading `Authorization` now emits an actionable security diagnostic until native security configuration covers the operation instead of silently losing the requirement or emitting a normal header parameter.**
+- **OpenAPI request bodies now retain a separate schema for every media type, including documents imported through the `OpenApi` source.**
+- **Go, TypeScript, and Python SDKs encode JSON, JSON-suffix, form, multipart, text, and binary request choices through one shared media classification.**
+- **Multipart SDK encoding omits absent values and emits zero, one, or many binary values as zero, one, or many repeated parts.**
+- **Declared 3xx responses are accepted operation outcomes and expose their status and headers to response hooks instead of being reported as API errors.**
+- **SDK planning now carries all request choices and response headers and classifies declared redirects consistently across targets.**
+- **Graph projection and direction analysis now traverse every request-body alternative and response-header schema.**
+- **Parallel TypeScript regression tests use collision-free temporary directories, and TypeScript toolchain restoration no longer waits on an unrelated npm audit request.**
+
 ## 0.10.2 — 2026-09-02
 
 ### Changed

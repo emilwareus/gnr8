@@ -17,7 +17,7 @@
 
 use crate::facts::{
     DiagnosticCategoryFact, DiagnosticFact, FieldFact, GoFacts, LiteralValue, ParamFact,
-    ResponseFact, RouteFact, SchemaFact, TypeRef,
+    RequestBodyVariantFact, ResponseFact, ResponseHeaderFact, RouteFact, SchemaFact, TypeRef,
 };
 
 // Re-export the neutral type vocabulary so the IR and the facts DTO share ONE definition (the IR
@@ -528,6 +528,9 @@ pub struct Operation {
     /// The request body media type when source analysis can infer it.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub request_body_content_type: Option<String>,
+    /// Additional media-type/schema pairs accepted by the operation.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub request_body_variants: Vec<RequestBodyVariant>,
     /// Responses, sorted by status.
     pub responses: Vec<Response>,
     /// Operation-level security scheme ids.
@@ -602,6 +605,23 @@ pub struct Response {
     /// Response media types, stable target-facing metadata for raw/binary responses.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub content_types: Vec<String>,
+    /// Response headers written for this status.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub headers: Vec<ResponseHeader>,
+}
+
+/// One additional media-type/schema pair accepted by an operation.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct RequestBodyVariant {
+    pub body: SchemaRef,
+    pub content_type: String,
+}
+
+/// One response header declared for a response status.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct ResponseHeader {
+    pub name: String,
+    pub schema: Type,
 }
 
 impl Response {
@@ -930,6 +950,16 @@ impl Operation {
         let mut middleware = route.middleware;
         middleware.sort();
         middleware.dedup();
+        let mut request_body_variants = route
+            .request_body_variants
+            .into_iter()
+            .map(RequestBodyVariant::from_fact)
+            .collect::<Vec<_>>();
+        request_body_variants.sort_by(|left, right| {
+            left.content_type
+                .cmp(&right.content_type)
+                .then_with(|| left.body.ref_id.cmp(&right.body.ref_id))
+        });
 
         Self {
             id,
@@ -944,6 +974,7 @@ impl Operation {
             request_body: route.request_body.map(SchemaRef::from_fact),
             request_body_required: route.request_body_required,
             request_body_content_type: route.request_body_content_type,
+            request_body_variants,
             responses,
             security: Vec::new(),
             security_overrides_global: false,
@@ -977,12 +1008,37 @@ impl Response {
             normalize_content_types(response.content_type.as_deref(), response.content_types);
         let body_kind =
             normalize_response_body_kind(&response.body_kind, body.is_some(), &content_types);
+        let mut headers = response
+            .headers
+            .into_iter()
+            .map(ResponseHeader::from_fact)
+            .collect::<Vec<_>>();
+        headers.sort_by(|left, right| left.name.cmp(&right.name));
         Self {
             status: response.status,
             body,
             body_kind,
             content_type: response.content_type,
             content_types,
+            headers,
+        }
+    }
+}
+
+impl RequestBodyVariant {
+    fn from_fact(variant: RequestBodyVariantFact) -> Self {
+        Self {
+            body: SchemaRef::from_fact(variant.body),
+            content_type: variant.content_type,
+        }
+    }
+}
+
+impl ResponseHeader {
+    fn from_fact(header: ResponseHeaderFact) -> Self {
+        Self {
+            name: header.name,
+            schema: normalize_type(header.schema),
         }
     }
 }
@@ -1157,7 +1213,10 @@ mod tests {
     // to the test module so the workspace-wide RUST-04 deny stays intact for production code.
     #![allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
 
-    use super::{is_module_relative, ApiGraph, RuntimePolicy, Type};
+    use super::{
+        is_module_relative, ApiGraph, RequestBodyVariant, ResponseHeader, RuntimePolicy, SchemaRef,
+        Type,
+    };
     use crate::facts::GoFacts;
 
     /// Which locations name a file INSIDE the analyzed module, and are therefore portable.
@@ -1538,5 +1597,56 @@ mod tests {
         let ja = serde_json::to_string(&a).unwrap();
         let jb = serde_json::to_string(&b).unwrap();
         assert_eq!(ja, jb, "two from_facts runs must serialize identically");
+    }
+
+    #[test]
+    fn graphs_without_multiple_body_or_response_header_fields_still_deserialize() {
+        let graph = ApiGraph::from_facts(sample_facts(), "/root");
+        let mut value = serde_json::to_value(graph).unwrap();
+        for operation in value["operations"].as_array_mut().unwrap() {
+            operation
+                .as_object_mut()
+                .unwrap()
+                .remove("request_body_variants");
+            for response in operation["responses"].as_array_mut().unwrap() {
+                response.as_object_mut().unwrap().remove("headers");
+            }
+        }
+
+        let restored: ApiGraph = serde_json::from_value(value).unwrap();
+        assert!(restored
+            .operations
+            .iter()
+            .all(|operation| operation.request_body_variants.is_empty()));
+        assert!(restored
+            .operations
+            .iter()
+            .flat_map(|operation| &operation.responses)
+            .all(|response| response.headers.is_empty()));
+    }
+
+    #[test]
+    fn multiple_request_bodies_and_response_headers_round_trip() {
+        let mut graph = ApiGraph::from_facts(sample_facts(), "/root");
+        let operation = graph
+            .operations
+            .iter_mut()
+            .find(|operation| operation.request_body.is_some())
+            .unwrap();
+        let request_ref = operation.request_body.as_ref().unwrap().ref_id.clone();
+        operation.request_body_variants.push(RequestBodyVariant {
+            body: SchemaRef {
+                ref_id: request_ref,
+            },
+            content_type: "multipart/form-data".to_string(),
+        });
+        operation.responses[0].headers.push(ResponseHeader {
+            name: "X-Request-ID".to_string(),
+            schema: Type::Primitive(crate::facts::Prim::String),
+        });
+
+        let encoded = serde_json::to_vec(&graph).unwrap();
+        let restored: ApiGraph = serde_json::from_slice(&encoded).unwrap();
+        assert_eq!(restored, graph);
     }
 }

@@ -47,6 +47,8 @@ type MessageResponse struct {
 type SearchResponse struct {
 	Q      string `json:"q"`
 	Limit  int    `json:"limit"`
+	Offset uint   `json:"offset"`
+	Page   uint   `json:"page"`
 	Days   int    `json:"days"`
 	Sort   string `json:"sort"`
 	Cursor string `json:"cursor"`
@@ -96,6 +98,10 @@ func RegisterRoutes(r *gin.Engine, h *Handler) {
 	files.GET("/:fileId/open", h.openFile)
 	files.GET("/:fileId/stream", h.streamFile)
 	files.GET("/:fileId/read", h.readFile)
+	files.GET("/:fileId/redirect", h.redirectFile)
+	files.GET("/:fileId/helper-redirect", h.helperRedirectFile)
+	files.POST("/upload", h.uploadFile)
+	files.POST("/dynamic-upload", h.dynamicUpload)
 
 	items := v1.Group("/items")
 	items.GET("/:itemId/children/:childId", h.getChild)
@@ -108,6 +114,7 @@ func RegisterRoutes(r *gin.Engine, h *Handler) {
 	items.PATCH("/:itemId/unrelated-length-read", h.unrelatedLengthRead)
 	items.GET("/saved-views", h.listSavedViews)
 	items.GET("/search", h.searchItems)
+	items.GET("/request-observations", h.requestObservations)
 	items.GET("/attendance", h.attendance)
 	items.GET("/events", h.itemEvents)
 	items.GET("/raw-stream", h.rawStream)
@@ -176,7 +183,44 @@ func (h *Handler) streamFile(c *gin.Context) {
 }
 
 func (h *Handler) readFile(c *gin.Context) {
-	c.DataFromReader(http.StatusOK, 12, attachmentContentType(), strings.NewReader("hello"), nil)
+	c.DataFromReader(http.StatusOK, 12, attachmentContentType(), strings.NewReader("hello"), map[string]string{
+		"Content-Disposition": `attachment; filename="report.pdf"`,
+		"X-Session-ID":        "session-123",
+	})
+}
+
+func (h *Handler) redirectFile(c *gin.Context) {
+	c.Header("X-Session-ID", "session-123")
+	c.Redirect(http.StatusTemporaryRedirect, "/v1/files/final")
+}
+
+func (h *Handler) helperRedirectFile(c *gin.Context) {
+	redirectResponse(c, "/v1/files/final", http.StatusFound)
+}
+
+func redirectResponse(c *gin.Context, location string, status int) {
+	http.Redirect(c.Writer, c.Request, location, status)
+}
+
+func (h *Handler) uploadFile(c *gin.Context) {
+	var body UpdateItemRequest
+	if c.GetHeader("Content-Type") == "application/json" {
+		_ = c.ShouldBindJSON(&body)
+	} else {
+		raw := c.PostForm("request")
+		_ = json.Unmarshal([]byte(raw), &body)
+		form, _ := c.MultipartForm()
+		files := form.File["files"]
+		_ = files
+	}
+	c.Status(http.StatusNoContent)
+}
+
+func (h *Handler) dynamicUpload(c *gin.Context) {
+	form, _ := c.MultipartForm()
+	field := c.Query("field")
+	_ = form.File[field]
+	c.Status(http.StatusNoContent)
 }
 
 func (h *Handler) itemEvents(c *gin.Context) {
@@ -228,9 +272,31 @@ func (h *Handler) searchItems(c *gin.Context) {
 	sort := parseSort(strings.TrimSpace(c.Query("sort")), defaultSort)
 	cursor := parseSort(c.DefaultQuery("cursor", defaultCursor), "fallback")
 	token, _ := c.GetQuery("token")
+	offset, _ := parseOptionalUint(c, "offset")
+	page, err := parseRequiredUint(c, "page")
+	if err != nil {
+		c.JSON(http.StatusBadRequest, MessageResponse{Message: err.Error()})
+		return
+	}
 	_ = wrappedLimit
 	_ = trimmedLimit
-	c.JSON(http.StatusOK, SearchResponse{Q: q, Limit: limit, Sort: sort, Cursor: cursor, Token: token})
+	c.JSON(http.StatusOK, SearchResponse{Q: q, Limit: limit, Offset: offset, Page: page, Sort: sort, Cursor: cursor, Token: token})
+}
+
+func (h *Handler) requestObservations(c *gin.Context) {
+	_ = c.GetHeader("X-Observed")
+	if c.GetHeader("X-Required") == "" {
+		c.AbortWithStatus(http.StatusBadRequest)
+		return
+	}
+	_, _ = c.Cookie("observed-cookie")
+	_, err := c.Cookie("required-cookie")
+	if err != nil {
+		c.AbortWithStatus(http.StatusUnauthorized)
+		return
+	}
+	_ = c.GetHeader("Authorization")
+	c.Status(http.StatusNoContent)
 }
 
 func (h *Handler) attendance(c *gin.Context) {
@@ -343,6 +409,22 @@ func parseAttendanceDays(raw string, fallback, _ int) (int, error) {
 		return fallback, nil
 	}
 	return fallback + 1, nil
+}
+
+func parseOptionalUint(c *gin.Context, name string) (uint, error) {
+	raw := c.Query(name)
+	if raw == "" {
+		return 0, nil
+	}
+	return 1, nil
+}
+
+func parseRequiredUint(c *gin.Context, name string) (uint, error) {
+	raw := c.Query(name)
+	if raw == "" {
+		return 0, fmt.Errorf("missing %s", name)
+	}
+	return 1, nil
 }
 
 func parseSort(raw string, fallback string) string {

@@ -14,7 +14,8 @@ use crate::analyze::facts::{
 };
 use crate::graph::{
     ApiGraph, Diagnostic, DiagnosticCategory, MediaExample, Operation, OperationDocsPolicy, Param,
-    Response, ResponseDocsPolicy, Schema, SchemaRef, SecurityScheme, SourceSpan,
+    RequestBodyVariant, Response, ResponseDocsPolicy, ResponseHeader, Schema, SchemaRef,
+    SecurityScheme, SourceSpan,
 };
 use crate::CoreError;
 
@@ -29,6 +30,14 @@ pub(crate) enum SpecVersion {
 struct ImportedType {
     ty: Type,
     nullable: bool,
+}
+
+struct ImportedRequestBody {
+    schema_ref: SchemaRef,
+    media_type: String,
+    media_types: Vec<String>,
+    variants: Vec<RequestBodyVariant>,
+    required: bool,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -723,6 +732,7 @@ impl Importer {
                 let mut request_body_required = false;
                 let mut request_body_content_type = None;
                 let mut request_body_content_types = Vec::new();
+                let mut request_body_variants = Vec::new();
 
                 let all_parameters = self.merge_parameters(
                     &path_parameters,
@@ -813,11 +823,12 @@ impl Importer {
                         }
                         SpecVersion::OpenApi30 | SpecVersion::OpenApi31 => self
                             .request_body_schema_ref(operation, &operation_id)
-                            .map(|(schema_ref, media_type, media_types, required)| {
-                                request_body_required = required;
-                                request_body_content_types = media_types;
-                                request_body_content_type = Some(media_type);
-                                schema_ref
+                            .map(|body| {
+                                request_body_required = body.required;
+                                request_body_content_types = body.media_types;
+                                request_body_content_type = Some(body.media_type);
+                                request_body_variants = body.variants;
+                                body.schema_ref
                             }),
                     };
                 }
@@ -887,6 +898,7 @@ impl Importer {
                     request_body,
                     request_body_required,
                     request_body_content_type,
+                    request_body_variants,
                     responses,
                     security,
                     security_overrides_global,
@@ -1196,7 +1208,7 @@ impl Importer {
         &mut self,
         operation: &Value,
         operation_id: &str,
-    ) -> Option<(SchemaRef, String, Vec<String>, bool)> {
+    ) -> Option<ImportedRequestBody> {
         let mut request_body = operation.get("requestBody")?.clone();
         if let Some(ref_value) = request_body.get("$ref").and_then(Value::as_str) {
             let Some(resolved) = self.resolve_ref_value(ref_value) else {
@@ -1225,11 +1237,6 @@ impl Importer {
             );
             return None;
         };
-        if !is_supported_request_media(media_type) {
-            self.warn(format!(
-                "requestBody media type '{media_type}' on operation '{operation_id}' is imported as a schema only"
-            ));
-        }
         let Some(schema) = media.get("schema") else {
             self.warn_request_body(
                 operation_id,
@@ -1238,28 +1245,32 @@ impl Importer {
             );
             return None;
         };
-        let content_types =
-            self.request_content_types_for_schema(content, media_type, schema, operation_id);
-        Some((
-            self.schema_ref_for(schema, &format!("{operation_id}Request")),
-            media_type.to_string(),
-            content_types,
-            request_body
+        let (content_types, variants) =
+            self.request_content_for_schemas(content, media_type, schema, operation_id);
+        Some(ImportedRequestBody {
+            schema_ref: self.schema_ref_for(schema, &format!("{operation_id}Request")),
+            media_type: media_type.to_string(),
+            media_types: content_types,
+            variants,
+            required: request_body
                 .get("required")
                 .and_then(Value::as_bool)
                 .unwrap_or(false),
-        ))
+        })
     }
 
-    fn request_content_types_for_schema(
+    fn request_content_for_schemas(
         &mut self,
         content: &serde_json::Map<String, Value>,
         selected_media_type: &str,
         selected_schema: &Value,
         operation_id: &str,
-    ) -> Vec<String> {
+    ) -> (Vec<String>, Vec<RequestBodyVariant>) {
         let mut content_types = vec![selected_media_type.to_string()];
-        for (media_type, media) in content {
+        let mut variants = Vec::new();
+        let mut remaining = content.iter().collect::<Vec<_>>();
+        remaining.sort_by(|left, right| left.0.cmp(right.0));
+        for (media_type, media) in remaining {
             if media_type == selected_media_type {
                 continue;
             }
@@ -1270,14 +1281,15 @@ impl Importer {
             if schema == selected_schema {
                 content_types.push(media_type.clone());
             } else {
-                self.warn_request_body(
-                    operation_id,
-                    media_type,
-                    "the media type has a different request schema",
-                );
+                variants.push(RequestBodyVariant {
+                    body: self.schema_ref_for(schema, &format!("{operation_id}RequestVariant")),
+                    content_type: media_type.clone(),
+                });
             }
         }
-        content_types
+        content_types.sort();
+        variants.sort_by(|left, right| left.content_type.cmp(&right.content_type));
+        (content_types, variants)
     }
 
     fn import_request_examples(&mut self, operation: &Value) -> Vec<MediaExample> {
@@ -1423,6 +1435,7 @@ impl Importer {
         operation_id: &str,
         status: u16,
     ) -> Response {
+        let headers = self.import_response_headers(response, operation_id, status);
         if matches!(
             self.version,
             SpecVersion::OpenApi30 | SpecVersion::OpenApi31
@@ -1440,6 +1453,7 @@ impl Importer {
                     body_kind: "sse".to_string(),
                     content_type: Some("text/event-stream".to_string()),
                     content_types: vec!["text/event-stream".to_string()],
+                    headers,
                 };
             }
         }
@@ -1464,6 +1478,7 @@ impl Importer {
                 body_kind: "empty".to_string(),
                 content_type: None,
                 content_types: Vec::new(),
+                headers,
             };
         };
         self.import_schema_response(
@@ -1473,9 +1488,49 @@ impl Importer {
             status,
             media_type,
             schema,
+            headers,
         )
     }
 
+    fn import_response_headers(
+        &mut self,
+        response: &Value,
+        operation_id: &str,
+        status: u16,
+    ) -> Vec<ResponseHeader> {
+        let Some(raw_headers) = response.get("headers").and_then(Value::as_object) else {
+            return Vec::new();
+        };
+        let mut headers = Vec::new();
+        for (name, raw_header) in raw_headers {
+            let header = raw_header
+                .get("$ref")
+                .and_then(Value::as_str)
+                .and_then(|reference| self.resolve_ref_value(reference))
+                .unwrap_or_else(|| raw_header.clone());
+            let schema = if self.version == SpecVersion::Swagger2 {
+                &header
+            } else if let Some(schema) = header.get("schema") {
+                schema
+            } else {
+                self.warn(format!(
+                    "response header '{name}' on operation '{operation_id}' status {status} has no schema"
+                ));
+                continue;
+            };
+            headers.push(ResponseHeader {
+                name: name.clone(),
+                schema: self.type_from_schema(schema).ty,
+            });
+        }
+        headers.sort_by(|left, right| left.name.cmp(&right.name));
+        headers
+    }
+
+    #[expect(
+        clippy::too_many_arguments,
+        reason = "response import keeps the selected operation, response, status, media, schema, and headers together"
+    )]
     fn import_schema_response(
         &mut self,
         operation: &Value,
@@ -1484,6 +1539,7 @@ impl Importer {
         status: u16,
         media_type: String,
         schema: &Value,
+        headers: Vec<ResponseHeader>,
     ) -> Response {
         if self.response_schema_is_binary(schema) {
             let swagger_declared = if self.version == SpecVersion::Swagger2 {
@@ -1521,6 +1577,7 @@ impl Importer {
                 body_kind: "binary".to_string(),
                 content_type: Some(content_type),
                 content_types,
+                headers,
             };
         }
         let content_types = if self.version == SpecVersion::Swagger2 {
@@ -1541,6 +1598,7 @@ impl Importer {
             body_kind: "json".to_string(),
             content_type: (media_type != "application/json").then_some(media_type),
             content_types,
+            headers,
         }
     }
 
@@ -2483,13 +2541,6 @@ fn preferred_request_media_type(content_types: &[String]) -> Option<&str> {
         }
     }
     content_types.first().map(String::as_str)
-}
-
-fn is_supported_request_media(media_type: &str) -> bool {
-    matches!(
-        media_type,
-        "application/json" | "multipart/form-data" | "application/x-www-form-urlencoded"
-    )
 }
 
 fn type_contains_bytes(ty: &Type) -> bool {
@@ -3488,10 +3539,11 @@ paths:
                 "application/vnd.acme.report+json".to_string()
             ]
         );
-        assert!(graph.diagnostics.iter().any(|diagnostic| {
-            diagnostic.code == "request.body.unresolved"
-                && diagnostic.subject.as_deref() == Some("text/plain")
-        }));
+        assert_eq!(graph.operations[0].request_body_variants.len(), 1);
+        assert_eq!(
+            graph.operations[0].request_body_variants[0].content_type,
+            "text/plain"
+        );
 
         let yaml = to_openapi(&graph, "Report API", "/", &graph.security).unwrap();
         let emitted = parse_json_or_yaml(&yaml, std::path::Path::new("generated.yaml")).unwrap();
@@ -3504,7 +3556,48 @@ paths:
         );
         assert!(operation
             .pointer("/requestBody/content/text~1plain")
-            .is_none());
+            .is_some());
+
+        let sdk = crate::tssdk::generate(&graph, "report-sdk", "/").unwrap();
+        assert!(sdk.contains("export type CreateReportBody ="), "{sdk}");
+        for content_type in [
+            "application/json",
+            "application/vnd.acme.report+json",
+            "text/plain",
+        ] {
+            assert!(
+                sdk.contains(&format!("contentType: \"{content_type}\"")),
+                "{sdk}"
+            );
+        }
+
+        let go_sdk = crate::gosdk::generate(&graph, "report", "/").unwrap();
+        for choice in [
+            "CreateReportApplicationJSONBody",
+            "CreateReportApplicationVndAcmeReportJSONBody",
+            "CreateReportTextBody",
+        ] {
+            assert!(
+                go_sdk.contains(&format!("type {choice} struct")),
+                "{go_sdk}"
+            );
+        }
+
+        let py_sdk = crate::pysdk::generate(&graph, "report_sdk", "/").unwrap();
+        assert!(
+            py_sdk.contains("from typing import Any, Literal, Optional, Union"),
+            "{py_sdk}"
+        );
+        for content_type in [
+            "application/json",
+            "application/vnd.acme.report+json",
+            "text/plain",
+        ] {
+            assert!(
+                py_sdk.contains(&format!("Literal[\"{content_type}\"]")),
+                "{py_sdk}"
+            );
+        }
     }
 
     #[test]

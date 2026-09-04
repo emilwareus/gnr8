@@ -85,7 +85,7 @@ jobs:
 
       - name: Restore TypeScript sidecar dependency
         if: matrix.setup_node == 'true'
-        run: npm ci --silent
+        run: npm ci --silent --no-audit
         working-directory: tsextract
 
       - name: Check committed generated artifacts
