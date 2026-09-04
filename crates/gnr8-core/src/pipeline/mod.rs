@@ -268,7 +268,38 @@ pub fn build_ir(
             StageSpan::Custom(indices) => ir = runner.apply_transforms(&indices, ir)?,
         }
     }
+    resolve_security_diagnostics(&mut ir);
     Ok(ir)
+}
+
+fn resolve_security_diagnostics(ir: &mut ApiGraph) {
+    const CODE: &str = "security.requirement.missing";
+    let resolved_operations = ir
+        .operations
+        .iter()
+        .filter(|operation| {
+            ir.security.iter().any(|scheme| {
+                scheme_carries_authorization(scheme)
+                    && ((!operation.security_overrides_global && scheme.global)
+                        || operation.security.iter().any(|id| id == &scheme.id))
+            })
+        })
+        .map(|operation| format!("{} {}", operation.method, operation.path))
+        .collect::<std::collections::BTreeSet<_>>();
+    ir.diagnostics.retain(|diagnostic| {
+        diagnostic.code != CODE
+            || diagnostic
+                .operation
+                .as_ref()
+                .is_none_or(|operation| !resolved_operations.contains(operation))
+    });
+}
+
+fn scheme_carries_authorization(scheme: &crate::graph::SecurityScheme) -> bool {
+    (scheme.kind == "http" && matches!(scheme.name.as_str(), "bearer" | "basic"))
+        || (scheme.kind == "apiKey"
+            && scheme.location == "header"
+            && scheme.name.eq_ignore_ascii_case("Authorization"))
 }
 
 /// Run the whole plan: source → transforms → freeze → each target → each post-processor.
@@ -606,8 +637,8 @@ pub fn build_ir_in_process(
 mod tests {
     #![allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
 
-    use super::{build_ir, run, NoCustomStages, StageRunner};
-    use crate::graph::ApiGraph;
+    use super::{build_ir, resolve_security_diagnostics, run, NoCustomStages, StageRunner};
+    use crate::graph::{ApiGraph, SecurityScheme};
     use crate::sdk::{builtins as decl, Artifact, Custom, Cx, Pipeline, Target, Transform};
     use crate::CoreError;
     use gnr8::sdk::{Artifacts, StagePlan};
@@ -709,6 +740,77 @@ mod tests {
         fn output_anchors(&self) -> Vec<String> {
             vec!["generated/custom-0.md".to_string()]
         }
+    }
+
+    fn graph_with_authorization_diagnostic() -> ApiGraph {
+        serde_json::from_str(
+            r#"{
+              "module": "security.test",
+              "operations": [{
+                "id": "observedAuth",
+                "method": "GET",
+                "path": "/observed-auth",
+                "handler": "observedAuth",
+                "params": [],
+                "request_body": null,
+                "responses": [{"status": 204, "body": null}],
+                "provenance": {"file": "app.go", "start_line": 1, "end_line": 1}
+              }],
+              "schemas": [],
+              "diagnostics": [{
+                "code": "security.requirement.missing",
+                "severity": "WARN",
+                "category": "security",
+                "message": "configure security",
+                "file": "app.go",
+                "line": 1,
+                "span": {"file": "app.go", "start_line": 1, "end_line": 1},
+                "operation": "GET /observed-auth",
+                "subject": "Authorization"
+              }],
+              "base_path": "",
+              "title": "Security API",
+              "security": []
+            }"#,
+        )
+        .expect("security diagnostic graph")
+    }
+
+    #[test]
+    fn authorization_diagnostic_is_resolved_only_by_matching_security_configuration() {
+        let mut unresolved = graph_with_authorization_diagnostic();
+        unresolved.security.push(SecurityScheme {
+            id: "QueryKey".to_string(),
+            kind: "apiKey".to_string(),
+            location: "query".to_string(),
+            name: "token".to_string(),
+            global: true,
+        });
+        resolve_security_diagnostics(&mut unresolved);
+        assert_eq!(unresolved.diagnostics.len(), 1);
+
+        let mut resolved = graph_with_authorization_diagnostic();
+        resolved.security.push(SecurityScheme {
+            id: "UserBearer".to_string(),
+            kind: "http".to_string(),
+            location: String::new(),
+            name: "bearer".to_string(),
+            global: true,
+        });
+        resolve_security_diagnostics(&mut resolved);
+        assert!(resolved.diagnostics.is_empty());
+
+        let mut operation_scoped = graph_with_authorization_diagnostic();
+        operation_scoped.operations[0].security = vec!["ActorHeader".to_string()];
+        operation_scoped.security.push(SecurityScheme {
+            id: "ActorHeader".to_string(),
+            kind: "apiKey".to_string(),
+            location: "header".to_string(),
+            name: "authorization".to_string(),
+            global: false,
+        });
+        resolve_security_diagnostics(&mut operation_scoped);
+        assert!(operation_scoped.diagnostics.is_empty());
     }
 
     fn cx() -> Cx {

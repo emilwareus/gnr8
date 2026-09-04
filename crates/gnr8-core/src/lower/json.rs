@@ -228,11 +228,11 @@ fn write_parameter(param: &Parameter) -> Value {
 
 fn write_request_body(body: &RequestBody) -> Value {
     let mut content = Map::new();
-    for content_type in &body.content_types {
+    for body_content in &body.contents {
         let mut media = Map::new();
-        media.insert("schema".to_string(), ref_schema(&body.schema_ref));
-        write_examples_into(&mut media, &body.examples, content_type);
-        content.insert(content_type.clone(), Value::Object(media));
+        media.insert("schema".to_string(), ref_schema(&body_content.schema_ref));
+        write_examples_into(&mut media, &body.examples, &body_content.content_type);
+        content.insert(body_content.content_type.clone(), Value::Object(media));
     }
 
     let mut out = Map::new();
@@ -265,6 +265,15 @@ fn write_response(response: &ResponseObj) -> Value {
         "description".to_string(),
         Value::String(response.description.clone()),
     );
+    if !response.headers.is_empty() {
+        let mut headers = Map::new();
+        for header in &response.headers {
+            let mut value = Map::new();
+            value.insert("schema".to_string(), write_schema(&header.schema));
+            headers.insert(header.name.clone(), Value::Object(value));
+        }
+        out.insert("headers".to_string(), Value::Object(headers));
+    }
     if response.binary {
         let mut schema = Map::new();
         schema.insert("type".to_string(), Value::String("string".to_string()));
@@ -526,8 +535,8 @@ mod tests {
 
     use super::write;
     use crate::lower::model::{
-        Components, Info, OpenApiDoc, Operation, PathItem, RequestBody, ResponseObj, SchemaObject,
-        SecurityRequirement, SecurityScheme,
+        Components, Info, OpenApiDoc, Operation, PathItem, RequestBody, RequestBodyContent,
+        ResponseObj, SchemaObject, SecurityRequirement, SecurityScheme,
     };
 
     fn sample_doc() -> OpenApiDoc {
@@ -561,8 +570,10 @@ mod tests {
                         parameters: vec![],
                         request_body: Some(RequestBody {
                             required: true,
-                            content_types: vec!["application/json".to_string()],
-                            schema_ref: "CreateGoalInput".to_string(),
+                            contents: vec![RequestBodyContent {
+                                content_type: "application/json".to_string(),
+                                schema_ref: "CreateGoalInput".to_string(),
+                            }],
                             examples: Vec::new(),
                         }),
                         responses: vec![(
@@ -575,6 +586,7 @@ mod tests {
                                 binary: false,
                                 event_stream: false,
                                 examples: Vec::new(),
+                                headers: Vec::new(),
                             },
                         )],
                     }),

@@ -60,15 +60,21 @@ func TestGinContractRegressionFacts(t *testing.T) {
 	if err := json.NewDecoder(tmp).Decode(&doc); err != nil {
 		t.Fatalf("decode facts: %v", err)
 	}
-	if len(doc.Diagnostics) != 1 {
-		t.Fatalf("gin contract fixture should emit one raw-stream diagnostic, got %+v", doc.Diagnostics)
+	wantDiagnostics := map[string]string{
+		"response.missing":             "GET /v1/items/raw-stream",
+		"response.header.unresolved":   "GET /v1/files/{fileId}/dynamic-header",
+		"request.parameter.unresolved": "POST /v1/files/dynamic-upload",
+		"request.body.unresolved":      "POST /v1/files/dynamic-upload",
+		"security.requirement.missing": "GET /v1/items/request-observations",
 	}
-	rawStreamDiagnostic := doc.Diagnostics[0]
-	if rawStreamDiagnostic.Code != "response.missing" ||
-		rawStreamDiagnostic.Severity != "ERROR" ||
-		rawStreamDiagnostic.Operation != "GET /v1/items/raw-stream" ||
-		rawStreamDiagnostic.Subject != "rawStream" {
-		t.Fatalf("raw stream must be diagnosed as a missing response contract, got %+v", rawStreamDiagnostic)
+	if len(doc.Diagnostics) != len(wantDiagnostics) {
+		t.Fatalf("gin contract fixture diagnostics: got %+v", doc.Diagnostics)
+	}
+	for _, diagnostic := range doc.Diagnostics {
+		operation, ok := wantDiagnostics[diagnostic.Code]
+		if !ok || diagnostic.Operation != operation {
+			t.Fatalf("unexpected diagnostic: %+v", diagnostic)
+		}
 	}
 
 	login := routeByHandler(t, doc, "login")
@@ -114,6 +120,64 @@ func TestGinContractRegressionFacts(t *testing.T) {
 	if reader.Responses[0].BodyKind != "binary" || reader.Responses[0].ContentType != "application/pdf" {
 		t.Fatalf("readFile should be binary application/pdf, got %+v", reader.Responses)
 	}
+	for _, name := range []string{"Content-Disposition", "Content-Length", "Content-Type", "X-Session-ID"} {
+		assertResponseHeader(t, reader, 200, name)
+		assertNoResponseHeader(t, reader, 404, name)
+	}
+	dynamicHeader := routeByHandler(t, doc, "dynamicHeaderFile")
+	assertBodylessStatus(t, dynamicHeader, 204)
+	for _, response := range dynamicHeader.Responses {
+		if len(response.Headers) != 0 {
+			t.Fatalf("a dynamic response header name must be diagnosed, never guessed: %+v", response.Headers)
+		}
+	}
+	redirect := routeByHandler(t, doc, "redirectFile")
+	assertBodylessStatus(t, redirect, 307)
+	assertResponseHeader(t, redirect, 307, "Location")
+	assertResponseHeader(t, redirect, 307, "X-Session-ID")
+	// The same handler mutates a REQUEST header. Only what it sends is a response fact.
+	assertNoResponseHeader(t, redirect, 307, "X-Forwarded-Trace")
+	helperRedirect := routeByHandler(t, doc, "helperRedirectFile")
+	assertBodylessStatus(t, helperRedirect, 302)
+	assertResponseHeader(t, helperRedirect, 302, "Location")
+
+	upload := routeByHandler(t, doc, "uploadFile")
+	if upload.RequestBody == nil || upload.RequestBody.RefID != "CreateUploadRequest" || upload.RequestBodyContentType != "application/json" {
+		t.Fatalf("upload JSON request body mismatch: %+v", upload)
+	}
+	if len(upload.RequestBodyVariants) != 1 || upload.RequestBodyVariants[0].ContentType != "multipart/form-data" {
+		t.Fatalf("upload multipart request variant mismatch: %+v", upload.RequestBodyVariants)
+	}
+	uploadForm := schemaByID(t, doc, upload.RequestBodyVariants[0].Body.RefID)
+	encodedUploadFields, err := json.Marshal(uploadForm.Body.Of)
+	if err != nil {
+		t.Fatalf("encode upload multipart schema: %v", err)
+	}
+	var uploadFields []facts.FieldFact
+	if err := json.Unmarshal(encodedUploadFields, &uploadFields); err != nil {
+		t.Fatalf("upload multipart schema should be an object: %+v", uploadForm)
+	}
+	fieldByName := map[string]facts.FieldFact{}
+	for _, field := range uploadFields {
+		fieldByName[field.JSONName] = field
+	}
+	if fieldByName["request"].Schema.Type != facts.TypePrimitive || !fieldByName["request"].ValidatorRequiresPresence {
+		t.Fatalf("upload JSON string part mismatch: %+v", fieldByName["request"])
+	}
+	files := fieldByName["files"]
+	filesSchema, err := json.Marshal(files.Schema)
+	if err != nil {
+		t.Fatalf("encode upload file schema: %v", err)
+	}
+	if !jsonEqual(t, filesSchema, []byte(`{"type":"array","of":{"type":"primitive","of":{"prim":"bytes"}}}`)) || files.ValidatorRequiresPresence {
+		t.Fatalf("upload repeated file parts mismatch: %+v", files)
+	}
+	updateUpload := routeByHandler(t, doc, "updateUploadFile")
+	if updateUpload.RequestBody == nil || updateUpload.RequestBody.RefID != "UpdateItemRequest" ||
+		len(updateUpload.RequestBodyVariants) != 1 ||
+		updateUpload.RequestBodyVariants[0].ContentType != "multipart/form-data" {
+		t.Fatalf("second generic upload instantiation mismatch: %+v", updateUpload)
+	}
 	events := routeByHandler(t, doc, "itemEvents")
 	if events.Responses[0].BodyKind != "sse" || events.Responses[0].ContentType != "text/event-stream" {
 		t.Fatalf("itemEvents should be SSE text/event-stream, got %+v", events.Responses)
@@ -131,6 +195,20 @@ func TestGinContractRegressionFacts(t *testing.T) {
 	assertQueryParamDefault(t, search, "sort", false, `{"type":"primitive","of":{"prim":"string"}}`, "string", "asc")
 	assertQueryParamDefault(t, search, "cursor", false, `{"type":"primitive","of":{"prim":"string"}}`, "string", "first")
 	assertQueryParam(t, search, "token", false, `{"type":"primitive","of":{"prim":"string"}}`, "")
+	assertQueryParam(t, search, "offset", false, `{"type":"primitive","of":{"prim":"int","bits":64,"signed":false}}`, "")
+	assertQueryParam(t, search, "page", true, `{"type":"primitive","of":{"prim":"int","bits":64,"signed":false}}`, "")
+
+	observations := routeByHandler(t, doc, "requestObservations")
+	assertRequestParam(t, observations, "header", "X-Observed", false)
+	assertRequestParam(t, observations, "header", "X-Helper-Observed", false)
+	assertRequestParam(t, observations, "header", "X-Required", true)
+	assertRequestParam(t, observations, "cookie", "observed-cookie", false)
+	assertRequestParam(t, observations, "cookie", "required-cookie", true)
+	for _, param := range observations.Params {
+		if param.Location == "header" && param.Name == "Authorization" {
+			t.Fatalf("Authorization must be represented by security configuration, not an ordinary parameter: %+v", observations.Params)
+		}
+	}
 
 	attendance := routeByHandler(t, doc, "attendance")
 	assertQueryParam(t, attendance, "startDate", true, `{"type":"well_known","of":"date_time"}`, "")
@@ -300,6 +378,51 @@ func assertResponseBodyRef(t *testing.T, route facts.RouteFact, status uint16, r
 		return
 	}
 	t.Fatalf("%s should have response %d, got %+v", route.Handler, status, route.Responses)
+}
+
+func assertResponseHeader(t *testing.T, route facts.RouteFact, status uint16, name string) {
+	t.Helper()
+	for _, response := range route.Responses {
+		if response.Status != status {
+			continue
+		}
+		for _, header := range response.Headers {
+			if header.Name == name {
+				return
+			}
+		}
+		t.Fatalf("%s response %d should declare header %s, got %+v", route.Handler, status, name, response.Headers)
+	}
+	t.Fatalf("%s should have response %d, got %+v", route.Handler, status, route.Responses)
+}
+
+func assertNoResponseHeader(t *testing.T, route facts.RouteFact, status uint16, name string) {
+	t.Helper()
+	for _, response := range route.Responses {
+		if response.Status != status {
+			continue
+		}
+		for _, header := range response.Headers {
+			if header.Name == name {
+				t.Fatalf("%s response %d must not declare header %s, got %+v", route.Handler, status, name, response.Headers)
+			}
+		}
+		return
+	}
+	t.Fatalf("%s should have response %d, got %+v", route.Handler, status, route.Responses)
+}
+
+func assertRequestParam(t *testing.T, route facts.RouteFact, location, name string, required bool) {
+	t.Helper()
+	for _, param := range route.Params {
+		if param.Location == location && param.Name == name {
+			if param.Required != required {
+				t.Fatalf("%s %s %s required: got %v, want %v", route.Handler, location, name, param.Required, required)
+			}
+			return
+		}
+	}
+	t.Fatalf("%s missing %s %s, got %+v", route.Handler, location, name, route.Params)
 }
 
 func assertQueryParam(t *testing.T, route facts.RouteFact, name string, required bool, schemaJSON string, defaultNumber string) {

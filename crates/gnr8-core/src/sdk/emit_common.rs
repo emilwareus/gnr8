@@ -3,7 +3,7 @@
 //! These are the pure, byte-identical pieces of `gosdk::emit`/`pysdk::emit`/`tssdk::emit`: identifier
 //! tokenization ([`split_words`]), path joining ([`join_path`]) and templating ([`path_tokens`] +
 //! [`path_tokens_match`]), and graph-walking model/response resolvers ([`success_responses_of`],
-//! [`request_body_model_of`]).
+//! [`request_body_models_of`]).
 //! They contain NO per-language formatting — the casers (`exported`/`snake`/`camel`/…) and the type
 //! mappers (`go_type`/`py_type`/`ts_type`) stay in each emitter, where they genuinely diverge. One
 //! definition per fact (CLAUDE.md rule 3).
@@ -692,9 +692,9 @@ pub(crate) fn path_tokens_match(tokens: &[String], params: &[&str]) -> bool {
 /// The success-response shape an SDK can represent for one operation.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct SuccessResponses {
-    /// Declared successful statuses, sorted by status code. Empty means no explicit 2xx response.
+    /// Declared successful or redirect statuses, sorted by status code.
     pub(crate) statuses: Vec<u16>,
-    /// The single success body model, when all body-bearing 2xx responses share one model.
+    /// The single success body model, when all body-bearing 2xx/3xx responses share one model.
     pub(crate) body_model: Option<String>,
     /// The statuses that carry [`Self::body_model`].
     pub(crate) body_statuses: Vec<u16>,
@@ -704,7 +704,7 @@ pub(crate) struct SuccessResponses {
     pub(crate) binary_content_type: Option<String>,
 }
 
-/// One declared non-2xx JSON error response body.
+/// One declared non-success JSON error response body.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct ErrorResponseBody {
     /// HTTP status for the declared error response.
@@ -756,7 +756,7 @@ impl SuccessResponses {
     }
 }
 
-/// Resolve declared non-2xx JSON error body models for one operation.
+/// Resolve declared non-success JSON error body models for one operation.
 ///
 /// The graph currently represents only explicit numeric statuses, not `default` or ranges, so the
 /// returned list is sorted by explicit status and used before language fallback behavior.
@@ -766,7 +766,9 @@ pub(crate) fn error_response_bodies_of(
 ) -> Result<Vec<ErrorResponseBody>, CoreError> {
     let mut out = Vec::new();
     for resp in &op.responses {
-        if (200..300).contains(&resp.status) || resp.body_kind != "json" {
+        if ((200..300).contains(&resp.status) || (300..400).contains(&resp.status))
+            || resp.body_kind != "json"
+        {
             continue;
         }
         let Some(body) = &resp.body else {
@@ -808,11 +810,13 @@ fn reject_impossible_body(op: &Operation, resp: &crate::graph::Response) -> Resu
     })
 }
 
-/// Resolve all 2xx responses for one operation.
+/// Resolve every declared successful response for one operation.
 ///
 /// SDK methods have one return type, so multiple body-bearing success responses are accepted only when
 /// they point to the same model. Body-less alternate 2xx responses are represented by returning the
-/// language's empty/default success value rather than surfacing an API error.
+/// language's empty/default success value rather than surfacing an API error. Declared redirects are
+/// successes too: clients expose the 3xx status and headers through their response hooks and do not
+/// follow them unless the caller opts in.
 pub(crate) fn success_responses_of(
     op: &Operation,
     graph: &ApiGraph,
@@ -823,7 +827,7 @@ pub(crate) fn success_responses_of(
     let mut body_model: Option<String> = None;
     let mut binary_content_type: Option<String> = None;
     for resp in &op.responses {
-        if (200..300).contains(&resp.status) {
+        if (200..300).contains(&resp.status) || (300..400).contains(&resp.status) {
             statuses.push(resp.status);
             reject_impossible_body(op, resp)?;
             if resp.is_status_bodyless() {
@@ -920,43 +924,81 @@ pub(crate) fn success_responses_of(
 /// # Errors
 ///
 /// Returns [`CoreError::SdkGen`] if the request-body `$ref` is dangling.
-pub(crate) fn request_body_model_of(
+pub(crate) fn request_body_models_of(
     op: &Operation,
     graph: &ApiGraph,
-) -> Result<Option<RequestBodyModel>, CoreError> {
+) -> Result<Vec<RequestBodyModel>, CoreError> {
     let Some(body) = &op.request_body else {
-        return Ok(None);
-    };
-    let model = graph
-        .schemas
-        .iter()
-        .find(|s| s.id == body.ref_id)
-        .ok_or_else(|| CoreError::SdkGen {
+        if op.request_body_variants.is_empty() {
+            return Ok(Vec::new());
+        }
+        return Err(CoreError::SdkGen {
             message: format!(
-                "operation '{}' request body references dangling $ref '{}'",
-                op.id, body.ref_id
+                "operation '{}' declares request body variants without a primary request body",
+                op.id
             ),
-        })?;
-    let content_type = op
+        });
+    };
+    let primary_content_type = op
         .request_body_content_type
         .clone()
         .unwrap_or_else(|| "application/json".to_string());
-    let encoding = request_body_encoding(&content_type).ok_or_else(|| CoreError::SdkGen {
-        message: format!(
-            "operation '{}' request body content type '{}' is unsupported by generated SDKs; \
-             supported request media types are application/json, text/plain, \
-             application/x-www-form-urlencoded, multipart/form-data, and application/octet-stream",
-            op.id, content_type
-        ),
-    })?;
-    validate_request_body_schema(op, model, encoding)?;
-    Ok(Some(RequestBodyModel {
-        schema_id: model.id.clone(),
-        model: model.name.clone(),
-        required: op.request_body_required,
-        content_type,
-        encoding,
-    }))
+    let mut declarations = BTreeMap::from([(primary_content_type, body.ref_id.as_str())]);
+    if let Some(policy) = graph
+        .operation_docs
+        .iter()
+        .find(|policy| policy.operation_id == op.id)
+    {
+        for content_type in &policy.request_content_types {
+            declarations
+                .entry(content_type.clone())
+                .or_insert(body.ref_id.as_str());
+        }
+    }
+    for variant in &op.request_body_variants {
+        if let Some(previous) =
+            declarations.insert(variant.content_type.clone(), variant.body.ref_id.as_str())
+        {
+            if previous != variant.body.ref_id {
+                return Err(CoreError::SdkGen {
+                    message: format!(
+                        "operation '{}' declares request media type '{}' with more than one schema",
+                        op.id, variant.content_type
+                    ),
+                });
+            }
+        }
+    }
+    let mut models = Vec::with_capacity(declarations.len());
+    for (content_type, schema_id) in declarations {
+        let model = graph
+            .schemas
+            .iter()
+            .find(|schema| schema.id == *schema_id)
+            .ok_or_else(|| CoreError::SdkGen {
+                message: format!(
+                    "operation '{}' request body references dangling $ref '{}'",
+                    op.id, schema_id
+                ),
+            })?;
+        let encoding = request_body_encoding(&content_type).ok_or_else(|| CoreError::SdkGen {
+            message: format!(
+                "operation '{}' request body content type '{}' is unsupported by generated SDKs; \
+                 supported request media types are application/json, application/*+json, text/plain, \
+                 application/x-www-form-urlencoded, multipart/form-data, and application/octet-stream",
+                op.id, content_type
+            ),
+        })?;
+        validate_request_body_schema(op, model, encoding)?;
+        models.push(RequestBodyModel {
+            schema_id: model.id.clone(),
+            model: model.name.clone(),
+            required: op.request_body_required,
+            content_type,
+            encoding,
+        });
+    }
+    Ok(models)
 }
 
 fn request_body_encoding(content_type: &str) -> Option<RequestBodyEncoding> {
@@ -972,6 +1014,9 @@ fn request_body_encoding(content_type: &str) -> Option<RequestBodyEncoding> {
         "application/x-www-form-urlencoded" => Some(RequestBodyEncoding::FormUrlEncoded),
         "multipart/form-data" => Some(RequestBodyEncoding::Multipart),
         "application/octet-stream" => Some(RequestBodyEncoding::Binary),
+        other if other.starts_with("application/") && other.ends_with("+json") => {
+            Some(RequestBodyEncoding::Json)
+        }
         _ => None,
     }
 }
@@ -1203,6 +1248,7 @@ mod tests {
             request_body: None,
             request_body_required: true,
             request_body_content_type: None,
+            request_body_variants: Vec::new(),
             responses: vec![
                 Response {
                     status: 200,
@@ -1210,6 +1256,7 @@ mod tests {
                     body_kind: "binary".to_string(),
                     content_type: Some("application/pdf".to_string()),
                     content_types: vec!["application/pdf".to_string()],
+                    headers: Vec::new(),
                 },
                 Response {
                     status: 206,
@@ -1217,6 +1264,7 @@ mod tests {
                     body_kind: "binary".to_string(),
                     content_type: Some("application/octet-stream".to_string()),
                     content_types: vec!["application/octet-stream".to_string()],
+                    headers: Vec::new(),
                 },
             ],
             security: Vec::new(),
@@ -1268,6 +1316,7 @@ mod tests {
             request_body: None,
             request_body_required: true,
             request_body_content_type: None,
+            request_body_variants: Vec::new(),
             responses: vec![Response {
                 status: 204,
                 body: Some(crate::graph::SchemaRef {
@@ -1276,6 +1325,7 @@ mod tests {
                 body_kind: "json".to_string(),
                 content_type: Some("application/json".to_string()),
                 content_types: vec!["application/json".to_string()],
+                headers: Vec::new(),
             }],
             security: Vec::new(),
             security_overrides_global: false,
@@ -1339,6 +1389,7 @@ mod tests {
             request_body: None,
             request_body_required: true,
             request_body_content_type: None,
+            request_body_variants: Vec::new(),
             responses: vec![],
             security: vec!["CSRFAuth".to_string()],
             security_overrides_global: true,
@@ -1400,6 +1451,7 @@ mod tests {
             request_body: None,
             request_body_required: true,
             request_body_content_type: None,
+            request_body_variants: Vec::new(),
             responses: vec![],
             security: vec![],
             security_overrides_global: false,
@@ -1452,6 +1504,7 @@ mod tests {
             request_body: None,
             request_body_required: true,
             request_body_content_type: None,
+            request_body_variants: Vec::new(),
             responses: vec![],
             security: vec![],
             security_overrides_global: false,
@@ -1519,6 +1572,7 @@ mod tests {
             request_body: None,
             request_body_required: true,
             request_body_content_type: None,
+            request_body_variants: Vec::new(),
             responses: vec![],
             security: vec![],
             security_overrides_global: false,

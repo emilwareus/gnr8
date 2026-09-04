@@ -94,17 +94,18 @@ func WithResponseHook(hook ResponseHook) Option {
 	return func(c *Client) { c.responseHooks = append(c.responseHooks, hook) }
 }
 
-// WithErrorHook installs a hook that runs for transport failures and final non-2xx responses.
+// WithErrorHook installs a hook that runs for transport failures and final rejected responses.
 func WithErrorHook(hook ErrorHook) Option {
 	return func(c *Client) { c.errorHooks = append(c.errorHooks, hook) }
 }
 
 // RequestOptions overrides runtime behavior for one operation call.
 type RequestOptions struct {
-	Timeout        time.Duration
-	MaxRetries     *int
-	IdempotencyKey string
-	Metadata       map[string]string
+	Timeout         time.Duration
+	MaxRetries      *int
+	IdempotencyKey  string
+	Metadata        map[string]string
+	FollowRedirects bool
 }
 
 // RequestOption mutates per-request runtime options.
@@ -130,6 +131,11 @@ func WithRequestMetadata(metadata map[string]string) RequestOption {
 	return func(o *RequestOptions) { o.Metadata = metadata }
 }
 
+// WithFollowRedirects opts one operation call into the transport's redirect behavior.
+func WithFollowRedirects(follow bool) RequestOption {
+	return func(o *RequestOptions) { o.FollowRedirects = follow }
+}
+
 // RequestContext describes one generated SDK transport attempt.
 type RequestContext struct {
 	OperationID     string
@@ -151,6 +157,7 @@ type runtimeRequestOptions struct {
 	PathTemplate         string
 	Idempotent           bool
 	IdempotencyKeyHeader string
+	SuccessStatuses      map[int]bool
 	Options              RequestOptions
 }
 
@@ -285,7 +292,15 @@ func (c *Client) do(req *http.Request, runtime runtimeRequestOptions) (*http.Res
 				return nil, err
 			}
 		}
-		resp, err := c.httpClient.Do(attemptReq)
+		httpClient := c.httpClient
+		if !runtime.Options.FollowRedirects {
+			client := *c.httpClient
+			client.CheckRedirect = func(_ *http.Request, _ []*http.Request) error {
+				return http.ErrUseLastResponse
+			}
+			httpClient = &client
+		}
+		resp, err := httpClient.Do(attemptReq)
 		if err != nil {
 			lastErr = err
 			if attempt < maxRetries && retryBudget > 0 {
@@ -330,7 +345,7 @@ func (c *Client) do(req *http.Request, runtime runtimeRequestOptions) (*http.Res
 			}
 			continue
 		}
-		if resp.StatusCode < 200 || resp.StatusCode >= 300 {
+		if (resp.StatusCode < 200 || resp.StatusCode >= 300) && !runtime.SuccessStatuses[resp.StatusCode] {
 			c.callErrorHooks(attemptReq.Context(), ctx, &APIError{StatusCode: resp.StatusCode, Headers: resp.Header.Clone(), RequestID: resp.Header.Get("X-Request-ID")})
 		}
 		if cancel != nil {

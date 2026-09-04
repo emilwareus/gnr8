@@ -72,7 +72,7 @@ fn sdk_readme(language: &str, package: &str, ir: &ApiGraph) -> String {
     );
     let _ = writeln!(
         text,
-        "4. Handle generated {error_type} values for non-2xx responses.\n"
+        "4. Handle generated {error_type} values for rejected HTTP responses.\n"
     );
     // The timeout knob does not bound the same span in every language, and a caller who assumes
     // it does will size it wrong. Say so where they will read it.

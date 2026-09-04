@@ -33,9 +33,9 @@ use crate::graph::{
 };
 use crate::sdk::emit_common::{
     error_response_bodies_of, is_json_object_key, join_path, operation_auth_alternatives,
-    operation_prose, path_tokens, path_tokens_match, quoted_string_literal, request_body_model_of,
+    operation_prose, path_tokens, path_tokens_match, quoted_string_literal, request_body_models_of,
     split_words, success_responses_of, ApiKeyLocation, HttpAuthScheme, OperationApiKeyScheme,
-    OperationAuthScheme, RequestBodyEncoding, UniqueSchemaNames,
+    OperationAuthScheme, RequestBodyEncoding, RequestBodyModel, UniqueSchemaNames,
 };
 use crate::sdk::model_style::PyModelStyle;
 use crate::CoreError;
@@ -1248,6 +1248,26 @@ fn py_body_encoding(encoding: RequestBodyEncoding) -> &'static str {
     }
 }
 
+fn py_request_body_arg_type(bodies: &[RequestBodyModel]) -> Result<String, CoreError> {
+    match bodies {
+        [] => Err(CoreError::SdkGen {
+            message: "request body type requested for an operation without a body".to_string(),
+        }),
+        [body] => Ok(body.model.clone()),
+        many => Ok(format!(
+            "Union[{}]",
+            many.iter()
+                .map(|body| format!(
+                    "tuple[Literal[{}], {}]",
+                    quoted_string_literal(&body.content_type),
+                    body.model
+                ))
+                .collect::<Vec<_>>()
+                .join(", ")
+        )),
+    }
+}
+
 struct PyOperationRuntime<'a> {
     idempotent: bool,
     idempotency_key_header: Option<&'a str>,
@@ -1285,7 +1305,7 @@ pub(crate) fn client_referenced_models(
 ) -> Result<Vec<String>, CoreError> {
     let mut names: Vec<String> = Vec::new();
     for op in ops {
-        if let Some(body) = request_body_model_of(op, graph)? {
+        for body in request_body_models_of(op, graph)? {
             names.push(body.model);
         }
         if let Some(model) = success_responses_of(op, graph)?.body_model {
@@ -1324,6 +1344,18 @@ pub(crate) fn operations_need_parameter_unions(ops: &[&Operation]) -> bool {
             .iter()
             .any(|param| type_contains_union(&param.schema))
     })
+}
+
+pub(crate) fn operations_have_multiple_request_bodies(
+    ops: &[&Operation],
+    graph: &ApiGraph,
+) -> Result<bool, CoreError> {
+    for op in ops {
+        if request_body_models_of(op, graph)?.len() > 1 {
+            return Ok(true);
+        }
+    }
+    Ok(false)
 }
 
 fn type_contains_union(schema: &Type) -> bool {
@@ -1449,6 +1481,7 @@ pub(crate) fn emit_client_with_models(
     if has_basic_auth {
         stdlib.push("import base64".to_string());
     }
+    stdlib.push("import copy".to_string());
     if let PyModelStyle::Dataclass = model_style {
         stdlib.push("import dataclasses".to_string());
     }
@@ -1636,6 +1669,54 @@ def _header_value(headers: dict[str, str], name: str) -> str:
     return \"\"
 
 
+class _NoRedirectHandler(urllib.request.HTTPRedirectHandler):
+    def redirect_request(self, req, fp, code, msg, headers, newurl):
+        return None
+
+
+def _origin(url: str) -> tuple[str, str, Optional[int]]:
+    parts = urllib.parse.urlsplit(url)
+    port = parts.port
+    if port is None:
+        port = 443 if parts.scheme.lower() == \"https\" else 80
+    return parts.scheme.lower(), (parts.hostname or \"\").lower(), port
+
+
+class _SafeRedirectHandler(urllib.request.HTTPRedirectHandler):
+    def redirect_request(self, req, fp, code, msg, headers, newurl):
+        redirected = super().redirect_request(req, fp, code, msg, headers, newurl)
+        if redirected is None:
+            return None
+        sensitive = set(getattr(req, \"_gnr8_sensitive_headers\", ()))
+        sensitive.update((\"Authorization\", \"Cookie\", \"Proxy-Authorization\"))
+        setattr(redirected, \"_gnr8_sensitive_headers\", tuple(sensitive))
+        if _origin(req.full_url) != _origin(newurl):
+            # Request.add_header() stores keys capitalize()-normalized while
+            # remove_header() pops the exact key, so a configured spelling such as
+            # X-API-Key never matches what is stored. Match the stored names.
+            unwanted = {{name.lower() for name in sensitive}}
+            for name, _value in redirected.header_items():
+                if name.lower() in unwanted:
+                    redirected.remove_header(name)
+        return redirected
+
+
+def _opener_with_redirect_policy(
+    opener: Optional[urllib.request.OpenerDirector],
+    redirect_handler: urllib.request.HTTPRedirectHandler,
+) -> urllib.request.OpenerDirector:
+    if opener is None:
+        return urllib.request.build_opener(redirect_handler)
+    handlers = [
+        copy.copy(handler)
+        for handler in opener.handlers
+        if not isinstance(handler, urllib.request.HTTPRedirectHandler)
+    ]
+    policy_opener = urllib.request.build_opener(*handlers, redirect_handler)
+    policy_opener.addheaders = list(opener.addheaders)
+    return policy_opener
+
+
 class RequestOptions:
     \"\"\"Per-request SDK runtime overrides.\"\"\"
 
@@ -1646,11 +1727,13 @@ class RequestOptions:
         max_retries: Optional[int] = None,
         idempotency_key: Optional[str] = None,
         metadata: Optional[dict[str, str]] = None,
+        follow_redirects: bool = False,
     ) -> None:
         self.timeout = timeout
         self.max_retries = max_retries
         self.idempotency_key = idempotency_key
         self.metadata = metadata or {{}}
+        self.follow_redirects = follow_redirects
 
 
 class HookContext:
@@ -1708,7 +1791,10 @@ class Client:
     ) -> None:
         self._base_url = base_url.rstrip(\"/\")
         self._api_key = api_key
-{auth_field}{bearer_field}{basic_field}{transport_auth_field}        self._opener = opener or urllib.request.build_opener()
+{auth_field}{bearer_field}{basic_field}{transport_auth_field}        self._opener = _opener_with_redirect_policy(opener, _NoRedirectHandler())
+        self._redirect_opener = _opener_with_redirect_policy(
+            opener, _SafeRedirectHandler()
+        )
         self._timeout = timeout
         self._max_retries = max_retries
         self._retry_statuses = {retry_statuses}
@@ -1864,6 +1950,8 @@ class Client:
         request_options: Optional[RequestOptions] = None,
         idempotent: bool = False,
         idempotency_key_header: str = \"Idempotency-Key\",
+        success_statuses: tuple[int, ...] = (),
+        sensitive_headers: tuple[str, ...] = (),
     ) -> tuple:
         data, content_type = self._encode_body(body, body_encoding, content_type)
         options = request_options or RequestOptions()
@@ -1888,10 +1976,12 @@ class Client:
         url = self._base_url + path
         last_error: Optional[BaseException] = None
         _retry_budget = MAX_RETRY_DELAY_SECONDS
+        opener = self._redirect_opener if options.follow_redirects else self._opener
         for attempt in range(max_retries + 1):
             req = urllib.request.Request(url, data=data, method=method)
             for key, value in headers.items():
                 req.add_header(key, value)
+            setattr(req, \"_gnr8_sensitive_headers\", sensitive_headers)
             context = HookContext(
                 operation_id=operation_id,
                 method=method,
@@ -1904,7 +1994,7 @@ class Client:
                 for hook in self._hooks.request:
                     hook(context, req)
                 try:
-                    with self._opener.open(req, timeout=timeout) as resp:
+                    with opener.open(req, timeout=timeout) as resp:
                         status = resp.status
                         response_headers = dict(resp.headers.items())
                         raw = resp.read()
@@ -1928,7 +2018,7 @@ class Client:
                     _retry_budget -= _delay
                     time.sleep(_delay)
                     continue
-                if status < 200 or status >= 300:
+                if (status < 200 or status >= 300) and status not in success_statuses:
                     self._call_error_hooks(
                         context,
                         ApiError(
@@ -2029,8 +2119,8 @@ class Client:
 /// - interpolates each path param through `urllib.parse.quote(str(value), safe="")` (V5 path-injection
 ///   mitigation — twin of Go `url.PathEscape`); builds the query with `urllib.parse.urlencode` over the
 ///   present optional params; joins `base_path` + `op.path`;
-/// - calls `self._do`, raises the `ApiError` built by `self._error` for non-2xx responses, and decodes JSON only
-///   for success statuses that declare a body model.
+/// - calls `self._do`, raises the `ApiError` built by `self._error` for rejected responses, and decodes
+///   JSON only for accepted statuses that declare a body model.
 ///
 /// # Errors
 ///
@@ -2311,7 +2401,7 @@ fn emit_operation(
         });
     }
 
-    let body_model = request_body_model_of(op, graph)?;
+    let body_models = request_body_models_of(op, graph)?;
     let success = success_responses_of(op, graph)?;
     let error_bodies = error_response_bodies_of(op, graph)?;
     let auth_alternatives = operation_auth_alternatives(graph, op)?;
@@ -2369,7 +2459,7 @@ fn emit_operation(
         required_query_idents,
         optional_query,
         optional_query_idents,
-    } = resolve_op_args(op, &path_params, &request_params, body_model.is_some())?;
+    } = resolve_op_args(op, &path_params, &request_params, !body_models.is_empty())?;
 
     // Signature: self, path params (positional), required body when present, required query
     // (positional), optional body when present, then optional query params (= None). This preserves
@@ -2383,8 +2473,8 @@ fn emit_operation(
             py_type(&param.schema, false, graph)?
         ));
     }
-    if let Some(body) = body_model.as_ref().filter(|body| body.required) {
-        args.push(format!("body: {}", body.model));
+    if let Some(_body) = body_models.first().filter(|body| body.required) {
+        args.push(format!("body: {}", py_request_body_arg_type(&body_models)?));
     }
     for (param, ident) in required_query.iter().zip(required_query_idents.iter()) {
         args.push(format!(
@@ -2392,8 +2482,11 @@ fn emit_operation(
             py_type(&param.schema, false, graph)?
         ));
     }
-    if let Some(body) = body_model.as_ref().filter(|body| !body.required) {
-        args.push(format!("body: Optional[{}] = None", body.model));
+    if let Some(_body) = body_models.first().filter(|body| !body.required) {
+        args.push(format!(
+            "body: Optional[{}] = None",
+            py_request_body_arg_type(&body_models)?
+        ));
     }
     for (param, ident) in optional_query.iter().zip(optional_query_idents.iter()) {
         args.push(format!(
@@ -2546,9 +2639,35 @@ fn emit_operation(
         }
     }
 
-    // Dispatch: call _do, reject non-2xx responses, and decode only statuses with a declared body.
+    // Dispatch: call _do, reject unaccepted responses, and decode only statuses with a declared body.
     let mut do_args = vec![quoted_string_literal(&op.method), "path".to_string()];
-    if let Some(body) = body_model.as_ref() {
+    if body_models.len() > 1 {
+        writeln!(
+            out,
+            "        _body_value = None if body is None else body[1]"
+        )
+        .map_err(sink)?;
+        writeln!(
+            out,
+            "        _body_content_type = {} if body is None else body[0]",
+            quoted_string_literal(&body_models[0].content_type)
+        )
+        .map_err(sink)?;
+        writeln!(out, "        _body_encodings = {{").map_err(sink)?;
+        for body in &body_models {
+            writeln!(
+                out,
+                "            {}: {},",
+                quoted_string_literal(&body.content_type),
+                quoted_string_literal(py_body_encoding(body.encoding))
+            )
+            .map_err(sink)?;
+        }
+        writeln!(out, "        }}").map_err(sink)?;
+        do_args.push("body=_body_value".to_string());
+        do_args.push("content_type=_body_content_type".to_string());
+        do_args.push("body_encoding=_body_encodings[_body_content_type]".to_string());
+    } else if let Some(body) = body_models.first() {
         do_args.push("body=body".to_string());
         do_args.push(format!(
             "content_type={}",
@@ -2562,6 +2681,14 @@ fn emit_operation(
     if has_request_headers || has_auth_headers {
         do_args.push("request_headers=_request_headers".to_string());
     }
+    if !auth_headers.is_empty() {
+        let sensitive_headers = auth_headers
+            .iter()
+            .map(|header| quoted_string_literal(&header.name))
+            .collect::<Vec<_>>()
+            .join(", ");
+        do_args.push(format!("sensitive_headers=({sensitive_headers},)"));
+    }
     let runtime = py_operation_runtime(graph, op);
     do_args.push(format!("operation_id={}", quoted_string_literal(&op.id)));
     do_args.push(format!("path_template={}", quoted_string_literal(&op.path)));
@@ -2571,12 +2698,31 @@ fn emit_operation(
         "idempotency_key_header={}",
         quoted_string_literal(runtime.idempotency_key_header.unwrap_or("Idempotency-Key")),
     ));
+    do_args.push(format!(
+        "success_statuses={}",
+        py_status_tuple(&success.statuses)
+    ));
     writeln!(out, "        _status, _headers, _raw = self._do(").map_err(sink)?;
     for arg in do_args {
         writeln!(out, "            {arg},").map_err(sink)?;
     }
     writeln!(out, "        )").map_err(sink)?;
-    writeln!(out, "        if _status < 200 or _status >= 300:").map_err(sink)?;
+    let redirects = success
+        .statuses
+        .iter()
+        .copied()
+        .filter(|status| (300..400).contains(status))
+        .collect::<Vec<_>>();
+    if redirects.is_empty() {
+        writeln!(out, "        if _status < 200 or _status >= 300:").map_err(sink)?;
+    } else {
+        writeln!(
+            out,
+            "        if (_status < 200 or _status >= 300) and _status not in {}:",
+            py_status_tuple(&redirects)
+        )
+        .map_err(sink)?;
+    }
     for error_body in &error_bodies {
         writeln!(out, "            if _status == {}:", error_body.status).map_err(sink)?;
         writeln!(
@@ -2916,14 +3062,14 @@ fn py_pagination_args(
 ) -> Result<(Vec<String>, Vec<String>), CoreError> {
     let path_params: Vec<&Param> = op.params.iter().filter(|p| p.location == "path").collect();
     let request_params: Vec<&Param> = op.params.iter().filter(|p| p.location != "path").collect();
-    let body_model = request_body_model_of(op, graph)?;
+    let body_models = request_body_models_of(op, graph)?;
     let ResolvedArgs {
         path_idents,
         required_query,
         required_query_idents,
         optional_query,
         optional_query_idents,
-    } = resolve_op_args(op, &path_params, &request_params, body_model.is_some())?;
+    } = resolve_op_args(op, &path_params, &request_params, !body_models.is_empty())?;
 
     let mut args: Vec<String> = vec!["self".to_string()];
     let mut call_args: Vec<String> = Vec::new();
@@ -2934,8 +3080,8 @@ fn py_pagination_args(
         ));
         call_args.push(format!("{ident}={ident}"));
     }
-    if let Some(body) = body_model.as_ref().filter(|body| body.required) {
-        args.push(format!("body: {}", body.model));
+    if let Some(_body) = body_models.first().filter(|body| body.required) {
+        args.push(format!("body: {}", py_request_body_arg_type(&body_models)?));
         call_args.push("body=body".to_string());
     }
     for (param, ident) in required_query.iter().zip(required_query_idents.iter()) {
@@ -2943,8 +3089,11 @@ fn py_pagination_args(
         args.push(format!("{ident}: {hint}"));
         call_args.push(format!("{ident}={ident}"));
     }
-    if let Some(body) = body_model.as_ref().filter(|body| !body.required) {
-        args.push(format!("body: Optional[{}] = None", body.model));
+    if let Some(_body) = body_models.first().filter(|body| !body.required) {
+        args.push(format!(
+            "body: Optional[{}] = None",
+            py_request_body_arg_type(&body_models)?
+        ));
         call_args.push("body=body".to_string());
     }
     for (param, ident) in optional_query.iter().zip(optional_query_idents.iter()) {
@@ -4013,6 +4162,7 @@ mod tests {
                 body_kind: "empty".to_string(),
                 content_type: None,
                 content_types: Vec::new(),
+                headers: Vec::new(),
             });
             g.operations[0]
                 .responses
@@ -4112,6 +4262,24 @@ mod tests {
         }
 
         #[test]
+        fn header_api_key_auth_is_removed_from_cross_origin_redirects() {
+            let mut g = ops_graph();
+            g.security = vec![crate::graph::SecurityScheme {
+                id: "HeaderAuth".to_string(),
+                kind: "apiKey".to_string(),
+                location: "header".to_string(),
+                name: "X-API-Key".to_string(),
+                global: true,
+            }];
+            let out = emit_operations(&g, "bookstore", "/", &ops_for(&g, "listBooks")).unwrap();
+            assert!(
+                out.contains("_request_headers[\"X-API-Key\"]")
+                    && out.contains("sensitive_headers=(\"X-API-Key\",)"),
+                "{out}"
+            );
+        }
+
+        #[test]
         fn http_auth_marks_operation_dispatch() {
             let mut g = ops_graph();
             g.security = vec![
@@ -4200,6 +4368,7 @@ mod tests {
                 body_kind: "empty".to_string(),
                 content_type: None,
                 content_types: Vec::new(),
+                headers: Vec::new(),
             });
             op.responses.sort_by_key(|response| response.status);
             let out = emit_operations(&g, "bookstore", "/", &ops_for(&g, "listBooks")).unwrap();
@@ -4255,7 +4424,11 @@ mod tests {
                 out.contains("opener: Optional[urllib.request.OpenerDirector] = None"),
                 "{out}"
             );
-            assert!(out.contains("urllib.request.build_opener()"), "{out}");
+            assert!(
+                out.contains("_opener_with_redirect_policy(opener, _NoRedirectHandler())")
+                    && out.contains("opener, _SafeRedirectHandler()"),
+                "{out}"
+            );
             assert!(out.contains("except urllib.error.HTTPError as e:"), "{out}");
             // no third-party HTTP libs (PYSDK-01).
             assert!(!out.contains("import requests"), "{out}");
@@ -4401,6 +4574,7 @@ mod tests {
                 request_body: None,
                 request_body_required: false,
                 request_body_content_type: None,
+                request_body_variants: Vec::new(),
                 responses: Vec::new(),
                 security: Vec::new(),
                 security_overrides_global: false,

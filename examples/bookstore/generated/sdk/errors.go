@@ -7,7 +7,7 @@ import (
 	"net/http"
 )
 
-// APIError is returned by operation methods on non-2xx responses. It exposes the
+// APIError is returned by operation methods on rejected HTTP responses. It exposes the
 // HTTP status, response metadata, raw body, parsed JSON body, and decoded error body.
 type APIError struct {
 	StatusCode int

@@ -62,12 +62,14 @@ keys; message is explanatory text. Results are deterministically sorted.
 | `response.status.unresolved` | response status was dynamic/unknown | set an exact response override |
 | `response.schema.unresolved` | response schema was unknown or ambiguous | set success/response schema explicitly |
 | `response.media_type.unresolved` | response media type was unknown or not representable | use `ResponseOverride` media policy |
+| `response.header.unresolved` | a response header was written under a name that is not a constant | make the header name constant, or declare it with a response override |
 | `schema.type.unresolved` | field/schema type could not be resolved | add source type or `SetSchemaFieldType` |
 | `schema.metadata.unresolved` | schema constraint/metadata could not be preserved | type source or add target patch |
 | `schema.numeric.narrowing` | numeric shape required a lossy narrowing | choose an explicit graph type |
 | `schema.free_form_map` | source contains a fully represented but unconstrained free-form map (`INFO`) | accept `additionalProperties: true` or model a narrower schema |
 | `schema.omit_option.ineffective` | Go field is tagged `,omitempty` on a type `encoding/json` never omits — a struct, a `time.Time`, or a non-zero-length array (`INFO`) | use `,omitzero`, or accept that the key is always present |
 | `security.unresolved` | security/auth fact was incomplete | use `ApplySecurity`/`SecurityOverride` |
+| `security.requirement.missing` | the handler reads `Authorization` but typed source cannot state the scheme | apply an `Authorization`-carrying scheme with `ApplySecurity` |
 
 Not every source emits every code. The diagnostic message and span identify the exact unsupported
 pattern.

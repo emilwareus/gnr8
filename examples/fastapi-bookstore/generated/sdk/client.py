@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import copy
 import enum
 import json
 import secrets
@@ -45,6 +46,54 @@ def _header_value(headers: dict[str, str], name: str) -> str:
     return ""
 
 
+class _NoRedirectHandler(urllib.request.HTTPRedirectHandler):
+    def redirect_request(self, req, fp, code, msg, headers, newurl):
+        return None
+
+
+def _origin(url: str) -> tuple[str, str, Optional[int]]:
+    parts = urllib.parse.urlsplit(url)
+    port = parts.port
+    if port is None:
+        port = 443 if parts.scheme.lower() == "https" else 80
+    return parts.scheme.lower(), (parts.hostname or "").lower(), port
+
+
+class _SafeRedirectHandler(urllib.request.HTTPRedirectHandler):
+    def redirect_request(self, req, fp, code, msg, headers, newurl):
+        redirected = super().redirect_request(req, fp, code, msg, headers, newurl)
+        if redirected is None:
+            return None
+        sensitive = set(getattr(req, "_gnr8_sensitive_headers", ()))
+        sensitive.update(("Authorization", "Cookie", "Proxy-Authorization"))
+        setattr(redirected, "_gnr8_sensitive_headers", tuple(sensitive))
+        if _origin(req.full_url) != _origin(newurl):
+            # Request.add_header() stores keys capitalize()-normalized while
+            # remove_header() pops the exact key, so a configured spelling such as
+            # X-API-Key never matches what is stored. Match the stored names.
+            unwanted = {name.lower() for name in sensitive}
+            for name, _value in redirected.header_items():
+                if name.lower() in unwanted:
+                    redirected.remove_header(name)
+        return redirected
+
+
+def _opener_with_redirect_policy(
+    opener: Optional[urllib.request.OpenerDirector],
+    redirect_handler: urllib.request.HTTPRedirectHandler,
+) -> urllib.request.OpenerDirector:
+    if opener is None:
+        return urllib.request.build_opener(redirect_handler)
+    handlers = [
+        copy.copy(handler)
+        for handler in opener.handlers
+        if not isinstance(handler, urllib.request.HTTPRedirectHandler)
+    ]
+    policy_opener = urllib.request.build_opener(*handlers, redirect_handler)
+    policy_opener.addheaders = list(opener.addheaders)
+    return policy_opener
+
+
 class RequestOptions:
     """Per-request SDK runtime overrides."""
 
@@ -55,11 +104,13 @@ class RequestOptions:
         max_retries: Optional[int] = None,
         idempotency_key: Optional[str] = None,
         metadata: Optional[dict[str, str]] = None,
+        follow_redirects: bool = False,
     ) -> None:
         self.timeout = timeout
         self.max_retries = max_retries
         self.idempotency_key = idempotency_key
         self.metadata = metadata or {}
+        self.follow_redirects = follow_redirects
 
 
 class HookContext:
@@ -117,7 +168,10 @@ class Client:
     ) -> None:
         self._base_url = base_url.rstrip("/")
         self._api_key = api_key
-        self._opener = opener or urllib.request.build_opener()
+        self._opener = _opener_with_redirect_policy(opener, _NoRedirectHandler())
+        self._redirect_opener = _opener_with_redirect_policy(
+            opener, _SafeRedirectHandler()
+        )
         self._timeout = timeout
         self._max_retries = max_retries
         self._retry_statuses = (408, 429)
@@ -277,6 +331,8 @@ class Client:
         request_options: Optional[RequestOptions] = None,
         idempotent: bool = False,
         idempotency_key_header: str = "Idempotency-Key",
+        success_statuses: tuple[int, ...] = (),
+        sensitive_headers: tuple[str, ...] = (),
     ) -> tuple:
         data, content_type = self._encode_body(body, body_encoding, content_type)
         options = request_options or RequestOptions()
@@ -301,10 +357,12 @@ class Client:
         url = self._base_url + path
         last_error: Optional[BaseException] = None
         _retry_budget = MAX_RETRY_DELAY_SECONDS
+        opener = self._redirect_opener if options.follow_redirects else self._opener
         for attempt in range(max_retries + 1):
             req = urllib.request.Request(url, data=data, method=method)
             for key, value in headers.items():
                 req.add_header(key, value)
+            setattr(req, "_gnr8_sensitive_headers", sensitive_headers)
             context = HookContext(
                 operation_id=operation_id,
                 method=method,
@@ -317,7 +375,7 @@ class Client:
                 for hook in self._hooks.request:
                     hook(context, req)
                 try:
-                    with self._opener.open(req, timeout=timeout) as resp:
+                    with opener.open(req, timeout=timeout) as resp:
                         status = resp.status
                         response_headers = dict(resp.headers.items())
                         raw = resp.read()
@@ -341,7 +399,7 @@ class Client:
                     _retry_budget -= _delay
                     time.sleep(_delay)
                     continue
-                if status < 200 or status >= 300:
+                if (status < 200 or status >= 300) and status not in success_statuses:
                     self._call_error_hooks(
                         context,
                         ApiError(
@@ -462,6 +520,7 @@ class Client:
             request_options=request_options,
             idempotent=False,
             idempotency_key_header="Idempotency-Key",
+            success_statuses=(200,),
         )
         if _status < 200 or _status >= 300:
             raise self._error(_status, _headers, _raw)
@@ -491,6 +550,7 @@ class Client:
             request_options=request_options,
             idempotent=False,
             idempotency_key_header="Idempotency-Key",
+            success_statuses=(201,),
         )
         if _status < 200 or _status >= 300:
             raise self._error(_status, _headers, _raw)
@@ -524,6 +584,7 @@ class Client:
             request_options=request_options,
             idempotent=False,
             idempotency_key_header="Idempotency-Key",
+            success_statuses=(200,),
         )
         if _status < 200 or _status >= 300:
             raise self._error(_status, _headers, _raw)
@@ -554,6 +615,7 @@ class Client:
             request_options=request_options,
             idempotent=False,
             idempotency_key_header="Idempotency-Key",
+            success_statuses=(200,),
         )
         if _status < 200 or _status >= 300:
             raise self._error(_status, _headers, _raw)

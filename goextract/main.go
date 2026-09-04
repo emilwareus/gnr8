@@ -193,6 +193,7 @@ func buildRoutes(analyzer *handlers.Analyzer, recognized []routes.Route, diags *
 		rf.RequestBody = cf.RequestBody
 		rf.RequestBodyRequired = cf.RequestBodyRequired
 		rf.RequestBodyContentType = cf.RequestBodyContentType
+		rf.RequestBodyVariants = cf.RequestBodyVariants
 		rf.Responses = cf.Responses
 		rf.Params = mergeRoutePathParams(r.Path, r.Span, cf.Params)
 		for _, schema := range cf.Schemas {

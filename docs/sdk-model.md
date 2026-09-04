@@ -19,8 +19,8 @@ as an SDK package.
 
 - Package/module name and API base path.
 - Services/groups and their operation ids.
-- Operations with method, path template, handler id, service, auth requirements, request schema,
-  success responses, and error responses.
+- Operations with method, path template, handler id, service, auth requirements, request media/schema
+  choices, success responses, error responses, and declared response headers.
 - Schemas with stable graph id, generated name, and neutral shape kind.
 - API-key auth header metadata.
 - File layout policy.
@@ -30,8 +30,10 @@ as an SDK package.
 
 ## Ownership Boundary
 
-`ApiGraph` owns source facts: operations, params, schemas, responses, security scheme declarations,
-provenance, title, and base path.
+`ApiGraph` owns source facts: operations, params, schemas, request media/schema choices, responses,
+response headers, security scheme declarations, provenance, title, and base path. The original request
+body fields remain the primary choice; `request_body_variants` is the deterministically sorted set of
+additional choices. Together they form one request-content collection.
 
 `SdkModel` owns SDK planning facts: package surface, service grouping, per-operation auth/error/success
 classification, file layout, docs metadata, and runtime-policy defaults.

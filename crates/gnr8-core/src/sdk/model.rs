@@ -6,7 +6,9 @@
 use std::collections::BTreeMap;
 
 use crate::graph::{ApiGraph, PaginationMode, PaginationTermination, RuntimeHookKind, Type};
-use crate::sdk::emit_common::{api_key_credential_names, api_key_header_names};
+use crate::sdk::emit_common::{
+    api_key_credential_names, api_key_header_names, request_body_models_of,
+};
 use crate::sdk::layout::SdkFileLayout;
 use crate::CoreError;
 
@@ -69,7 +71,12 @@ pub struct SdkOperation {
     /// Operation auth requirements.
     pub auth: SdkOperationAuth,
     /// Request schema name, when present.
+    ///
+    /// This remains the primary request schema for target code that has not yet adopted
+    /// [`Self::request_bodies`].
     pub request_schema: Option<String>,
+    /// Every request media/schema choice the operation accepts.
+    pub request_bodies: Vec<SdkRequestBody>,
     /// Response body schema names keyed by status.
     pub response_schemas: Vec<(u16, String)>,
     /// Success responses keyed by status.
@@ -91,6 +98,17 @@ pub struct SdkOperationAuth {
     pub overrides_global: bool,
 }
 
+/// One typed request-body choice exposed by an operation.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SdkRequestBody {
+    /// Request media type.
+    pub content_type: String,
+    /// Directional SDK model name.
+    pub schema: String,
+    /// Whether callers must select and provide a request body.
+    pub required: bool,
+}
+
 /// Planned SDK response surface.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct SdkResponse {
@@ -102,6 +120,17 @@ pub struct SdkResponse {
     pub body_kind: String,
     /// Media types emitted for this response.
     pub content_types: Vec<String>,
+    /// Declared response headers.
+    pub headers: Vec<SdkResponseHeader>,
+}
+
+/// One response header exposed by an SDK response.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SdkResponseHeader {
+    /// HTTP header name.
+    pub name: String,
+    /// Neutral header value shape.
+    pub schema: Type,
 }
 
 /// A generated schema/model.
@@ -217,7 +246,7 @@ pub enum SdkHookKind {
     Request,
     /// Response hook after a successful HTTP response.
     Response,
-    /// Error hook for transport or non-2xx errors.
+    /// Error hook for transport failures or rejected HTTP responses.
     Error,
 }
 
@@ -318,6 +347,14 @@ impl SdkModel {
                 .as_ref()
                 .map(|body| schema_name_by_ref(graph, &body.ref_id))
                 .transpose()?;
+            let request_bodies = request_body_models_of(op, graph)?
+                .into_iter()
+                .map(|body| SdkRequestBody {
+                    content_type: body.content_type,
+                    schema: body.model,
+                    required: body.required,
+                })
+                .collect();
             let response_schemas = op
                 .responses
                 .iter()
@@ -334,7 +371,7 @@ impl SdkModel {
                 .collect::<Result<Vec<_>, CoreError>>()?;
             let (success_responses, op_error_responses): (Vec<_>, Vec<_>) = responses
                 .into_iter()
-                .partition(|response| (200..=299).contains(&response.status));
+                .partition(|response| (200..=399).contains(&response.status));
             for response in &op_error_responses {
                 error_responses.push(SdkErrorResponse {
                     operation_id: op.id.clone(),
@@ -379,6 +416,7 @@ impl SdkModel {
                     overrides_global: op.security_overrides_global,
                 },
                 request_schema,
+                request_bodies,
                 response_schemas,
                 success_responses,
                 error_responses: op_error_responses,
@@ -517,6 +555,14 @@ fn response_model(
         body_schema,
         body_kind: response.body_kind.clone(),
         content_types,
+        headers: response
+            .headers
+            .iter()
+            .map(|header| SdkResponseHeader {
+                name: header.name.clone(),
+                schema: header.schema.clone(),
+            })
+            .collect(),
     })
 }
 
@@ -565,8 +611,8 @@ mod tests {
     use super::{SdkModel, SdkSchemaKind};
     use crate::analyze::facts::FieldMeta;
     use crate::graph::{
-        ApiGraph, Field, Operation, Prim, Response, Schema, SchemaRef, SecurityScheme, SourceSpan,
-        Type,
+        ApiGraph, Field, Operation, Prim, RequestBodyVariant, Response, ResponseHeader, Schema,
+        SchemaRef, SecurityScheme, SourceSpan, Type,
     };
     use crate::sdk::layout::SdkFileLayout;
 
@@ -595,6 +641,7 @@ mod tests {
                 }),
                 request_body_required: true,
                 request_body_content_type: None,
+                request_body_variants: Vec::new(),
                 responses: vec![
                     Response {
                         status: 201,
@@ -604,6 +651,7 @@ mod tests {
                         body_kind: "json".to_string(),
                         content_type: None,
                         content_types: vec!["application/json".to_string()],
+                        headers: Vec::new(),
                     },
                     Response {
                         status: 404,
@@ -613,6 +661,7 @@ mod tests {
                         body_kind: "json".to_string(),
                         content_type: None,
                         content_types: vec!["application/json".to_string()],
+                        headers: Vec::new(),
                     },
                 ],
                 security: Vec::new(),
@@ -667,12 +716,59 @@ mod tests {
     #[test]
     fn sdk_model_is_deterministic_and_carries_layout_metadata() {
         let layout = SdkFileLayout::split().model_dir("models");
-        let a = SdkModel::build(&graph(), "books", "/api", &layout).unwrap();
-        let b = SdkModel::build(&graph(), "books", "/api", &layout).unwrap();
+        let mut graph = graph();
+        graph.operations[0]
+            .request_body_variants
+            .push(RequestBodyVariant {
+                body: SchemaRef {
+                    ref_id: "app.Book".to_string(),
+                },
+                content_type: "multipart/form-data".to_string(),
+            });
+        graph.operations[0].responses[0]
+            .headers
+            .push(ResponseHeader {
+                name: "X-Request-Id".to_string(),
+                schema: Type::Primitive(Prim::String),
+            });
+        graph.operations[0].responses.push(Response {
+            status: 307,
+            body: None,
+            body_kind: "empty".to_string(),
+            content_type: None,
+            content_types: Vec::new(),
+            headers: vec![ResponseHeader {
+                name: "Location".to_string(),
+                schema: Type::Primitive(Prim::String),
+            }],
+        });
+        graph.operations[0]
+            .responses
+            .sort_by_key(|response| response.status);
+        let a = SdkModel::build(&graph, "books", "/api", &layout).unwrap();
+        let b = SdkModel::build(&graph, "books", "/api", &layout).unwrap();
 
         assert_eq!(a, b);
         assert_eq!(a.services[0].name, "Books");
         assert_eq!(a.operations[0].request_schema.as_deref(), Some("Book"));
+        assert_eq!(a.operations[0].request_bodies.len(), 2);
+        assert_eq!(
+            a.operations[0].request_bodies[0].content_type,
+            "application/json"
+        );
+        assert_eq!(
+            a.operations[0].request_bodies[1].content_type,
+            "multipart/form-data"
+        );
+        assert_eq!(
+            a.operations[0].success_responses[0].headers[0].name,
+            "X-Request-Id"
+        );
+        assert_eq!(a.operations[0].success_responses[1].status, 307);
+        assert_eq!(
+            a.operations[0].success_responses[1].headers[0].name,
+            "Location"
+        );
         assert_eq!(a.schemas[0].kind, SdkSchemaKind::Object);
         assert_eq!(a.file_plan.model_dir.as_deref(), Some("models"));
     }

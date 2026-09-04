@@ -55,7 +55,8 @@ The lowerer writes graph-backed OpenAPI facts including:
 
 - `openapi: 3.1.0`, `info`, servers, tags, paths, and operation metadata.
 - Path/query/header/cookie parameters with style, explode, defaults, and requiredness.
-- Request bodies, responses, content types, examples, and descriptions.
+- Request bodies whose media types may reference different schemas, responses, response headers,
+  content types, examples, and descriptions.
 - Component schemas, references, constraints, nullable/union shapes, arrays, maps, and enums.
 - Security schemes plus document- and operation-level requirements.
 - Stable operation IDs and deterministic component/order output.
