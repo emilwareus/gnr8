@@ -11,6 +11,8 @@ import (
 	"github.com/gin-gonic/gin"
 )
 
+const sessionIDHeader = "X-Session-ID"
+
 type Handler struct{}
 
 type LoginRequest struct {
@@ -195,7 +197,7 @@ func (h *Handler) readFile(c *gin.Context) {
 	}
 	c.DataFromReader(http.StatusOK, 12, attachmentContentType(), strings.NewReader("hello"), map[string]string{
 		"Content-Disposition": `attachment; filename="report.pdf"`,
-		"X-Session-ID":        "session-123",
+		sessionIDHeader:       "session-123",
 	})
 }
 
@@ -209,7 +211,8 @@ func sessionHeaderName() string {
 }
 
 func (h *Handler) redirectFile(c *gin.Context) {
-	c.Header("X-Session-ID", "session-123")
+	c.Request.Header.Set("X-Forwarded-Trace", "trace-1")
+	c.Header(sessionIDHeader, "session-123")
 	c.Redirect(http.StatusTemporaryRedirect, "/v1/files/final")
 }
 

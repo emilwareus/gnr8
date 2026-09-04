@@ -2466,3 +2466,150 @@ func extraHeaders() map[string]string { return map[string]string{"X-Computed": "
 		t.Fatalf("constant header names must still be extracted: %+v", staticHeaders)
 	}
 }
+
+// A response header is a fact about what the handler SENDS. `c.Request.Header` and a
+// scratch `http.Header` have the same type as `c.Writer.Header()`, so a type-only
+// predicate states inbound and local headers as part of the outbound contract. Pin the
+// provenance rule in both directions, and pin that a constant map key is as statically
+// known as the string it was declared from.
+func TestResponseHeadersComeOnlyFromTheResponseWriter(t *testing.T) {
+	dir := t.TempDir()
+	mustWrite(t, filepath.Join(dir, "go.mod"), `module example.com/headerprovenance
+
+go 1.22
+
+require github.com/gin-gonic/gin v0.0.0
+
+replace github.com/gin-gonic/gin => ./ginstub
+`)
+	if err := os.Mkdir(filepath.Join(dir, "ginstub"), 0o755); err != nil {
+		t.Fatalf("mkdir ginstub: %v", err)
+	}
+	mustWrite(t, filepath.Join(dir, "ginstub", "go.mod"), "module github.com/gin-gonic/gin\n\ngo 1.22\n")
+	mustWrite(t, filepath.Join(dir, "ginstub", "gin.go"), `package gin
+
+import (
+	"io"
+	"net/http"
+)
+
+type HandlerFunc func(*Context)
+type Engine struct{}
+type Context struct {
+	Request *http.Request
+	Writer  http.ResponseWriter
+}
+
+func (e *Engine) GET(string, HandlerFunc)                                          {}
+func (c *Context) Status(int)                                                      {}
+func (c *Context) DataFromReader(int, int64, string, io.Reader, map[string]string) {}
+`)
+	mustWrite(t, filepath.Join(dir, "app.go"), `package headerprovenance
+
+import (
+	"net/http"
+	"strings"
+
+	"github.com/gin-gonic/gin"
+)
+
+const sessionHeader = "X-Session-ID"
+
+type Server struct{ R *gin.Engine }
+
+func (s Server) Register() {
+	s.R.GET("/request-mutation", s.requestMutation)
+	s.R.GET("/local-map", s.localMap)
+	s.R.GET("/writer", s.writer)
+	s.R.GET("/writer-var", s.writerVar)
+	s.R.GET("/writer-helper", s.writerHelper)
+	s.R.GET("/const-key", s.constKey)
+}
+
+func (s Server) requestMutation(c *gin.Context) {
+	c.Request.Header.Set("X-Request-Set", "v")
+	c.Request.Header.Add("X-Request-Add", "v")
+	c.Status(http.StatusNoContent)
+}
+
+func (s Server) localMap(c *gin.Context) {
+	local := http.Header{}
+	local.Set("X-Local", "v")
+	c.Status(http.StatusNoContent)
+}
+
+func (s Server) writer(c *gin.Context) {
+	c.Writer.Header().Set("X-Writer", "v")
+	c.Status(http.StatusNoContent)
+}
+
+func (s Server) writerVar(c *gin.Context) {
+	out := c.Writer.Header()
+	out.Set("X-Writer-Var", "v")
+	c.Status(http.StatusNoContent)
+}
+
+func (s Server) writerHelper(c *gin.Context) {
+	tag(c.Writer)
+	c.Status(http.StatusNoContent)
+}
+
+func tag(w http.ResponseWriter) { w.Header().Set("X-Writer-Helper", "v") }
+
+func (s Server) constKey(c *gin.Context) {
+	c.DataFromReader(http.StatusOK, 5, "text/plain", strings.NewReader("hello"), map[string]string{
+		sessionHeader: "v",
+	})
+}
+`)
+
+	res, err := load.Load(dir)
+	if err != nil {
+		t.Fatalf("load header provenance fixture: %v", err)
+	}
+	diagnostics := diag.New()
+	analyzer := handlers.NewAnalyzer(res, "example.com/headerprovenance", diagnostics)
+	analyzed := map[string]handlers.CodeFacts{}
+	for _, route := range routes.Recognize(res) {
+		analyzed[route.Handler] = analyzer.Analyze(route, diagnostics)
+	}
+
+	headerNames := func(handler string) map[string]bool {
+		out := map[string]bool{}
+		for _, response := range analyzed[handler].Responses {
+			for _, header := range response.Headers {
+				out[header.Name] = true
+			}
+		}
+		return out
+	}
+
+	// A header the handler only reads or keeps locally is not part of what it sends.
+	for _, handler := range []string{"requestMutation", "localMap"} {
+		if names := headerNames(handler); len(names) != 0 {
+			t.Fatalf("%s writes no response header, got %+v", handler, names)
+		}
+	}
+	// Every shape that provably reaches the response writer stays a response fact.
+	for handler, want := range map[string]string{
+		"writer":       "X-Writer",
+		"writerVar":    "X-Writer-Var",
+		"writerHelper": "X-Writer-Helper",
+	} {
+		if names := headerNames(handler); !names[want] {
+			t.Fatalf("%s must declare %s, got %+v", handler, want, names)
+		}
+	}
+	// A named constant key is statically known, so it is extracted, not diagnosed.
+	if names := headerNames("constKey"); !names[sessionHeaderConstant] {
+		t.Fatalf("constant map keys must resolve, got %+v", names)
+	}
+	for _, item := range diagnostics.Items() {
+		if item.Code == "response.header.unresolved" {
+			t.Fatalf("a constant header name must not be diagnosed: %+v", item)
+		}
+	}
+}
+
+// The header name the provenance fixture declares as a Go constant.
+const sessionHeaderConstant = "X-Session-ID"

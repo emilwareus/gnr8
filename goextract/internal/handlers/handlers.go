@@ -3565,7 +3565,7 @@ func (c *responseHeaderCollector) analyzeNodeCalls(
 			}
 			return true
 		}
-		if responseHeaderMutation(frame.decl, call) {
+		if responseHeaderMutation(frame, call) {
 			if header, ok := frameCallStringArg(frame, call, 0); ok {
 				addResponseHeader(headers, header)
 			} else {
@@ -3621,7 +3621,7 @@ func (c *responseHeaderCollector) recordGinResponse(
 			addResponseHeader(responseHeaders, "Content-Length")
 		}
 		if len(call.Args) > 4 {
-			extra, resolved := stringMapLiteralKeys(call.Args[4])
+			extra, resolved := stringMapLiteralKeys(frame, call.Args[4])
 			for _, header := range extra {
 				addResponseHeader(responseHeaders, header)
 			}
@@ -3709,9 +3709,12 @@ func nonNegativeIntegerConstant(info *gotypes.Info, expr ast.Expr) bool {
 
 // stringMapLiteralKeys reads the keys of a literal string map. The second result
 // reports whether the whole map was readable: an explicit nil states "no extra
-// headers", a literal with literal keys states exactly those, and anything else
-// is a name typed source cannot state.
-func stringMapLiteralKeys(expr ast.Expr) ([]string, bool) {
+// headers", a literal whose keys evaluate to constants states exactly those, and
+// anything else is a name typed source cannot state.
+//
+// Keys go through the frame's constant evaluator rather than a literal-only read,
+// so a named constant is as statically known as the string it was declared from.
+func stringMapLiteralKeys(frame helperFrame, expr ast.Expr) ([]string, bool) {
 	if isNilIdent(expr) {
 		return nil, true
 	}
@@ -3727,7 +3730,7 @@ func stringMapLiteralKeys(expr ast.Expr) ([]string, bool) {
 			resolved = false
 			continue
 		}
-		if key, ok := stringKey(pair.Key); ok {
+		if key, ok := frameStringValue(frame, pair.Key); ok {
 			keys = append(keys, key)
 		} else {
 			resolved = false
@@ -3736,12 +3739,78 @@ func stringMapLiteralKeys(expr ast.Expr) ([]string, bool) {
 	return keys, resolved
 }
 
-func responseHeaderMutation(h handlerDecl, call *ast.CallExpr) bool {
+// responseHeaderMutation reports whether call writes a header on the map the
+// response is actually sent with.
+//
+// The receiver's type is a necessary condition, never a sufficient one:
+// `c.Request.Header` and a local `http.Header` have exactly the same type as
+// `c.Writer.Header()`, so classifying by type alone states inbound and scratch
+// headers as part of the outbound contract. The map has to be provably the
+// writer's own.
+func responseHeaderMutation(frame helperFrame, call *ast.CallExpr) bool {
 	selector, ok := call.Fun.(*ast.SelectorExpr)
 	if !ok || selector.Sel == nil || (selector.Sel.Name != "Set" && selector.Sel.Name != "Add") {
 		return false
 	}
-	return isNamedType(h.info.TypeOf(selector.X), "net/http", "Header")
+	if !isNamedType(frameTypeOf(frame, selector.X), "net/http", "Header") {
+		return false
+	}
+	return responseWriterHeaderExpr(frame, selector.X)
+}
+
+// responseWriterHeaderExpr reports whether expr is a response writer's own header
+// map: either `<writer>.Header()` directly, or a variable bound to one.
+func responseWriterHeaderExpr(frame helperFrame, expr ast.Expr) bool {
+	switch node := expr.(type) {
+	case *ast.ParenExpr:
+		return responseWriterHeaderExpr(frame, node.X)
+	case *ast.CallExpr:
+		return isResponseWriterHeaderCall(frame, node)
+	case *ast.Ident:
+		if frame.decl.info == nil {
+			return false
+		}
+		object := frame.decl.info.ObjectOf(node)
+		return object != nil && responseWriterHeaderVars(frame)[object]
+	}
+	return false
+}
+
+func isResponseWriterHeaderCall(frame helperFrame, call *ast.CallExpr) bool {
+	selector, ok := call.Fun.(*ast.SelectorExpr)
+	if !ok || selector.Sel == nil || selector.Sel.Name != "Header" || len(call.Args) != 0 {
+		return false
+	}
+	writer := frameTypeOf(frame, selector.X)
+	return isNamedType(writer, "net/http", "ResponseWriter") ||
+		isNamedType(writer, routes.GinPkgPath, "ResponseWriter")
+}
+
+// responseWriterHeaderVars collects the variables bound to a response writer's
+// header map, so the `h := c.Writer.Header(); h.Set(…)` idiom stays a response
+// fact while an unrelated `http.Header` value does not.
+func responseWriterHeaderVars(frame helperFrame) map[gotypes.Object]bool {
+	vars := map[gotypes.Object]bool{}
+	if frame.decl.decl == nil || frame.decl.decl.Body == nil || frame.decl.info == nil {
+		return vars
+	}
+	ast.Inspect(frame.decl.decl.Body, func(node ast.Node) bool {
+		assign, ok := node.(*ast.AssignStmt)
+		if !ok || len(assign.Rhs) != 1 || len(assign.Lhs) != 1 {
+			return true
+		}
+		call, ok := assign.Rhs[0].(*ast.CallExpr)
+		if !ok || !isResponseWriterHeaderCall(frame, call) {
+			return true
+		}
+		if ident, ok := assign.Lhs[0].(*ast.Ident); ok && ident.Name != "_" {
+			if object := frame.decl.info.ObjectOf(ident); object != nil {
+				vars[object] = true
+			}
+		}
+		return true
+	})
+	return vars
 }
 
 func frameCallPassesResponseContext(frame helperFrame, call *ast.CallExpr) bool {

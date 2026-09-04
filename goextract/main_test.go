@@ -135,6 +135,8 @@ func TestGinContractRegressionFacts(t *testing.T) {
 	assertBodylessStatus(t, redirect, 307)
 	assertResponseHeader(t, redirect, 307, "Location")
 	assertResponseHeader(t, redirect, 307, "X-Session-ID")
+	// The same handler mutates a REQUEST header. Only what it sends is a response fact.
+	assertNoResponseHeader(t, redirect, 307, "X-Forwarded-Trace")
 	helperRedirect := routeByHandler(t, doc, "helperRedirectFile")
 	assertBodylessStatus(t, helperRedirect, 302)
 	assertResponseHeader(t, helperRedirect, 302, "Location")

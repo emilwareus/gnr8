@@ -51,8 +51,11 @@ Recognized route facts include:
 - JSON responses, response status/media facts, constant redirects, response headers, Go structs,
   nested types, and string enums. Redirect status values passed through bounded helpers are resolved
   at each call site, and response headers are associated only with statuses reached on paths where
-  those headers were written. A header written under a name that is not a constant is omitted and
-  reported as `response.header.unresolved` rather than guessed.
+  those headers were written. A response header is read from the response writer's own map —
+  `c.Header`, `c.Writer.Header()`, or a bounded `http.ResponseWriter` helper — so mutating
+  `c.Request.Header` or a local `http.Header` states nothing about the response. A header written
+  under a name that is not a constant is omitted and reported as `response.header.unresolved`
+  rather than guessed; a named constant resolves like the string it was declared from.
 - Independent inbound/outbound presence and null behavior for Go fields.
 
   On a `json:`-tagged field (or one with no payload tag), outbound presence is the omission option —
