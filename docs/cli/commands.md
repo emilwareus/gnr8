@@ -138,6 +138,10 @@ case-sensitive matching standard OpenAPI tag from that scope; it is repeatable, 
 operations remain checked. Findings are always reported, including exempt ones. Schema findings use
 their most checked transitive consumer on each graph side.
 
+`ConfigurePagination` and `ConfigureSdkRuntime` policy is not yet compared, so a change to
+pagination, retry, or timeout configuration alters generated SDK methods without producing a
+finding.
+
 `--markdown` prints the same report as a Markdown block for a job summary or a pull-request
 comment: the base revision, the exempt-tag policy, the summary counts, and the findings in an
 indented code block with their affected SDK operations and source locations. It selects the report
