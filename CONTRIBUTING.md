@@ -18,6 +18,8 @@ The complete test suite uses these tools:
 - Go, for the Go extractor and Go SDK tests.
 - Python 3, for the Python extractor and generated SDK tests.
 - Node and npm, for the TypeScript extractor tests.
+- Ruby, for the YAML emitter cross-parser test (any 3.x with stdlib Psych; the test skips
+  automatically when `ruby` is not on `PATH`).
 
 Restore the TypeScript test toolchain:
 

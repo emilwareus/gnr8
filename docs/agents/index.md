@@ -37,6 +37,9 @@ gnr8 check
 3. Generate and inspect diagnostics before accepting output.
 4. Commit `.gnr8/Cargo.toml`, `.gnr8/Cargo.lock`, pipeline source, and generated artifacts.
 5. Gate pull requests with `gnr8 check` or the gnr8 GitHub Action.
+6. On API-shape PRs, add `gnr8 changes --base <ref>` (repeat `--exempt-tag <name>` for
+   non-contract operations carrying that standard OpenAPI tag). Exit `1` means a checked breaking
+   change; see [CLI command reference](../cli/commands.md).
 
 ## Mental model
 
