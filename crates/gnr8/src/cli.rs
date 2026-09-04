@@ -94,6 +94,12 @@ pub(crate) enum Commands {
         /// Exact, case-sensitive operation tag to exempt from the breaking-change gate.
         #[arg(long, value_parser = non_empty_tag)]
         exempt_tag: Vec<String>,
+
+        /// Print the report as Markdown for a job summary or pull-request comment.
+        ///
+        /// Selects the report format, so it cannot be combined with the global --json.
+        #[arg(long)]
+        markdown: bool,
     },
     /// Explain inferred API facts and diagnostics.
     Inspect {
@@ -240,7 +246,8 @@ mod tests {
             cli.command,
             Commands::Changes {
                 base,
-                exempt_tag
+                exempt_tag,
+                markdown: false
             } if base == "origin/main" && exempt_tag == ["internal", "beta"]
         ));
         assert!(Cli::try_parse_from(["gnr8", "changes"]).is_err());
@@ -284,6 +291,27 @@ mod tests {
             "partner APIs",
         ])
         .is_ok());
+    }
+
+    #[test]
+    fn changes_parses_the_markdown_report_format() {
+        // Which formats may be combined is `changes::ReportFormat`'s rule, not clap's: `--json` is
+        // global, so a derive-level conflict would only catch the spelling that writes both flags
+        // after the subcommand. Both spellings must parse here and be rejected there.
+        assert!(matches!(
+            Cli::try_parse_from(["gnr8", "changes", "--base", "main", "--markdown"])
+                .unwrap()
+                .command,
+            Commands::Changes { markdown: true, .. }
+        ));
+        let cli =
+            Cli::try_parse_from(["gnr8", "--json", "changes", "--base", "main", "--markdown"])
+                .unwrap();
+        assert!(cli.json);
+        assert!(matches!(
+            cli.command,
+            Commands::Changes { markdown: true, .. }
+        ));
     }
 
     #[test]

@@ -54,7 +54,11 @@ fn run() -> Result<()> {
         Commands::Guide { topic } => run_guide(*topic, output),
         Commands::Generate { force } => run_generate(*force, policy, output),
         Commands::Check => run_check(policy, output),
-        Commands::Changes { base, exempt_tag } => run_changes(base, exempt_tag, policy, output),
+        Commands::Changes {
+            base,
+            exempt_tag,
+            markdown,
+        } => run_changes(base, exempt_tag, *markdown, policy, output),
         Commands::Watch { debounce_ms } => run_watch(*debounce_ms, policy, output),
         Commands::Doctor => run_doctor(policy, output),
     }
@@ -65,9 +69,18 @@ fn run() -> Result<()> {
 fn run_changes(
     base_reference: &str,
     exempt_tags: &[String],
+    markdown: bool,
     policy: WorkerPolicy,
     output: Output,
 ) -> Result<()> {
+    // Markdown is a report a machine publishes, exactly like JSON: stdout carries the document and
+    // nothing else, so progress, verbose prose and the diagnostic summary are suppressed for both.
+    let format = changes::ReportFormat::select(output.json, markdown)?;
+    let output = if format.suppresses_prose() {
+        output.machine()
+    } else {
+        output
+    };
     let root = project_root()?;
     let total_start = Instant::now();
     output.verbose(format!("changes: loading base {base_reference}"));
@@ -94,13 +107,15 @@ fn run_changes(
     let exempt_tags: std::collections::BTreeSet<String> = exempt_tags.iter().cloned().collect();
     let report = gnr8_engine::changes::diff_graphs(&base.graph, &current.graph, &exempt_tags);
     print_diagnostics(output, &run.outcome.diagnostics);
-    if output.json {
-        print!("{}", changes::render_json(&base, &report)?);
-    } else {
-        print!("{}", changes::render_human(&report));
-        output.verbose(format!("base resolved: {}", base.commit));
-        output.verbose(format!("worker: {}", run.worker_origin.label()));
-        output.verbose(format!("total: {}", fmt_duration(total_start.elapsed())));
+    match format {
+        changes::ReportFormat::Markdown => print!("{}", changes::render_markdown(&base, &report)),
+        changes::ReportFormat::Json => print!("{}", changes::render_json(&base, &report)?),
+        changes::ReportFormat::Human => {
+            print!("{}", changes::render_human(&report));
+            output.verbose(format!("base resolved: {}", base.commit));
+            output.verbose(format!("worker: {}", run.worker_origin.label()));
+            output.verbose(format!("total: {}", fmt_duration(total_start.elapsed())));
+        }
     }
     if report.is_gating() {
         std::io::stdout().flush()?;
@@ -141,6 +156,11 @@ struct Output {
 impl Output {
     fn new(json: bool, verbose: u8) -> Self {
         Self { json, verbose }
+    }
+
+    /// Suppress human prose because stdout carries one machine-readable document.
+    fn machine(self) -> Self {
+        Self { json: true, ..self }
     }
 
     fn progress(self, message: impl AsRef<str>) {

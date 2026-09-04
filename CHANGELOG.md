@@ -39,6 +39,10 @@ must move the minor version.
   checked breaking finding exists. Exact standard operation tags can exempt a finding only when
   every extant side is exempt; schema scope follows all transitive consumers independently on both
   graphs.
+- **`gnr8 changes --markdown` prints the report as Markdown.** It carries the base revision, the
+  exempt-tag policy, the summary counts, and every finding with its affected SDK operations and
+  source location, ready for a job summary or a pull-request comment. It selects the report format,
+  so it cannot be combined with `--json`.
 - **The GitHub Action can publish API-change reports.** `report-api-changes`, `base-ref`, and
   `exempt-tags` add Markdown/JSON artifacts, a job summary, a marker-owned pull-request comment when
   permitted, and a final checked-breaking gate.

@@ -286,7 +286,7 @@ Action inputs:
 | `cache-key-prefix` | `gnr8` | cache-key prefix |
 | `setup-rust` / `rust-toolchain` | `true` / `auto` | generator toolchain; `auto` honors a repository-root `rust-toolchain.toml` (or `rust-toolchain`) pin and installs `stable` when there is none |
 | `setup-go` / `go-version` | `false` / `stable` | Go source toolchain |
-| `setup-python` / `python-version` | `false` / `3.x` | Python source toolchain; change reporting provisions Python regardless because its safe Markdown renderer requires it |
+| `setup-python` / `python-version` | `false` / `3.x` | Python source toolchain |
 | `setup-node` / `node-version` | `false` / `lts/*` | NestJS source toolchain |
 
 Outputs are `binary` (resolved executable path) and `cache-hit`.
@@ -296,6 +296,9 @@ base history fails with an error that names this requirement. The action writes 
 report with affected SDK operations and current source locations to the job summary, uploads the
 Markdown and JSON reports, and creates or updates its marker-owned pull-request comment when the
 workflow token permits comments. A comment permission failure does not hide or weaken the gate.
+
+Both reports are rendered by `gnr8 changes` itself — `--json` and `--markdown` — so the published
+Markdown is the CLI's own output rather than a second rendering of the JSON.
 
 The release installer rejects `latest`: generated checks must use an exact version. `version: lock`
 uses `cargo tree --locked` to find the direct normal `gnr8` dependency. Every working directory must

@@ -124,6 +124,7 @@ gnr8 check      # CI: fail on uncommitted generated drift
 gnr8 changes --base origin/main
 gnr8 changes --base origin/main --exempt-tag internal --exempt-tag beta
 gnr8 --json changes --base origin/main
+gnr8 changes --base origin/main --markdown
 ```
 
 Runs the current project pipeline without writing, then compares its projected graph with
@@ -136,6 +137,12 @@ when it is in the checked scope. `--exempt-tag` removes operations carrying an e
 case-sensitive matching standard OpenAPI tag from that scope; it is repeatable, and untagged
 operations remain checked. Findings are always reported, including exempt ones. Schema findings use
 their most checked transitive consumer on each graph side.
+
+`--markdown` prints the same report as a Markdown block for a job summary or a pull-request
+comment: the base revision, the exempt-tag policy, the summary counts, and the findings in an
+indented code block with their affected SDK operations and source locations. It selects the report
+format, so it cannot be combined with `--json`. The GitHub Action publishes this output rather than
+formatting one of its own.
 
 JSON contains the requested and resolved base revision, sorted exempt-tag policy, summary counts,
 and deterministically sorted changes with stable dotted codes, effective tags and exemption state

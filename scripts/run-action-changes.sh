@@ -9,7 +9,34 @@ set -euo pipefail
 : "${GITHUB_OUTPUT:?GITHUB_OUTPUT is required}"
 : "${GITHUB_STEP_SUMMARY:?GITHUB_STEP_SUMMARY is required}"
 
+# The per-project heading is the only report text this script writes; everything under it comes from
+# `gnr8 changes --markdown`, which is the one renderer for that format. The directory lands in a
+# Markdown document outside a code block, so it is escaped the way the CLI escapes what it puts there.
+escape_html() {
+  printf '%s' "$1" | sed -e 's/&/\&amp;/g' -e 's/</\&lt;/g' -e 's/>/\&gt;/g' \
+    -e 's/"/\&quot;/g' -e "s/'/\&#x27;/g"
+}
+
+# Run one report for $dir into $1 and hand back the gate status. Only 0 and 1 are gate answers; any
+# other status is a failed analysis and stops the whole step.
+report() {
+  local destination="$1"
+  shift
+  local status=0
+  (cd "$dir" && "$GNR8_BIN" "$@") > "$destination" 2> "$stderr" || status=$?
+  if [[ -s "$stderr" ]]; then
+    cat "$stderr" >&2
+  fi
+  if [[ "$status" -ne 0 && "$status" -ne 1 ]]; then
+    echo "gnr8 action: change analysis failed for '$dir' with status $status" >&2
+    exit "$status"
+  fi
+  return "$status"
+}
+
 report_root="$(mktemp -d "$RUNNER_TEMP/gnr8-api-changes.XXXXXXXX")"
+# Intermediates live outside report_root, which is uploaded verbatim as the run's artifact.
+work_root="$(mktemp -d "$RUNNER_TEMP/gnr8-api-changes-work.XXXXXXXX")"
 combined="$report_root/report.md"
 printf '# gnr8 API changes\n\n' > "$combined"
 
@@ -26,10 +53,10 @@ if [[ "${#dirs[@]}" -eq 0 ]]; then
   exit 2
 fi
 
-# Seeded with the fixed argv so the array is never empty: expanding "${empty[@]}" under `set -u`
-# is an unbound-variable error in bash 3.2, the bash GitHub's macOS runners provide, and the
+# Seeded with the argv both reports share so the array is never empty: expanding "${empty[@]}" under
+# `set -u` is an unbound-variable error in bash 3.2, the bash GitHub's macOS runners provide, and the
 # default configuration (no exempt-tags) appends nothing to it.
-change_args=(--json changes --base "$BASE_REF")
+change_args=(changes --base "$BASE_REF")
 while IFS= read -r tag || [[ -n "$tag" ]]; do
   # Tag matching is exact. Empty lines separate values; every byte on a non-empty line belongs to
   # the OpenAPI tag, including leading/trailing spaces and a leading '#'. The CLI performs the one
@@ -51,89 +78,30 @@ for dir in "${dirs[@]}"; do
   mkdir -p "$project_root"
   json="$project_root/report.json"
   markdown="$project_root/report.md"
+  body="$work_root/$(printf '%03d' "$index").md"
   stderr="$project_root/stderr.txt"
 
   echo "::group::gnr8 changes $dir"
-  set +e
-  (cd "$dir" && "$GNR8_BIN" "${change_args[@]}") > "$json" 2> "$stderr"
-  status=$?
-  set -e
-  if [[ -s "$stderr" ]]; then
-    cat "$stderr" >&2
-  fi
-  if [[ "$status" -ne 0 && "$status" -ne 1 ]]; then
-    echo "gnr8 action: change analysis failed for '$dir' with status $status" >&2
-    exit "$status"
+  # Each format is rendered by the CLI. The Markdown report is a second invocation rather than a
+  # second implementation of the format here: `changes` is deterministic and this run reads the
+  # cache the first one just filled, so it costs a fraction of it and no formatting lives here.
+  status=0
+  report "$json" --json "${change_args[@]}" || status=$?
+  body_status=0
+  report "$body" "${change_args[@]}" --markdown || body_status=$?
+  if [[ "$status" -ne "$body_status" ]]; then
+    echo "gnr8 action: '$dir' reported gate status $status as JSON and $body_status as Markdown" >&2
+    exit 2
   fi
   if [[ "$status" -eq 1 ]]; then
     gating=true
   fi
 
-  python3 - "$json" "$markdown" "$dir" <<'PY'
-import json
-import html
-import pathlib
-import sys
-
-source, destination, project = sys.argv[1:]
-report = json.loads(pathlib.Path(source).read_text(encoding="utf-8"))
-summary = report["summary"]
-tags = report["policy"]["exempt_tags"]
-def one_line(value):
-    return " ".join(str(value).splitlines())
-
-lines = ["<!-- gnr8-api-changes -->", f"## API changes for {html.escape(one_line(project))}", ""]
-lines.append(
-    "Base: <code>{}</code> → <code>{}</code>".format(
-        html.escape(one_line(report["base"]["ref"])),
-        html.escape(one_line(report["base"]["resolved"])),
-    )
-)
-tag_list = ", ".join(f"<code>{html.escape(one_line(tag))}</code>" for tag in tags)
-lines.extend(["", "Exempt tags: " + (tag_list or "none"), ""])
-lines.append(
-    "Summary: {} breaking, {} additive, {} doc-only, {} gating.".format(
-        summary["breaking"], summary["additive"], summary["doc_only"], summary["gating"]
-    )
-)
-lines.append("")
-if not report["changes"]:
-    lines.append("    No API changes.")
-for change in report["changes"]:
-    kind = change["kind"].upper().replace("_", "-")
-    operation = change.get("operation", "-")
-    suffix = ""
-    if kind == "BREAKING" and not change["gating"]:
-        base = change["exempt"]["base"]
-        current = change["exempt"]["current"]
-        if base is True and current is True:
-            suffix = "  (exempt on both sides; not gating)"
-        elif base is True and current is None:
-            suffix = "  (exempt on base side; not gating)"
-        elif base is None and current is True:
-            suffix = "  (exempt on current side; not gating)"
-    safe_operation = one_line(operation)
-    safe_message = one_line(change["message"])
-    lines.append(f"    {kind:<9} {safe_operation:<19} {safe_message}{suffix}")
-    affected = {
-        (item["operation_id"], item["operation"])
-        for side in ("base", "current")
-        for item in (change.get("affected_operations", {}).get(side) or [])
-    }
-    if affected:
-        rendered = ", ".join(
-            f"{one_line(operation_id)} ({one_line(operation)})"
-            for operation_id, operation in sorted(affected)
-        )
-        lines.append(f"        SDK operations: {rendered}")
-    if change.get("file"):
-        location = one_line(change["file"])
-        if change.get("line") is not None:
-            location += f":{change['line']}"
-        lines.append(f"        Source: {location}")
-lines.append("")
-pathlib.Path(destination).write_text("\n".join(lines), encoding="utf-8")
-PY
+  {
+    printf '<!-- gnr8-api-changes -->\n'
+    printf '## API changes for %s\n\n' "$(escape_html "$dir")"
+    cat "$body"
+  } > "$markdown"
 
   cat "$markdown" >> "$combined"
   echo "::endgroup::"
