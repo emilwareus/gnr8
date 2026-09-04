@@ -21,6 +21,15 @@ must move the minor version.
   command's domain gate: generated drift, actionable doctor findings, or checked breaking API
   changes. This aligns the executable with the documented distinction between gate and command
   failure.
+- **Every successful pipeline emits the versioned `generated/gnr8.graph.json` artifact.** It is the
+  sole historical source `gnr8 changes` compares against, so it uses the ordinary generated-output
+  lifecycle and must be committed with the OpenAPI and SDK artifacts. Because the file is new to
+  every project, existing projects must run `gnr8 generate` and commit before `gnr8 check` passes.
+- **`sdk/reference.md` documents an operation's effective tags.** The operation documentation
+  section previously printed only tags a `DocumentOperation` policy set, so an operation that
+  inherits its tags from its group carried none; it now prints the same effective tags OpenAPI and
+  the change gate use, and an operation whose only documented fact is those tags gains a section.
+  Existing projects must run `gnr8 generate` and commit before `gnr8 check` passes.
 
 ### Added
 
@@ -30,8 +39,6 @@ must move the minor version.
   checked breaking finding exists. Exact standard operation tags can exempt a finding only when
   every extant side is exempt; schema scope follows all transitive consumers independently on both
   graphs.
-- **Every successful pipeline emits the versioned `generated/gnr8.graph.json` artifact.** It uses the
-  ordinary generated-output lifecycle and must be committed with the OpenAPI and SDK artifacts.
 - **The GitHub Action can publish API-change reports.** `report-api-changes`, `base-ref`, and
   `exempt-tags` add Markdown/JSON artifacts, a job summary, a marker-owned pull-request comment when
   permitted, and a final checked-breaking gate.
