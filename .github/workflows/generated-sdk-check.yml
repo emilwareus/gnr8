@@ -8,6 +8,12 @@ on:
 permissions:
   contents: read
 
+# Same reason as ci.yml: skipping the registry audit round-trip is what keeps the
+# TypeScript sidecar restore inside the five-minute budget.
+env:
+  NPM_CONFIG_AUDIT: "false"
+  NPM_CONFIG_FUND: "false"
+
 concurrency:
   group: generated-sdk-check-${{ github.workflow }}-${{ github.ref }}
   cancel-in-progress: true
