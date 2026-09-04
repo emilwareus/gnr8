@@ -9,6 +9,8 @@ must move the minor version.
 
 ## Unreleased
 
+## 0.11.0 — 2026-09-04
+
 ### Breaking
 
 - **Operations with more than one request representation now require an explicit typed body selection in generated SDKs.** Go uses `{Operation}Body` wrappers, TypeScript uses a `contentType` union, and Python uses `(Literal[content_type], Model)` tuples.
