@@ -55,7 +55,10 @@ func (c *Client) ListBooks(ctx context.Context, params ListBooksParams, opts ...
 		PathTemplate:         "/books",
 		Idempotent:           false,
 		IdempotencyKeyHeader: "Idempotency-Key",
-		Options:              newRequestOptions(opts...),
+		SuccessStatuses: map[int]bool{
+			200: true,
+		},
+		Options: newRequestOptions(opts...),
 	})
 	if err != nil {
 		return out, err
@@ -132,7 +135,10 @@ func (c *Client) CreateBook(ctx context.Context, in CreateBookRequest, opts ...R
 		PathTemplate:         "/books",
 		Idempotent:           false,
 		IdempotencyKeyHeader: "Idempotency-Key",
-		Options:              newRequestOptions(opts...),
+		SuccessStatuses: map[int]bool{
+			201: true,
+		},
+		Options: newRequestOptions(opts...),
 	})
 	if err != nil {
 		return out, err
@@ -209,7 +215,10 @@ func (c *Client) DeleteBook(ctx context.Context, id string, opts ...RequestOptio
 		PathTemplate:         "/books/{id}",
 		Idempotent:           false,
 		IdempotencyKeyHeader: "Idempotency-Key",
-		Options:              newRequestOptions(opts...),
+		SuccessStatuses: map[int]bool{
+			200: true,
+		},
+		Options: newRequestOptions(opts...),
 	})
 	if err != nil {
 		return out, err
@@ -278,7 +287,10 @@ func (c *Client) GetBook(ctx context.Context, id string, opts ...RequestOption) 
 		PathTemplate:         "/books/{id}",
 		Idempotent:           false,
 		IdempotencyKeyHeader: "Idempotency-Key",
-		Options:              newRequestOptions(opts...),
+		SuccessStatuses: map[int]bool{
+			200: true,
+		},
+		Options: newRequestOptions(opts...),
 	})
 	if err != nil {
 		return out, err
@@ -363,7 +375,10 @@ func (c *Client) UpdateBook(ctx context.Context, id string, in UpdateBookRequest
 		PathTemplate:         "/books/{id}",
 		Idempotent:           false,
 		IdempotencyKeyHeader: "Idempotency-Key",
-		Options:              newRequestOptions(opts...),
+		SuccessStatuses: map[int]bool{
+			200: true,
+		},
+		Options: newRequestOptions(opts...),
 	})
 	if err != nil {
 		return out, err

@@ -421,38 +421,7 @@ fn lower_operation(
         .map(|param| lower_parameter(param, ref_to_name))
         .collect::<Result<Vec<_>, crate::CoreError>>()?;
 
-    let request_body = match &op.request_body {
-        Some(body) => {
-            let content_type =
-                op.request_body_content_type
-                    .clone()
-                    .ok_or_else(|| crate::CoreError::Lowering {
-                        message: format!(
-                            "operation '{}' has a request body but no request body content type",
-                            op.id
-                        ),
-                    })?;
-            let mut content_types = docs
-                .map(|policy| policy.request_content_types.clone())
-                .unwrap_or_default();
-            if !content_types.contains(&content_type) {
-                content_types.push(content_type);
-            }
-            content_types.sort();
-            content_types.dedup();
-            Some(RequestBody {
-                required: op.request_body_required,
-                examples: docs
-                    .map(|policy| {
-                        media_examples_for_content_types(&policy.request_examples, &content_types)
-                    })
-                    .unwrap_or_default(),
-                content_types,
-                schema_ref: resolve_ref(&body.ref_id, ref_to_name)?,
-            })
-        }
-        None => None,
-    };
+    let request_body = lower_request_body(op, docs, ref_to_name)?;
 
     let responses = lower_responses(op, docs, ref_to_name)?;
     let operation_security = if let Some(policy) = exact_security {
@@ -522,6 +491,79 @@ fn lower_operation(
         request_body,
         responses,
     })
+}
+
+fn lower_request_body(
+    op: &GraphOp,
+    docs: Option<&OperationDocsPolicy>,
+    ref_to_name: &BTreeMap<&str, &str>,
+) -> Result<Option<RequestBody>, crate::CoreError> {
+    let Some(body) = &op.request_body else {
+        if op.request_body_variants.is_empty() {
+            return Ok(None);
+        }
+        return Err(crate::CoreError::Lowering {
+            message: format!(
+                "operation '{}' declares request body variants without a primary request body",
+                op.id
+            ),
+        });
+    };
+    let content_type =
+        op.request_body_content_type
+            .clone()
+            .ok_or_else(|| crate::CoreError::Lowering {
+                message: format!(
+                    "operation '{}' has a request body but no request body content type",
+                    op.id
+                ),
+            })?;
+    let mut primary_content_types = docs
+        .map(|policy| policy.request_content_types.clone())
+        .unwrap_or_default();
+    if !primary_content_types.contains(&content_type) {
+        primary_content_types.push(content_type);
+    }
+    primary_content_types.sort();
+    primary_content_types.dedup();
+    let primary_ref = resolve_ref(&body.ref_id, ref_to_name)?;
+    let mut contents = primary_content_types
+        .iter()
+        .map(|content_type| model::RequestBodyContent {
+            content_type: content_type.clone(),
+            schema_ref: primary_ref.clone(),
+        })
+        .collect::<Vec<_>>();
+    for variant in &op.request_body_variants {
+        contents.push(model::RequestBodyContent {
+            content_type: variant.content_type.clone(),
+            schema_ref: resolve_ref(&variant.body.ref_id, ref_to_name)?,
+        });
+    }
+    contents.sort_by(|left, right| left.content_type.cmp(&right.content_type));
+    for pair in contents.windows(2) {
+        if pair[0].content_type == pair[1].content_type {
+            return Err(crate::CoreError::Lowering {
+                message: format!(
+                    "operation '{}' declares request media type '{}' more than once",
+                    op.id, pair[0].content_type
+                ),
+            });
+        }
+    }
+    let content_types = contents
+        .iter()
+        .map(|content| content.content_type.clone())
+        .collect::<Vec<_>>();
+    Ok(Some(RequestBody {
+        required: op.request_body_required,
+        examples: docs
+            .map(|policy| {
+                media_examples_for_content_types(&policy.request_examples, &content_types)
+            })
+            .unwrap_or_default(),
+        contents,
+    }))
 }
 
 fn lower_parameter(
@@ -687,6 +729,17 @@ fn lower_response(
                 });
             }
         };
+    let mut headers = resp
+        .headers
+        .iter()
+        .map(|header| {
+            Ok(model::ResponseHeader {
+                name: header.name.clone(),
+                schema: lower_schema_type(&header.schema, ref_to_name, SchemaDirections::RESPONSE)?,
+            })
+        })
+        .collect::<Result<Vec<_>, crate::CoreError>>()?;
+    headers.sort_by(|left, right| left.name.cmp(&right.name));
     Ok((
         resp.status.to_string(),
         ResponseObj {
@@ -703,6 +756,7 @@ fn lower_response(
             content_types,
             binary,
             event_stream,
+            headers,
         },
     ))
 }

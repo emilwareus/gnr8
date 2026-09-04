@@ -21,11 +21,31 @@ const (
 	categoryRequestBody      = "request_body"
 	categoryResponse         = "response"
 	categorySchema           = "schema"
+	categorySecurity         = "security"
 )
 
 // Accumulator collects DiagnosticFact values during extraction.
 type Accumulator struct {
 	items []facts.DiagnosticFact
+}
+
+// AuthorizationSecurityMissing records an implementation read of the
+// Authorization header. Typed source cannot state the corresponding security
+// scheme, so the final graph resolves this warning only when user code applies
+// an Authorization-carrying scheme to the operation.
+func (a *Accumulator) AuthorizationSecurityMissing(method, route, file string, line uint32) {
+	a.items = append(a.items, facts.DiagnosticFact{
+		Code:     "security.requirement.missing",
+		Severity: severityWarn,
+		Category: categorySecurity,
+		Message: "Authorization is read by " + method + " " + route +
+			" but typed source cannot express its security scheme; configure an Authorization-carrying ApplySecurity transform in .gnr8",
+		File:      file,
+		Line:      line,
+		EndLine:   line,
+		Operation: method + " " + route,
+		Subject:   "Authorization",
+	})
 }
 
 // New returns an empty accumulator.
@@ -172,6 +192,22 @@ func (a *Accumulator) ResponseSchemaUnresolved(method, route, subject, message, 
 func (a *Accumulator) ResponseMediaTypeUnresolved(method, route, reason, file string, line uint32) {
 	a.items = append(a.items, facts.DiagnosticFact{
 		Code:      "response.media_type.unresolved",
+		Severity:  severityWarn,
+		Category:  categoryResponse,
+		Message:   reason,
+		File:      file,
+		Line:      line,
+		EndLine:   line,
+		Operation: method + " " + route,
+	})
+}
+
+// ResponseHeaderUnresolved records a response header the handler writes under a
+// name typed source cannot state. The header is omitted rather than guessed, so
+// the operation identity lets a response override declare it explicitly.
+func (a *Accumulator) ResponseHeaderUnresolved(method, route, reason, file string, line uint32) {
+	a.items = append(a.items, facts.DiagnosticFact{
+		Code:      "response.header.unresolved",
 		Severity:  severityWarn,
 		Category:  categoryResponse,
 		Message:   reason,

@@ -36,7 +36,7 @@ use crate::graph::{
 };
 use crate::sdk::emit_common::{
     error_response_bodies_of, is_json_object_key, join_path, operation_auth_alternatives,
-    operation_prose, path_tokens, path_tokens_match, quoted_string_literal, request_body_model_of,
+    operation_prose, path_tokens, path_tokens_match, quoted_string_literal, request_body_models_of,
     split_words, success_responses_of, ApiKeyLocation, ErrorResponseBody, HttpAuthScheme,
     OperationApiKeyScheme, OperationAuthScheme, RequestBodyEncoding, RequestBodyModel,
     SuccessResponses, UniqueSchemaNames,
@@ -653,6 +653,7 @@ export interface RequestOptions {{
   headers?: Record<string, string>;
   metadata?: Record<string, string>;
   signal?: AbortSignal;
+  followRedirects?: boolean;
 }}
 
 export interface HookContext {{
@@ -664,6 +665,7 @@ export interface HookContext {{
   requestMetadata: Record<string, string>;
   status?: number;
   responseHeaders?: Headers;
+  opaqueRedirect?: boolean;
 }}
 
 export type RequestHook = (
@@ -701,6 +703,7 @@ interface RuntimeRequestContext {{
   pathTemplate: string;
   idempotent?: boolean;
   idempotencyKeyHeader?: string;
+  successStatuses?: readonly number[];
 }}
 
 interface AuthRequirement {{
@@ -971,6 +974,7 @@ export class Client {{
         method,
         headers,
         body: bodyPayload ?? null,
+        redirect: options.followRedirects === true ? \"follow\" : \"manual\",
         signal:
           signals.length > 1 ? AbortSignal.any(signals) : (signals[0] ?? null),
       }};
@@ -1025,8 +1029,15 @@ export class Client {{
       if (response === undefined) {{
         throw new Error(\"request failed without response\");
       }}
+      const opaqueRedirect =
+        response.type === \"opaqueredirect\" &&
+        options.followRedirects !== true &&
+        (context.successStatuses ?? []).some(
+          (status) => status >= 300 && status < 400,
+        );
       hookContext.status = response.status;
       hookContext.responseHeaders = response.headers;
+      hookContext.opaqueRedirect = opaqueRedirect;
       try {{
         for (const hook of this.hooks.response) {{
           await hook(hookContext, response);
@@ -1053,7 +1064,11 @@ export class Client {{
         await this._waitBeforeRetry(delayMs, options.signal, hookContext);
         continue;
       }}
-      if (response.status < 200 || response.status >= 300) {{
+      if (
+        (response.status < 200 || response.status >= 300) &&
+        !(context.successStatuses ?? []).includes(response.status) &&
+        !opaqueRedirect
+      ) {{
         const error = new ApiError(response.status, {{
           headers: response.headers,
           requestId: response.headers.get(\"x-request-id\") ?? undefined,
@@ -1191,8 +1206,8 @@ fn ts_operation_runtime<'a>(graph: &'a ApiGraph, op: &Operation) -> TsOperationR
 /// - interpolates each path param through `encodeURIComponent(String(value))` (V5 path-injection
 ///   mitigation — twin of Go `url.PathEscape` / Python `urllib.quote(safe='')`); builds the query with a
 ///   `URLSearchParams`; joins `base_path` + `op.path`;
-/// - dispatches through `this._request`, throws `ApiError` for non-2xx responses, and returns decoded
-///   JSON only for success statuses that declare a body model.
+/// - dispatches through `this._request`, throws `ApiError` for rejected responses, and returns decoded
+///   JSON only for accepted statuses that declare a body model.
 ///
 /// # Errors
 ///
@@ -1275,8 +1290,12 @@ pub(crate) fn emit_operation_module(
     // erased at compile time, exactly like the `Client`/`RequestOptions` imports beside them.
     let mut client_types = vec!["Client".to_string(), "RequestOptions".to_string()];
     for op in ops {
-        if ts_operation_shape(op, graph)?.resolved.has_params() {
+        let shape = ts_operation_shape(op, graph)?;
+        if shape.resolved.has_params() {
             client_types.push(operation_params_type_name(op));
+        }
+        if shape.body_models.len() > 1 {
+            client_types.push(operation_body_type_name(op));
         }
     }
     let out = format!(
@@ -1604,6 +1623,10 @@ pub(crate) fn operation_params_type_name(op: &Operation) -> String {
     format!("{}Params", upper_camel_first(&operation_method_name(op)))
 }
 
+fn operation_body_type_name(op: &Operation) -> String {
+    format!("{}Body", upper_camel_first(&operation_method_name(op)))
+}
+
 /// Reject a `{Operation}Params` type name that would be declared twice or shadow another export.
 ///
 /// The params types live in `client.ts` next to `RequestOptions` and are re-exported from `index.ts`
@@ -1617,26 +1640,37 @@ pub(crate) fn operation_params_type_name(op: &Operation) -> String {
 fn check_params_type_names(graph: &ApiGraph, ops: &[&Operation]) -> Result<(), CoreError> {
     let mut seen: BTreeMap<String, &str> = BTreeMap::new();
     for op in ops {
-        if !ts_operation_shape(op, graph)?.resolved.has_params() {
-            continue;
+        let shape = ts_operation_shape(op, graph)?;
+        let mut names = Vec::new();
+        if shape.resolved.has_params() {
+            names.push(operation_params_type_name(op));
         }
-        let name = operation_params_type_name(op);
-        if graph.schemas.iter().any(|schema| schema.name == name) {
-            return Err(CoreError::SdkGen {
-                message: format!(
-                    "operation '{}' emits TypeScript params type '{name}', which collides with an \
-                     existing exported symbol",
-                    op.id
-                ),
-            });
+        if shape.body_models.len() > 1 {
+            names.push(operation_body_type_name(op));
         }
-        if let Some(existing) = seen.insert(name.clone(), op.id.as_str()) {
-            return Err(CoreError::SdkGen {
-                message: format!(
-                    "operations '{existing}' and '{}' both emit TypeScript params type '{name}'",
-                    op.id
-                ),
-            });
+        for name in names {
+            let label = if name.ends_with("Params") {
+                "params"
+            } else {
+                "request"
+            };
+            if graph.schemas.iter().any(|schema| schema.name == name) {
+                return Err(CoreError::SdkGen {
+                    message: format!(
+                        "operation '{}' emits TypeScript {label} type '{name}', which collides with an \
+                         existing exported symbol",
+                        op.id
+                    ),
+                });
+            }
+            if let Some(existing) = seen.insert(name.clone(), op.id.as_str()) {
+                return Err(CoreError::SdkGen {
+                    message: format!(
+                        "operations '{existing}' and '{}' both emit TypeScript {label} type '{name}'",
+                        op.id
+                    ),
+                });
+            }
         }
     }
     Ok(())
@@ -1652,7 +1686,32 @@ fn emit_operation_params_types(
     ops: &[&Operation],
 ) -> Result<(), CoreError> {
     for op in ops {
-        let args = ts_operation_shape(op, graph)?.resolved;
+        let shape = ts_operation_shape(op, graph)?;
+        if shape.body_models.len() > 1 {
+            writeln!(out, "\nexport type {} =", operation_body_type_name(op)).map_err(sink)?;
+            for (index, body) in shape.body_models.iter().enumerate() {
+                writeln!(out, "  | {{").map_err(sink)?;
+                writeln!(
+                    out,
+                    "      contentType: {};",
+                    quoted_string_literal(&body.content_type)
+                )
+                .map_err(sink)?;
+                writeln!(
+                    out,
+                    "      value: {};",
+                    ts_request_body_arg_type(body, graph)?
+                )
+                .map_err(sink)?;
+                let terminator = if index + 1 == shape.body_models.len() {
+                    ";"
+                } else {
+                    ""
+                };
+                writeln!(out, "    }}{terminator}").map_err(sink)?;
+            }
+        }
+        let args = shape.resolved;
         if !args.has_params() {
             continue;
         }
@@ -1879,7 +1938,7 @@ fn emit_operation(
 
     let TsOperationShape {
         path_params,
-        body_model,
+        body_models,
         resolved,
     } = ts_operation_shape(op, graph)?;
 
@@ -1927,10 +1986,15 @@ fn emit_operation(
         })
         .collect();
     let return_model = success.body_model.clone();
+    let has_redirect = success
+        .statuses
+        .iter()
+        .any(|status| (300..400).contains(status));
+    let has_empty_wire_outcome = success.has_bodyless_alternative() || has_redirect;
     // A typed body/response references a model symbol re-exported from ./models; reference it through the
     // `models` namespace import so client.ts has no per-name import to compute (determinism).
     let return_ty = if success.has_binary_body() {
-        if success.has_bodyless_alternative() {
+        if has_empty_wire_outcome {
             "Blob | undefined".to_string()
         } else {
             "Blob".to_string()
@@ -1939,7 +2003,7 @@ fn emit_operation(
         return_model.as_ref().map_or_else(
             || "void".to_string(),
             |m| {
-                if success.has_bodyless_alternative() {
+                if has_empty_wire_outcome {
                     format!("models.{m} | undefined")
                 } else {
                     format!("models.{m}")
@@ -1948,14 +2012,8 @@ fn emit_operation(
         )
     };
 
-    let TsOperationArgs { declared: args, .. } = ts_operation_args(
-        op,
-        graph,
-        &path_params,
-        body_model.as_ref(),
-        &resolved,
-        PARAMS_ARG,
-    )?;
+    let TsOperationArgs { declared: args, .. } =
+        ts_operation_args(op, graph, &path_params, &body_models, &resolved, PARAMS_ARG)?;
 
     let ret_promise = if return_model.is_some() || success.has_binary_body() {
         format!("Promise<{return_ty}>")
@@ -2002,7 +2060,8 @@ fn emit_operation(
         &mut body,
         &op.method,
         &success,
-        TsRequestBody::from_body(body_model.as_ref()),
+        TsRequestBody::from_bodies(&body_models),
+        &body_models,
         &auth_headers,
         &auth_http,
         &error_bodies,
@@ -2049,7 +2108,7 @@ fn body_at_style_depth(body: &str, style: OperationEmitStyle) -> String {
 /// the operation (rule 3: one path per fact).
 struct TsOperationShape<'op> {
     path_params: Vec<&'op Param>,
-    body_model: Option<RequestBodyModel>,
+    body_models: Vec<RequestBodyModel>,
     resolved: ResolvedArgs<'op>,
 }
 
@@ -2070,11 +2129,11 @@ fn ts_operation_shape<'op>(
         .iter()
         .filter(|p| p.location != "path" && !fetch_transport_owns_parameter(p))
         .collect();
-    let body_model = request_body_model_of(op, graph)?;
-    let resolved = resolve_op_args(op, &path_params, &request_params, body_model.is_some())?;
+    let body_models = request_body_models_of(op, graph)?;
+    let resolved = resolve_op_args(op, &path_params, &request_params, !body_models.is_empty())?;
     Ok(TsOperationShape {
         path_params,
-        body_model,
+        body_models,
         resolved,
     })
 }
@@ -2103,7 +2162,7 @@ fn ts_operation_args(
     op: &Operation,
     graph: &ApiGraph,
     path_params: &[&Param],
-    body_model: Option<&RequestBodyModel>,
+    body_models: &[RequestBodyModel],
     resolved: &ResolvedArgs,
     params_expr: &str,
 ) -> Result<TsOperationArgs, CoreError> {
@@ -2118,16 +2177,26 @@ fn ts_operation_args(
         forwarded.push(ident.clone());
     }
     let params_type = operation_params_type_name(op);
-    if let Some(body) = body_model.filter(|body| body.required) {
-        declared.push(format!("body: {}", ts_request_body_arg_type(body, graph)?));
+    if let Some(body) = body_models.first().filter(|body| body.required) {
+        let ty = if body_models.len() > 1 {
+            operation_body_type_name(op)
+        } else {
+            ts_request_body_arg_type(body, graph)?
+        };
+        declared.push(format!("body: {ty}"));
         forwarded.push("body".to_string());
     }
     if resolved.params_required() {
         declared.push(format!("{PARAMS_ARG}: {params_type}"));
         forwarded.push(params_expr.to_string());
     }
-    if let Some(body) = body_model.filter(|body| !body.required) {
-        declared.push(format!("body?: {}", ts_request_body_arg_type(body, graph)?));
+    if let Some(body) = body_models.first().filter(|body| !body.required) {
+        let ty = if body_models.len() > 1 {
+            operation_body_type_name(op)
+        } else {
+            ts_request_body_arg_type(body, graph)?
+        };
+        declared.push(format!("body?: {ty}"));
         forwarded.push("body".to_string());
     }
     if resolved.has_params() && !resolved.params_required() {
@@ -2404,7 +2473,7 @@ fn ts_pagination_args(
 ) -> Result<TsPaginationArgs, CoreError> {
     let TsOperationShape {
         path_params,
-        body_model,
+        body_models,
         resolved,
     } = ts_operation_shape(op, graph)?;
     let binding = ts_pagination_binding(op, policy, &resolved)?;
@@ -2415,21 +2484,14 @@ fn ts_pagination_args(
         op,
         graph,
         &path_params,
-        body_model.as_ref(),
+        &body_models,
         &resolved,
         PAGE_PARAMS_LOCAL,
     )?;
     let TsOperationArgs {
         forwarded: delegate_call_args,
         ..
-    } = ts_operation_args(
-        op,
-        graph,
-        &path_params,
-        body_model.as_ref(),
-        &resolved,
-        PARAMS_ARG,
-    )?;
+    } = ts_operation_args(op, graph, &path_params, &body_models, &resolved, PARAMS_ARG)?;
     Ok(TsPaginationArgs {
         args,
         page_call_args,
@@ -2967,8 +3029,8 @@ fn unsupported_ts_query_shape(param_name: &str, shape: &str) -> CoreError {
     }
 }
 
-/// Emit the fetch dispatch block: await fetch, reject non-2xx responses, and cast decoded JSON only for
-/// body-bearing success statuses. The request carries a JSON body only for body-bearing ops.
+/// Emit the fetch dispatch block: await fetch, reject unaccepted responses, and cast decoded JSON only
+/// for body-bearing accepted statuses. The request carries a body only for body-bearing ops.
 #[derive(Clone, Copy)]
 enum TsRequestBody {
     None,
@@ -2980,11 +3042,19 @@ enum TsRequestBody {
         encoding: RequestBodyEncoding,
         content_type: &'static str,
     },
+    Multiple {
+        required: bool,
+    },
 }
 
 impl TsRequestBody {
-    fn from_body(body: Option<&crate::sdk::emit_common::RequestBodyModel>) -> Self {
-        match body {
+    fn from_bodies(bodies: &[crate::sdk::emit_common::RequestBodyModel]) -> Self {
+        if bodies.len() > 1 {
+            return Self::Multiple {
+                required: bodies[0].required,
+            };
+        }
+        match bodies.first() {
             Some(body) if body.required => Self::Required {
                 encoding: body.encoding,
                 content_type: ts_static_content_type(&body.content_type),
@@ -3002,19 +3072,22 @@ impl TsRequestBody {
     }
 
     fn is_required(self) -> bool {
-        matches!(self, Self::Required { .. })
+        matches!(
+            self,
+            Self::Required { .. } | Self::Multiple { required: true }
+        )
     }
 
     fn encoding(self) -> Option<RequestBodyEncoding> {
         match self {
-            Self::None => None,
+            Self::None | Self::Multiple { .. } => None,
             Self::Optional { encoding, .. } | Self::Required { encoding, .. } => Some(encoding),
         }
     }
 
     fn content_type(self) -> Option<&'static str> {
         match self {
-            Self::None => None,
+            Self::None | Self::Multiple { .. } => None,
             Self::Optional { content_type, .. } | Self::Required { content_type, .. } => {
                 Some(content_type)
             }
@@ -3126,8 +3199,34 @@ fn ts_multipart_field_type(
 fn emit_error_throw_branch(
     out: &mut String,
     error_bodies: &[ErrorResponseBody],
+    success: &SuccessResponses,
 ) -> Result<(), CoreError> {
-    writeln!(out, "    if (res.status < 200 || res.status >= 300) {{").map_err(sink)?;
+    let redirects = success
+        .statuses
+        .iter()
+        .copied()
+        .filter(|status| (300..400).contains(status))
+        .collect::<Vec<_>>();
+    if redirects.is_empty() {
+        writeln!(out, "    if (res.status < 200 || res.status >= 300) {{").map_err(sink)?;
+    } else {
+        writeln!(out, "    if (").map_err(sink)?;
+        writeln!(out, "      (res.status < 200 || res.status >= 300) &&").map_err(sink)?;
+        writeln!(
+            out,
+            "      !({}) &&",
+            ts_status_match("res.status", &redirects)
+        )
+        .map_err(sink)?;
+        writeln!(out, "      !(").map_err(sink)?;
+        writeln!(
+            out,
+            "        res.type === \"opaqueredirect\" && options?.followRedirects !== true"
+        )
+        .map_err(sink)?;
+        writeln!(out, "      )").map_err(sink)?;
+        writeln!(out, "    ) {{").map_err(sink)?;
+    }
     writeln!(
         out,
         "      const {{ rawBody, jsonBody }} = await this._readErrorBody(res);"
@@ -3162,7 +3261,37 @@ fn emit_error_throw_branch(
 fn emit_ts_request_body_arg(
     out: &mut String,
     request_body: TsRequestBody,
+    bodies: &[RequestBodyModel],
 ) -> Result<&'static str, CoreError> {
+    if matches!(request_body, TsRequestBody::Multiple { .. }) {
+        writeln!(out, "    let requestBody: unknown = undefined;").map_err(sink)?;
+        if !request_body.is_required() {
+            writeln!(out, "    if (body !== undefined) {{").map_err(sink)?;
+        }
+        writeln!(out, "    switch (body.contentType) {{").map_err(sink)?;
+        for body in bodies {
+            writeln!(
+                out,
+                "      case {}:",
+                quoted_string_literal(&body.content_type)
+            )
+            .map_err(sink)?;
+            let value = match body.encoding {
+                RequestBodyEncoding::FormUrlEncoded => "this._formBody(body.value)",
+                RequestBodyEncoding::Multipart => "this._multipartBody(body.value)",
+                RequestBodyEncoding::Json
+                | RequestBodyEncoding::Text
+                | RequestBodyEncoding::Binary => "body.value",
+            };
+            writeln!(out, "        requestBody = {value};").map_err(sink)?;
+            writeln!(out, "        break;").map_err(sink)?;
+        }
+        writeln!(out, "    }}").map_err(sink)?;
+        if !request_body.is_required() {
+            writeln!(out, "    }}").map_err(sink)?;
+        }
+        return Ok("requestBody");
+    }
     let Some(encoding) = request_body.encoding() else {
         return Ok("undefined");
     };
@@ -3211,6 +3340,7 @@ fn emit_op_dispatch(
     method: &str,
     success: &SuccessResponses,
     request_body: TsRequestBody,
+    request_bodies: &[RequestBodyModel],
     auth_headers: &[OperationApiKeyScheme],
     auth_http: &[(String, HttpAuthScheme)],
     error_bodies: &[ErrorResponseBody],
@@ -3218,6 +3348,10 @@ fn emit_op_dispatch(
     graph: &ApiGraph,
     args: &ResolvedArgs,
 ) -> Result<(), CoreError> {
+    let has_redirect = success
+        .statuses
+        .iter()
+        .any(|status| (300..400).contains(status));
     writeln!(out, "    const headers: Record<string, string> = {{}};").map_err(sink)?;
     emit_ts_header_parameters(out, args)?;
     for (idx, header) in auth_headers.iter().enumerate() {
@@ -3265,7 +3399,23 @@ fn emit_op_dispatch(
         }
         writeln!(out, "    }}").map_err(sink)?;
     }
-    if request_body.is_required() {
+    if matches!(request_body, TsRequestBody::Multiple { .. }) {
+        if request_body.is_required() {
+            writeln!(
+                out,
+                "    if (body.contentType !== \"multipart/form-data\") {{"
+            )
+            .map_err(sink)?;
+        } else {
+            writeln!(
+                out,
+                "    if (body !== undefined && body.contentType !== \"multipart/form-data\") {{"
+            )
+            .map_err(sink)?;
+        }
+        writeln!(out, "      headers[\"Content-Type\"] = body.contentType;").map_err(sink)?;
+        writeln!(out, "    }}").map_err(sink)?;
+    } else if request_body.is_required() {
         if request_body.encoding() != Some(RequestBodyEncoding::Multipart) {
             let content_type = request_body.content_type().unwrap_or("application/json");
             writeln!(
@@ -3290,7 +3440,7 @@ fn emit_op_dispatch(
     }
     let runtime = ts_operation_runtime(graph, op);
     let idempotency_header = runtime.idempotency_key_header.unwrap_or("Idempotency-Key");
-    let request_body_arg = emit_ts_request_body_arg(out, request_body)?;
+    let request_body_arg = emit_ts_request_body_arg(out, request_body, request_bodies)?;
     let body_arg = if request_body.is_present() {
         request_body_arg
     } else {
@@ -3321,10 +3471,25 @@ fn emit_op_dispatch(
         quoted_string_literal(idempotency_header)
     )
     .map_err(sink)?;
+    writeln!(
+        out,
+        "        successStatuses: {},",
+        ts_status_array(&success.statuses)
+    )
+    .map_err(sink)?;
     writeln!(out, "      }},").map_err(sink)?;
     writeln!(out, "      options,").map_err(sink)?;
     writeln!(out, "    );").map_err(sink)?;
-    emit_error_throw_branch(out, error_bodies)?;
+    emit_error_throw_branch(out, error_bodies, success)?;
+    if has_redirect {
+        writeln!(
+            out,
+            "    if (res.type === \"opaqueredirect\" && options?.followRedirects !== true) {{"
+        )
+        .map_err(sink)?;
+        writeln!(out, "      return undefined;").map_err(sink)?;
+        writeln!(out, "    }}").map_err(sink)?;
+    }
     if success.has_binary_body() {
         writeln!(
             out,
@@ -3358,11 +3523,23 @@ fn emit_op_dispatch(
 }
 
 fn ts_status_match(expr: &str, statuses: &[u16]) -> String {
+    if statuses.is_empty() {
+        return "false".to_string();
+    }
     statuses
         .iter()
         .map(|status| format!("{expr} === {status}"))
         .collect::<Vec<_>>()
         .join(" || ")
+}
+
+fn ts_status_array(statuses: &[u16]) -> String {
+    let joined = statuses
+        .iter()
+        .map(u16::to_string)
+        .collect::<Vec<_>>()
+        .join(", ");
+    format!("[{joined}]")
 }
 
 /// Emit `index.ts`: re-export `Client`, `ApiError`, and every named model/enum symbol so a consumer can
@@ -3412,8 +3589,12 @@ pub(crate) fn emit_index_with_models(
     // `RequestOptions`. Sorted, so index.ts stays byte-stable regardless of graph order.
     let mut params_types: Vec<String> = Vec::new();
     for op in &ops {
-        if ts_operation_shape(op, graph)?.resolved.has_params() {
+        let shape = ts_operation_shape(op, graph)?;
+        if shape.resolved.has_params() {
             params_types.push(operation_params_type_name(op));
+        }
+        if shape.body_models.len() > 1 {
+            params_types.push(operation_body_type_name(op));
         }
     }
     params_types.sort();
@@ -4451,6 +4632,7 @@ mod tests {
                 body_kind: "empty".to_string(),
                 content_type: None,
                 content_types: Vec::new(),
+                headers: Vec::new(),
             });
             g.operations[0]
                 .responses

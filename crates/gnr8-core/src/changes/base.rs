@@ -396,6 +396,7 @@ mod tests {
             }),
             request_body_required: true,
             request_body_content_type: None,
+            request_body_variants: Vec::new(),
             responses: Vec::new(),
             security: Vec::new(),
             security_overrides_global: false,
@@ -409,6 +410,7 @@ mod tests {
             body_kind: "json".to_string(),
             content_type: Some("application/json".to_string()),
             content_types: Vec::new(),
+            headers: Vec::new(),
         });
         let graph = ApiGraph {
             operations: vec![operation],

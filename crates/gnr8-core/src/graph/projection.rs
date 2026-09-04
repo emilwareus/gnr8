@@ -110,6 +110,9 @@ pub(crate) fn for_generation(graph: &ApiGraph) -> Result<Cow<'_, ApiGraph>, Core
         if let Some(body) = &mut operation.request_body {
             rewrite_schema_ref(body, SchemaUse::Input, &split);
         }
+        for variant in &mut operation.request_body_variants {
+            rewrite_schema_ref(&mut variant.body, SchemaUse::Input, &split);
+        }
         for param in &mut operation.params {
             param.schema = rewrite_type(&param.schema, Some(SchemaUse::Input), &split)?;
             if let Some(content) = &mut param.openapi_content {
@@ -122,6 +125,9 @@ pub(crate) fn for_generation(graph: &ApiGraph) -> Result<Cow<'_, ApiGraph>, Core
         for response in &mut operation.responses {
             if let Some(body) = &mut response.body {
                 rewrite_schema_ref(body, SchemaUse::Output, &split);
+            }
+            for header in &mut response.headers {
+                header.schema = rewrite_type(&header.schema, Some(SchemaUse::Output), &split)?;
             }
         }
     }

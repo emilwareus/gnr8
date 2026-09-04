@@ -81,6 +81,7 @@ mod tests {
             request_body: None,
             request_body_required: true,
             request_body_content_type: None,
+            request_body_variants: Vec::new(),
             responses: Vec::new(),
             security: Vec::new(),
             security_overrides_global: false,

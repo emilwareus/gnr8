@@ -165,12 +165,16 @@ pub(crate) struct Parameter {
 pub(crate) struct RequestBody {
     /// Whether the body is required.
     pub required: bool,
-    /// Every declared request media type that uses the same schema.
-    pub content_types: Vec<String>,
-    /// The JSON-pointer name of the referenced schema (bare component name).
-    pub schema_ref: String,
+    /// Every declared request media type and its referenced schema.
+    pub contents: Vec<RequestBodyContent>,
     /// Named examples for this media type.
     pub examples: Vec<MediaExample>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize)]
+pub(crate) struct RequestBodyContent {
+    pub content_type: String,
+    pub schema_ref: String,
 }
 
 /// One response keyed by status code.
@@ -190,6 +194,14 @@ pub(crate) struct ResponseObj {
     pub event_stream: bool,
     /// Named examples for this response media type.
     pub examples: Vec<MediaExample>,
+    /// Declared response headers in deterministic name order.
+    pub headers: Vec<ResponseHeader>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize)]
+pub(crate) struct ResponseHeader {
+    pub name: String,
+    pub schema: SchemaObject,
 }
 
 /// One named media example.

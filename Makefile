@@ -74,9 +74,10 @@ gates:
 # the tssdk_compile typecheck). gnr8 ships NO typescript — in real use `tsextract` borrows the user's
 # own `typescript` from the target project (like goextract uses `go`, pyextract uses `python3`). This
 # dev install is gitignored and restored on demand. No-op (and the dependent tests skip gracefully)
-# when node/npm is absent. `npm ci` is offline+reproducible against the committed package-lock.json.
+# when node/npm is absent. `npm ci` is reproducible against the committed package-lock.json; package
+# auditing is intentionally excluded because it is unrelated to restoring this dev-only toolchain.
 tsextract-deps:
-	@command -v npm >/dev/null 2>&1 && (cd tsextract && npm ci --silent) || echo "npm absent — TS tests will skip"
+	@command -v npm >/dev/null 2>&1 && (cd tsextract && npm ci --silent --no-audit) || echo "npm absent — TS tests will skip"
 
 pyextract-test:
 	python3 -m unittest discover pyextract/tests

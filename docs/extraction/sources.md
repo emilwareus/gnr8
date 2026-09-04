@@ -42,11 +42,20 @@ Recognized route facts include:
 - Constant arguments propagated through helper calls.
 - `Param` path parameters.
 - `Query`, `DefaultQuery`, `GetQuery`, array/map query accessors.
-- `GetHeader` and `Request.Header.Get` headers, `Cookie` cookies.
-- `PostForm`, `DefaultPostForm`, `GetPostForm`, and `FormFile` form values.
+- `GetHeader` and `Request.Header.Get` headers, `Cookie` cookies. A read is optional unless the
+  handler or a bounded helper rejects an absent value.
+- `PostForm`, `DefaultPostForm`, `GetPostForm`, and `FormFile` form values. A string part becomes
+  required when an empty value is explicitly rejected; real defaults remain optional.
 - `ShouldBindJSON`/`BindJSON`; generic bind variants for typed form, multipart, query, and header
   structs.
-- JSON responses, response status/media facts, Go structs, nested types, and string enums.
+- JSON responses, response status/media facts, constant redirects, response headers, Go structs,
+  nested types, and string enums. Redirect status values passed through bounded helpers are resolved
+  at each call site, and response headers are associated only with statuses reached on paths where
+  those headers were written. A response header is read from the response writer's own map —
+  `c.Header`, `c.Writer.Header()`, or a bounded `http.ResponseWriter` helper — so mutating
+  `c.Request.Header` or a local `http.Header` states nothing about the response. A header written
+  under a name that is not a constant is omitted and reported as `response.header.unresolved`
+  rather than guessed; a named constant resolves like the string it was declared from.
 - Independent inbound/outbound presence and null behavior for Go fields.
 
   On a `json:`-tagged field (or one with no payload tag), outbound presence is the omission option —
@@ -79,9 +88,16 @@ Recognized route facts include:
   `request.parameter.ambiguous` and neither is applied.
 
 Dynamic route strings are skipped with a diagnostic. A dynamic group prefix is omitted and reported.
-Dynamic parameter names, direct multipart map access, untraversable helpers, or ambiguous handlers are
-reported rather than guessed. Use `gnr8 inspect graph` to identify the exact route/schema before
-adding a transform.
+A multipart form's literal file-map access, such as `form.File["files"]`, is a repeated binary part,
+including when it is reached through nested module-owned or generic helpers. It may coexist with a
+JSON body when the handler selects between media types. A computed file-map key has no bounded
+request shape and is reported rather than guessed. Dynamic parameter names, untraversable helpers,
+and ambiguous handlers are diagnosed for the same reason. An
+`Authorization` read is represented by security configured in the `.gnr8/` crate, never by an
+ordinary header parameter; an unresolved read produces `security.requirement.missing` until a
+matching bearer, basic, or Authorization-header scheme covers the operation.
+
+Use `gnr8 inspect graph` to identify the exact route/schema before adding a transform.
 
 ## FastAPI
 

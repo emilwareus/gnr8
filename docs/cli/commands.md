@@ -140,7 +140,8 @@ their most checked transitive consumer on each graph side.
 
 `ConfigurePagination` and `ConfigureSdkRuntime` policy is not yet compared, so a change to
 pagination, retry, or timeout configuration alters generated SDK methods without producing a
-finding.
+finding. Response headers and the schemas of additional request-body variants are likewise outside
+this comparison; their media types still participate in `request.body.media_type.*`.
 
 `--markdown` prints the same report as a Markdown block for a job summary or a pull-request
 comment: the base revision, the exempt-tag policy, the summary counts, and the findings in an

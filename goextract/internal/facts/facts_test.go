@@ -128,11 +128,11 @@ var canonicalFieldNames = []string{
 	"module", "extractor_toolchain", "routes", "schemas", "diagnostics",
 	// RouteFact ("description" is shared with FieldFact below; "summary" is route-only)
 	"method", "path", "handler", "operation_id", "summary", "group", "middleware", "params",
-	"request_body", "request_body_required", "request_body_content_type", "responses", "span",
+	"request_body", "request_body_required", "request_body_content_type", "request_body_variants", "responses", "span",
 	// ParamFact (name/location/required/schema/span)
 	"name", "location", "required", "schema", "default",
 	// ResponseFact
-	"status", "body", "body_kind", "content_type", "content_types",
+	"status", "body", "body_kind", "content_type", "content_types", "headers",
 	// SchemaFact (id/name/body/span)
 	"id",
 	// FieldFact
@@ -239,10 +239,14 @@ func fullyPopulatedDoc() facts.GoFacts {
 				RequestBody:            &facts.TypeRef{RefID: "internal/dto.UpdateGoalInput"},
 				RequestBodyRequired:    true,
 				RequestBodyContentType: "application/json",
+				RequestBodyVariants: []facts.RequestBodyVariantFact{
+					{Body: facts.TypeRef{RefID: "internal/dto.UpdateGoalForm"}, ContentType: "multipart/form-data"},
+				},
 				Responses: []facts.ResponseFact{
 					{
 						Status: 200, Body: &facts.TypeRef{RefID: "internal/dto.CommandMessage"},
 						BodyKind: "json", ContentType: "application/json", ContentTypes: []string{"application/json"},
+						Headers: []facts.ResponseHeaderFact{{Name: "X-Request-ID", Schema: facts.PrimitiveType(facts.StringPrim())}},
 					},
 				},
 				Span: facts.SourceSpan{File: "http.go", StartLine: 57, EndLine: 57},

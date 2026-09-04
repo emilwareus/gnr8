@@ -55,7 +55,10 @@ func (c *Client) ListTasks(ctx context.Context, params ListTasksParams, opts ...
 		PathTemplate:         "/tasks",
 		Idempotent:           false,
 		IdempotencyKeyHeader: "Idempotency-Key",
-		Options:              newRequestOptions(opts...),
+		SuccessStatuses: map[int]bool{
+			200: true,
+		},
+		Options: newRequestOptions(opts...),
 	})
 	if err != nil {
 		return out, err
@@ -133,7 +136,10 @@ func (c *Client) CreateTask(ctx context.Context, in CreateTaskRequest, opts ...R
 		PathTemplate:         "/tasks",
 		Idempotent:           false,
 		IdempotencyKeyHeader: "Idempotency-Key",
-		Options:              newRequestOptions(opts...),
+		SuccessStatuses: map[int]bool{
+			201: true,
+		},
+		Options: newRequestOptions(opts...),
 	})
 	if err != nil {
 		return out, err
@@ -213,7 +219,10 @@ func (c *Client) DebugTasks(ctx context.Context, opts ...RequestOption) (TaskLis
 		PathTemplate:         "/tasks/_debug",
 		Idempotent:           false,
 		IdempotencyKeyHeader: "Idempotency-Key",
-		Options:              newRequestOptions(opts...),
+		SuccessStatuses: map[int]bool{
+			200: true,
+		},
+		Options: newRequestOptions(opts...),
 	})
 	if err != nil {
 		return out, err
@@ -282,7 +291,10 @@ func (c *Client) DeleteTask(ctx context.Context, id string, opts ...RequestOptio
 		PathTemplate:         "/tasks/{id}",
 		Idempotent:           false,
 		IdempotencyKeyHeader: "Idempotency-Key",
-		Options:              newRequestOptions(opts...),
+		SuccessStatuses: map[int]bool{
+			200: true,
+		},
+		Options: newRequestOptions(opts...),
 	})
 	if err != nil {
 		return out, err
@@ -351,7 +363,10 @@ func (c *Client) GetTask(ctx context.Context, id string, opts ...RequestOption) 
 		PathTemplate:         "/tasks/{id}",
 		Idempotent:           false,
 		IdempotencyKeyHeader: "Idempotency-Key",
-		Options:              newRequestOptions(opts...),
+		SuccessStatuses: map[int]bool{
+			200: true,
+		},
+		Options: newRequestOptions(opts...),
 	})
 	if err != nil {
 		return out, err
@@ -436,7 +451,10 @@ func (c *Client) UpdateTask(ctx context.Context, id string, in UpdateTaskRequest
 		PathTemplate:         "/tasks/{id}",
 		Idempotent:           false,
 		IdempotencyKeyHeader: "Idempotency-Key",
-		Options:              newRequestOptions(opts...),
+		SuccessStatuses: map[int]bool{
+			200: true,
+		},
+		Options: newRequestOptions(opts...),
 	})
 	if err != nil {
 		return out, err

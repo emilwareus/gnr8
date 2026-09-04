@@ -246,6 +246,29 @@ All built-in SDKs share graph semantics for path, query, header, cookie, body, s
 style/explode, `allowReserved`, and defaults. If a generated request differs from the service
 contract, correct the graph parameter/body/security fact rather than patching one emitter.
 
+When an operation accepts more than one request content choice, the call requires an explicit typed
+selection:
+
+- Go emits an `{Operation}Body` interface with one `{Operation}{Media}Body` value type per choice.
+- TypeScript emits a discriminated `{Operation}Body` union keyed by `contentType`.
+- Python accepts a union of `(Literal[content_type], Model)` tuples.
+
+JSON, `application/*+json`, form, multipart, text, and binary choices use the same shared encoding
+classification in every target. Multipart array fields become repeated parts; absent or null fields
+are omitted.
+
+Declared 3xx responses are successful operation outcomes. Generated clients do not follow redirects
+by default. Go, Python, and server-side TypeScript Fetch implementations expose the actual status and
+headers to response hooks. Browser Fetch instead returns an `opaqueredirect` response whose status is
+`0` and whose headers are inaccessible; for an operation with a declared 3xx, TypeScript accepts that
+as an opaque success and sets `HookContext.opaqueRedirect` without inventing a status or `Location`.
+
+Callers opt in per request with `WithFollowRedirects(true)` in Go,
+`{ followRedirects: true }` in TypeScript, or `RequestOptions(follow_redirects=True)` in Python. The
+Python client enforces both policies even when an `OpenerDirector` is injected, and strips
+`Authorization`, `Cookie`, `Proxy-Authorization`, and configured header API-key credentials before a
+cross-origin redirect.
+
 ## Static companion files
 
 `StaticFiles` copies declared files into the artifact set:

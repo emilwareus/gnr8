@@ -1920,6 +1920,12 @@ fn request_content_types(graph: &ApiGraph, operation: &Operation) -> BTreeSet<St
     if let Some(content_type) = &operation.request_body_content_type {
         values.insert(content_type.clone());
     }
+    values.extend(
+        operation
+            .request_body_variants
+            .iter()
+            .map(|variant| variant.content_type.clone()),
+    );
     if let Some(policy) = operation_docs_policy(graph, &operation.id) {
         values.extend(policy.request_content_types.iter().cloned());
     }
@@ -2154,6 +2160,7 @@ mod tests {
             request_body: None,
             request_body_required: true,
             request_body_content_type: None,
+            request_body_variants: Vec::new(),
             responses: Vec::new(),
             security: Vec::new(),
             security_overrides_global: false,
@@ -2357,6 +2364,7 @@ mod tests {
             body_kind: "json".to_string(),
             content_type: Some("application/json".to_string()),
             content_types: Vec::new(),
+            headers: Vec::new(),
         }];
         ApiGraph {
             operations: vec![operation],
@@ -2988,6 +2996,7 @@ mod tests {
             body_kind: "json".to_string(),
             content_type: Some("application/json".to_string()),
             content_types: Vec::new(),
+            headers: Vec::new(),
         }];
         let graph = |schema| ApiGraph {
             operations: vec![response.clone(), request.clone()],
@@ -3335,6 +3344,7 @@ mod tests {
             body_kind: "json".to_string(),
             content_type: None,
             content_types: vec!["application/json".to_string()],
+            headers: Vec::new(),
         }];
 
         let mut current_operation = operation();
@@ -3354,6 +3364,7 @@ mod tests {
             body_kind: "empty".to_string(),
             content_type: None,
             content_types: Vec::new(),
+            headers: Vec::new(),
         }];
 
         let base = ApiGraph {
@@ -3521,6 +3532,7 @@ mod tests {
             body_kind: "json".to_string(),
             content_type: Some("application/json".to_string()),
             content_types: Vec::new(),
+            headers: Vec::new(),
         });
         assert_eq!(
             change(
@@ -3537,6 +3549,7 @@ mod tests {
             body_kind: "empty".to_string(),
             content_type: None,
             content_types: Vec::new(),
+            headers: Vec::new(),
         }];
         current = base.clone();
         current.operations[0].responses[0].body = Some(SchemaRef {

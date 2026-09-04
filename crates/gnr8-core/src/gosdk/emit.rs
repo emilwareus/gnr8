@@ -11,7 +11,7 @@
 //! - [`emit_operations`] — the single generic `operations.go` surface: typed methods on `*Client`,
 //!   `context.Context` first, path params as positional string args, a params struct for query-bearing
 //!   ops, a typed body input; each method marshals the body, builds the request, sets `X-API-Key`,
-//!   decodes 2xx into the success model and non-2xx into an [`APIError`].
+//!   decodes accepted statuses into the success model and rejected statuses into an [`APIError`].
 //! - [`emit_errors`]   — the typed `APIError` (`StatusCode`/`Message`/`Slug`/`Hints`) + `Error()` +
 //!   `IsNotFound()`.
 //!
@@ -31,9 +31,10 @@ use crate::graph::{
 };
 use crate::sdk::emit_common::{
     error_response_bodies_of, join_path, operation_auth_alternatives, operation_prose, path_tokens,
-    path_tokens_match, quoted_string_literal, request_body_model_of, split_words,
+    path_tokens_match, quoted_string_literal, request_body_models_of, split_words,
     success_responses_of, ApiKeyLocation, HttpAuthScheme, OperationApiKeyScheme,
-    OperationAuthScheme, RequestBodyEncoding, SuccessResponses, UniqueSchemaNames,
+    OperationAuthScheme, RequestBodyEncoding, RequestBodyModel, SuccessResponses,
+    UniqueSchemaNames,
 };
 use crate::CoreError;
 
@@ -525,11 +526,10 @@ fn go_struct_field_type(
 
 fn is_multipart_request_schema(graph: &ApiGraph, schema_id: &str) -> Result<bool, CoreError> {
     for operation in &graph.operations {
-        let Some(body) = request_body_model_of(operation, graph)? else {
-            continue;
-        };
-        if body.schema_id == schema_id && body.encoding == RequestBodyEncoding::Multipart {
-            return Ok(true);
+        for body in request_body_models_of(operation, graph)? {
+            if body.schema_id == schema_id && body.encoding == RequestBodyEncoding::Multipart {
+                return Ok(true);
+            }
         }
     }
     Ok(false)
@@ -717,7 +717,7 @@ func WithResponseHook(hook ResponseHook) Option {{
 return func(c *Client) {{ c.responseHooks = append(c.responseHooks, hook) }}
 }}
 
-// WithErrorHook installs a hook that runs for transport failures and final non-2xx responses.
+// WithErrorHook installs a hook that runs for transport failures and final rejected responses.
 func WithErrorHook(hook ErrorHook) Option {{
 return func(c *Client) {{ c.errorHooks = append(c.errorHooks, hook) }}
 }}
@@ -728,6 +728,7 @@ Timeout time.Duration
 MaxRetries *int
 IdempotencyKey string
 Metadata map[string]string
+FollowRedirects bool
 }}
 
 // RequestOption mutates per-request runtime options.
@@ -753,6 +754,11 @@ func WithRequestMetadata(metadata map[string]string) RequestOption {{
 return func(o *RequestOptions) {{ o.Metadata = metadata }}
 }}
 
+// WithFollowRedirects opts one operation call into the transport's redirect behavior.
+func WithFollowRedirects(follow bool) RequestOption {{
+return func(o *RequestOptions) {{ o.FollowRedirects = follow }}
+}}
+
 // RequestContext describes one generated SDK transport attempt.
 type RequestContext struct {{
 OperationID string
@@ -774,6 +780,7 @@ OperationID string
 PathTemplate string
 Idempotent bool
 IdempotencyKeyHeader string
+SuccessStatuses map[int]bool
 Options RequestOptions
 }}
 
@@ -875,7 +882,15 @@ c.callErrorHooks(attemptReq.Context(), ctx, err)
 return nil, err
 }}
 }}
-resp, err := c.httpClient.Do(attemptReq)
+httpClient := c.httpClient
+if !runtime.Options.FollowRedirects {{
+client := *c.httpClient
+client.CheckRedirect = func(_ *http.Request, _ []*http.Request) error {{
+return http.ErrUseLastResponse
+}}
+httpClient = &client
+}}
+resp, err := httpClient.Do(attemptReq)
 if err != nil {{
 lastErr = err
 if attempt < maxRetries && retryBudget > 0 {{
@@ -920,7 +935,7 @@ return nil, err
 }}
 continue
 }}
-if resp.StatusCode < 200 || resp.StatusCode >= 300 {{
+if (resp.StatusCode < 200 || resp.StatusCode >= 300) && !runtime.SuccessStatuses[resp.StatusCode] {{
 c.callErrorHooks(attemptReq.Context(), ctx, &APIError{{StatusCode: resp.StatusCode, Headers: resp.Header.Clone(), RequestID: resp.Header.Get(\"X-Request-ID\")}})
 }}
 if cancel != nil {{
@@ -1081,7 +1096,7 @@ fn go_retry_status_map(runtime: &RuntimePolicy) -> String {
 pub(crate) fn emit_errors(package: &str) -> String {
     let body = format!(
         "\
-// APIError is returned by operation methods on non-2xx responses. It exposes the
+// APIError is returned by operation methods on rejected HTTP responses. It exposes the
 // HTTP status, response metadata, raw body, parsed JSON body, and decoded error body.
 type APIError struct {{
 StatusCode int
@@ -1191,8 +1206,8 @@ return nil
 /// - takes `ctx context.Context` first, then path params as positional `string` args, then a generated
 ///   `<Method>Params` struct for query-bearing ops, then a typed body input;
 /// - marshals the body with `encoding/json`, builds the request to `baseURL + <absolute path>`, sets
-///   `X-API-Key` when the client's apiKey is non-empty, and decodes a 2xx body into the success model
-///   or a non-2xx body into an [`APIError`].
+///   `X-API-Key` when the client's apiKey is non-empty, and decodes an accepted body into the success
+///   model or a rejected body into an [`APIError`].
 ///
 /// `package` is the SDK package name (derived from config, the single source) used in the file frame.
 ///
@@ -1319,6 +1334,7 @@ fn emit_operations_inner(
             writeln!(body).map_err(sink)?;
         }
         first = false;
+        emit_request_body_choice(&mut body, op, graph)?;
         emit_operation(&mut body, op, graph, base_path)?;
         emit_pagination_helpers(&mut body, op, graph)?;
     }
@@ -1339,7 +1355,11 @@ fn emit_operations_inner(
     // Imports the operation bodies themselves name, derived per operation so an encoding whose
     // plumbing lives entirely in the shared helpers contributes nothing here.
     for op in ops {
-        if let Some(model) = request_body_model_of(op, graph)? {
+        let models = request_body_models_of(op, graph)?;
+        if models.len() > 1 {
+            imports.push("fmt");
+        }
+        for model in models {
             imports.extend(request_body_operation_imports(op, model.encoding));
         }
     }
@@ -1528,6 +1548,69 @@ fn emit_operation_doc(
     Ok(())
 }
 
+fn emit_request_body_choice(
+    body: &mut String,
+    op: &Operation,
+    graph: &ApiGraph,
+) -> Result<(), CoreError> {
+    let models = request_body_models_of(op, graph)?;
+    if models.len() < 2 {
+        return Ok(());
+    }
+    let method_name = exported(&op.handler);
+    let choice_name = format!("{method_name}Body");
+    let marker = format!("is{method_name}Body");
+    let variant_names = go_request_body_variant_names(&method_name, &models);
+    writeln!(body, "type {choice_name} interface {{").map_err(sink)?;
+    writeln!(body, "{marker}()").map_err(sink)?;
+    writeln!(body, "}}").map_err(sink)?;
+    for (model, variant_name) in models.iter().zip(&variant_names) {
+        writeln!(body).map_err(sink)?;
+        writeln!(body, "type {variant_name} struct {{").map_err(sink)?;
+        writeln!(body, "Value {}", model.model).map_err(sink)?;
+        writeln!(body, "}}").map_err(sink)?;
+        writeln!(body).map_err(sink)?;
+        writeln!(body, "func ({variant_name}) {marker}() {{}}").map_err(sink)?;
+    }
+    writeln!(body).map_err(sink)?;
+    Ok(())
+}
+
+fn go_request_body_encoding_label(encoding: RequestBodyEncoding) -> &'static str {
+    match encoding {
+        RequestBodyEncoding::Json => "JSON",
+        RequestBodyEncoding::Text => "Text",
+        RequestBodyEncoding::FormUrlEncoded => "Form",
+        RequestBodyEncoding::Multipart => "Multipart",
+        RequestBodyEncoding::Binary => "Binary",
+    }
+}
+
+fn go_request_body_variant_names(method_name: &str, models: &[RequestBodyModel]) -> Vec<String> {
+    let mut names = Vec::with_capacity(models.len());
+    let mut used = BTreeMap::<String, usize>::new();
+    for model in models {
+        let encoding_count = models
+            .iter()
+            .filter(|candidate| candidate.encoding == model.encoding)
+            .count();
+        let label = if encoding_count == 1 {
+            go_request_body_encoding_label(model.encoding).to_string()
+        } else {
+            exported(&model.content_type)
+        };
+        let base = format!("{method_name}{label}Body");
+        let occurrence = used.entry(base.clone()).or_default();
+        *occurrence += 1;
+        if *occurrence == 1 {
+            names.push(base);
+        } else {
+            names.push(format!("{base}Choice{occurrence}"));
+        }
+    }
+    names
+}
+
 #[expect(
     clippy::too_many_lines,
     reason = "operation emission keeps one linear view of the generated method's signature, request, and response contract"
@@ -1568,7 +1651,7 @@ fn emit_operation(
         writeln!(body).map_err(sink)?;
     }
 
-    let body_model = request_body_model_of(op, graph)?;
+    let body_models = request_body_models_of(op, graph)?;
     let success = success_responses_of(op, graph)?;
     let auth_alternatives = operation_auth_alternatives(graph, op)?;
     let auth_schemes = flattened_go_auth_schemes(&auth_alternatives);
@@ -1620,8 +1703,10 @@ fn emit_operation(
     if !request_params.is_empty() {
         args.push(format!("params {method_name}Params"));
     }
-    if let Some(body_model) = &body_model {
-        if body_model.required {
+    if let Some(body_model) = body_models.first() {
+        if body_models.len() > 1 {
+            args.push(format!("in {method_name}Body"));
+        } else if body_model.required {
             args.push(format!("in {}", body_model.model));
         } else {
             args.push(format!("in *{}", body_model.model));
@@ -1961,7 +2046,7 @@ fn go_pagination_args(op: &Operation, graph: &ApiGraph) -> Result<PaginationArgs
     let ordered_path_params = ordered_path_params(op)?;
     let request_params: Vec<&crate::graph::Param> =
         op.params.iter().filter(|p| p.location != "path").collect();
-    let body_model = request_body_model_of(op, graph)?;
+    let body_models = request_body_models_of(op, graph)?;
 
     let mut args = vec!["ctx context.Context".to_string()];
     let mut call_args = vec!["ctx".to_string()];
@@ -1974,8 +2059,10 @@ fn go_pagination_args(op: &Operation, graph: &ApiGraph) -> Result<PaginationArgs
         args.push(format!("params {method_name}Params"));
         call_args.push("params".to_string());
     }
-    if let Some(body_model) = &body_model {
-        if body_model.required {
+    if let Some(body_model) = body_models.first() {
+        if body_models.len() > 1 {
+            args.push(format!("in {method_name}Body"));
+        } else if body_model.required {
             args.push(format!("in {}", body_model.model));
         } else {
             args.push(format!("in *{}", body_model.model));
@@ -2301,13 +2388,15 @@ fn emit_request_dispatch(
     auth_queries: &[OperationApiKeyScheme],
     auth_http: &[(String, HttpAuthScheme)],
 ) -> Result<(), CoreError> {
-    let body_model = request_body_model_of(op, graph)?;
-    let has_body = body_model.is_some();
+    let body_models = request_body_models_of(op, graph)?;
+    let has_body = !body_models.is_empty();
     let has_decode = success.body_model.is_some();
     let has_binary = success.has_binary_body();
 
     // Body marshalling.
-    if let Some(body_info) = &body_model {
+    if body_models.len() > 1 {
+        emit_request_body_choice_encoding(body, op, &body_models)?;
+    } else if let Some(body_info) = body_models.first() {
         if body_info.required {
             emit_required_request_body(body, body_info.encoding)?;
         } else {
@@ -2330,9 +2419,17 @@ fn emit_request_dispatch(
     writeln!(body, "if err != nil {{").map_err(sink)?;
     writeln!(body, "return out, err").map_err(sink)?;
     writeln!(body, "}}").map_err(sink)?;
-    if let Some(body_info) = &body_model {
+    if let Some(body_info) = body_models.first() {
         let content_type = quoted_string_literal(&body_info.content_type);
-        if body_info.required {
+        if body_models.len() > 1 {
+            if body_info.required {
+                writeln!(body, "req.Header.Set(\"Content-Type\", reqContentType)").map_err(sink)?;
+            } else {
+                writeln!(body, "if in != nil {{").map_err(sink)?;
+                writeln!(body, "req.Header.Set(\"Content-Type\", reqContentType)").map_err(sink)?;
+                writeln!(body, "}}").map_err(sink)?;
+            }
+        } else if body_info.required {
             if body_info.encoding == RequestBodyEncoding::Multipart {
                 writeln!(body, "req.Header.Set(\"Content-Type\", reqContentType)").map_err(sink)?;
             } else {
@@ -2537,6 +2634,11 @@ fn emit_request_dispatch(
         quoted_string_literal(idempotency_header)
     )
     .map_err(sink)?;
+    writeln!(body, "SuccessStatuses: map[int]bool{{").map_err(sink)?;
+    for status in &success.statuses {
+        writeln!(body, "{status}: true,").map_err(sink)?;
+    }
+    writeln!(body, "}},").map_err(sink)?;
     writeln!(body, "Options: newRequestOptions(opts...),").map_err(sink)?;
     writeln!(body, "}})").map_err(sink)?;
     writeln!(body, "if err != nil {{").map_err(sink)?;
@@ -2544,12 +2646,27 @@ fn emit_request_dispatch(
     writeln!(body, "}}").map_err(sink)?;
     writeln!(body, "defer resp.Body.Close()").map_err(sink)?;
 
-    // Non-2xx → typed APIError, decoding the graph's actual error model (CR-01).
-    writeln!(
-        body,
-        "if resp.StatusCode < 200 || resp.StatusCode >= 300 {{"
-    )
-    .map_err(sink)?;
+    // Undeclared status → typed APIError, decoding the graph's actual error model (CR-01).
+    let redirects = success
+        .statuses
+        .iter()
+        .copied()
+        .filter(|status| (300..400).contains(status))
+        .collect::<Vec<_>>();
+    if redirects.is_empty() {
+        writeln!(
+            body,
+            "if resp.StatusCode < 200 || resp.StatusCode >= 300 {{"
+        )
+        .map_err(sink)?;
+    } else {
+        writeln!(
+            body,
+            "if (resp.StatusCode < 200 || resp.StatusCode >= 300) && !({}) {{",
+            go_status_match("resp.StatusCode", &redirects)
+        )
+        .map_err(sink)?;
+    }
     emit_error_decode(body, op, graph)?;
     writeln!(body, "}}").map_err(sink)?;
 
@@ -2593,6 +2710,79 @@ fn emit_request_dispatch(
     Ok(())
 }
 
+fn emit_request_body_choice_encoding(
+    body: &mut String,
+    op: &Operation,
+    models: &[RequestBodyModel],
+) -> Result<(), CoreError> {
+    let method_name = exported(&op.handler);
+    let variant_names = go_request_body_variant_names(&method_name, models);
+    writeln!(body, "var reqBody io.Reader").map_err(sink)?;
+    writeln!(body, "var reqContentType string").map_err(sink)?;
+    if !models[0].required {
+        writeln!(body, "if in != nil {{").map_err(sink)?;
+    }
+    writeln!(body, "switch value := in.(type) {{").map_err(sink)?;
+    for (model, variant) in models.iter().zip(&variant_names) {
+        writeln!(body, "case {variant}:").map_err(sink)?;
+        match model.encoding {
+            RequestBodyEncoding::Json => {
+                writeln!(body, "payload, marshalErr := json.Marshal(value.Value)").map_err(sink)?;
+                writeln!(body, "if marshalErr != nil {{").map_err(sink)?;
+                writeln!(body, "return out, marshalErr").map_err(sink)?;
+                writeln!(body, "}}").map_err(sink)?;
+                writeln!(body, "reqBody = bytes.NewReader(payload)").map_err(sink)?;
+            }
+            RequestBodyEncoding::Text => {
+                writeln!(body, "reqBody = strings.NewReader(fmt.Sprint(value.Value))")
+                    .map_err(sink)?;
+            }
+            RequestBodyEncoding::FormUrlEncoded => {
+                writeln!(body, "reader, encodeErr := encodeFormBody(value.Value)").map_err(sink)?;
+                writeln!(body, "if encodeErr != nil {{").map_err(sink)?;
+                writeln!(body, "return out, encodeErr").map_err(sink)?;
+                writeln!(body, "}}").map_err(sink)?;
+                writeln!(body, "reqBody = reader").map_err(sink)?;
+            }
+            RequestBodyEncoding::Multipart => {
+                writeln!(
+                    body,
+                    "reader, contentType, encodeErr := encodeMultipartBody(value.Value)"
+                )
+                .map_err(sink)?;
+                writeln!(body, "if encodeErr != nil {{").map_err(sink)?;
+                writeln!(body, "return out, encodeErr").map_err(sink)?;
+                writeln!(body, "}}").map_err(sink)?;
+                writeln!(body, "reqBody = reader").map_err(sink)?;
+                writeln!(body, "reqContentType = contentType").map_err(sink)?;
+            }
+            RequestBodyEncoding::Binary => {
+                writeln!(body, "reqBody = bytes.NewReader([]byte(value.Value))").map_err(sink)?;
+            }
+        }
+        if model.encoding != RequestBodyEncoding::Multipart {
+            writeln!(
+                body,
+                "reqContentType = {}",
+                quoted_string_literal(&model.content_type)
+            )
+            .map_err(sink)?;
+        }
+    }
+    writeln!(body, "default:").map_err(sink)?;
+    writeln!(
+        body,
+        "return out, fmt.Errorf(\"{} request body must select one declared media type\")",
+        op.id
+    )
+    .map_err(sink)?;
+    writeln!(body, "}}").map_err(sink)?;
+    if !models[0].required {
+        writeln!(body, "}}").map_err(sink)?;
+    }
+    Ok(())
+}
+
 struct GoOperationRuntime<'a> {
     idempotent: bool,
     idempotency_key_header: Option<&'a str>,
@@ -2616,6 +2806,9 @@ fn go_operation_runtime<'a>(graph: &'a ApiGraph, op: &Operation) -> GoOperationR
 }
 
 fn go_status_match(expr: &str, statuses: &[u16]) -> String {
+    if statuses.is_empty() {
+        return "false".to_string();
+    }
     statuses
         .iter()
         .map(|status| format!("{expr} == {status}"))
@@ -2984,7 +3177,7 @@ fn request_body_encodings(
 ) -> Result<Vec<RequestBodyEncoding>, CoreError> {
     let mut encodings = Vec::new();
     for op in ops {
-        if let Some(body) = request_body_model_of(op, graph)? {
+        for body in request_body_models_of(op, graph)? {
             encodings.push(body.encoding);
         }
     }
@@ -4506,6 +4699,7 @@ mod tests {
                 body_kind: "empty".to_string(),
                 content_type: None,
                 content_types: Vec::new(),
+                headers: Vec::new(),
             });
             graph.operations[0]
                 .responses

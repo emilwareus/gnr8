@@ -95,7 +95,7 @@ jobs:
 
       - name: Restore TypeScript test toolchain
         if: matrix.needs_node == 'true'
-        run: npm ci --silent
+        run: npm ci --silent --no-audit
         working-directory: tsextract
 
       - name: Install independent YAML parser

@@ -12,6 +12,7 @@ export interface RequestOptions {
   headers?: Record<string, string>;
   metadata?: Record<string, string>;
   signal?: AbortSignal;
+  followRedirects?: boolean;
 }
 
 export interface HookContext {
@@ -23,6 +24,7 @@ export interface HookContext {
   requestMetadata: Record<string, string>;
   status?: number;
   responseHeaders?: Headers;
+  opaqueRedirect?: boolean;
 }
 
 export type RequestHook = (
@@ -60,6 +62,7 @@ interface RuntimeRequestContext {
   pathTemplate: string;
   idempotent?: boolean;
   idempotencyKeyHeader?: string;
+  successStatuses?: readonly number[];
 }
 
 interface AuthRequirement {
@@ -332,6 +335,7 @@ export class Client {
         method,
         headers,
         body: bodyPayload ?? null,
+        redirect: options.followRedirects === true ? "follow" : "manual",
         signal:
           signals.length > 1 ? AbortSignal.any(signals) : (signals[0] ?? null),
       };
@@ -386,8 +390,15 @@ export class Client {
       if (response === undefined) {
         throw new Error("request failed without response");
       }
+      const opaqueRedirect =
+        response.type === "opaqueredirect" &&
+        options.followRedirects !== true &&
+        (context.successStatuses ?? []).some(
+          (status) => status >= 300 && status < 400,
+        );
       hookContext.status = response.status;
       hookContext.responseHeaders = response.headers;
+      hookContext.opaqueRedirect = opaqueRedirect;
       try {
         for (const hook of this.hooks.response) {
           await hook(hookContext, response);
@@ -414,7 +425,11 @@ export class Client {
         await this._waitBeforeRetry(delayMs, options.signal, hookContext);
         continue;
       }
-      if (response.status < 200 || response.status >= 300) {
+      if (
+        (response.status < 200 || response.status >= 300) &&
+        !(context.successStatuses ?? []).includes(response.status) &&
+        !opaqueRedirect
+      ) {
         const error = new ApiError(response.status, {
           headers: response.headers,
           requestId: response.headers.get("x-request-id") ?? undefined,
@@ -561,6 +576,7 @@ export class Client {
         pathTemplate: "/books/",
         idempotent: false,
         idempotencyKeyHeader: "Idempotency-Key",
+        successStatuses: [200],
       },
       options,
     );
@@ -603,6 +619,7 @@ export class Client {
         pathTemplate: "/books/",
         idempotent: false,
         idempotencyKeyHeader: "Idempotency-Key",
+        successStatuses: [201],
       },
       options,
     );
@@ -660,6 +677,7 @@ export class Client {
         pathTemplate: "/books/{bookId}",
         idempotent: false,
         idempotencyKeyHeader: "Idempotency-Key",
+        successStatuses: [200],
       },
       options,
     );
@@ -703,6 +721,7 @@ export class Client {
         pathTemplate: "/books/{bookId}",
         idempotent: false,
         idempotencyKeyHeader: "Idempotency-Key",
+        successStatuses: [200],
       },
       options,
     );

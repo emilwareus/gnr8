@@ -32,6 +32,9 @@
 
 use std::path::{Path, PathBuf};
 use std::process::Command;
+use std::sync::atomic::{AtomicU64, Ordering};
+
+static TEMP_COUNTER: AtomicU64 = AtomicU64::new(0);
 
 /// The vendored `typescript` compiler, resolved relative to this crate's manifest dir. The SAME
 /// compiler `tsextract` links (Phase 4, committed lockfile) — reused, never re-installed (T-05-03-SC).
@@ -73,9 +76,10 @@ fn unique_temp_dir(label: &str) -> PathBuf {
     let nanos = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .map_or(0, |d| d.as_nanos());
+    let sequence = TEMP_COUNTER.fetch_add(1, Ordering::Relaxed);
     let dir = std::env::temp_dir().join(format!(
-        "gnr8-tssdk-compile-{label}-{}-{nanos}",
-        std::process::id()
+        "gnr8-tssdk-compile-{label}-{}-{sequence}-{nanos}",
+        std::process::id(),
     ));
     std::fs::create_dir_all(&dir).expect("create unique temp dir");
     dir

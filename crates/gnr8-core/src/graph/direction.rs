@@ -32,6 +32,11 @@ impl SchemaDirections {
         response: false,
     };
 
+    pub(crate) const RESPONSE: Self = Self {
+        request: false,
+        response: true,
+    };
+
     pub(crate) fn input_field_is_required(field: &Field) -> bool {
         !field.deserializer_accepts_absent || field.validator_requires_presence
     }
@@ -100,12 +105,18 @@ pub(crate) fn schema_directions(graph: &ApiGraph) -> BTreeMap<&str, SchemaDirect
         if let Some(body) = &op.request_body {
             request_roots.push(body.ref_id.as_str());
         }
+        for variant in &op.request_body_variants {
+            request_roots.push(variant.body.ref_id.as_str());
+        }
         for param in &op.params {
             collect_parameter_refs(param, &bodies, &mut request_roots);
         }
         for response in &op.responses {
             if let Some(body) = &response.body {
                 response_roots.push(body.ref_id.as_str());
+            }
+            for header in &response.headers {
+                collect_named_refs(&header.schema, &mut response_roots);
             }
         }
     }

@@ -4,6 +4,7 @@
 
 use std::path::{Path, PathBuf};
 use std::process::Command;
+use std::sync::atomic::{AtomicU64, Ordering};
 
 use gnr8_engine::sdk::prelude::*;
 
@@ -16,6 +17,8 @@ const TSC: &str = concat!(
     env!("CARGO_MANIFEST_DIR"),
     "/../../tsextract/node_modules/typescript/bin/tsc"
 );
+
+static TEMP_SEQUENCE: AtomicU64 = AtomicU64::new(0);
 
 fn go_available() -> bool {
     Command::new("go")
@@ -41,8 +44,9 @@ fn unique_temp_dir(label: &str) -> PathBuf {
         .duration_since(std::time::UNIX_EPOCH)
         .map_or(0, |d| d.as_nanos());
     let dir = std::env::temp_dir().join(format!(
-        "gnr8-gin-contract-{label}-{}-{nanos}",
-        std::process::id()
+        "gnr8-gin-contract-{label}-{}-{nanos}-{}",
+        std::process::id(),
+        TEMP_SEQUENCE.fetch_add(1, Ordering::Relaxed)
     ));
     std::fs::create_dir_all(&dir).expect("create temp dir");
     dir
@@ -64,6 +68,12 @@ fn run_pipeline() -> Option<gnr8_engine::pipeline::PipelineOutcome> {
         .target(OpenApi31::new().to("generated/openapi.yaml"))
         .target(TsSdk::new().module("@example/sdk").to("generated/ts"))
         .target(PySdk::new().module("example_sdk").to("generated/py"))
+        .target(
+            PySdk::new()
+                .module("example_wire")
+                .dataclasses()
+                .to("generated/py-wire"),
+        )
         .target(GoSdk::new().module("example.com/sdk").to("generated/go"));
     Some(
         gnr8_engine::pipeline::run_in_process(&pipeline, &Cx::new(&fixture), Some(&store))
@@ -125,6 +135,16 @@ fn assert_typescript_client(ts_client: &str) {
     );
     assert!(
         ts_client.contains("encodeURIComponent(String(childId))"),
+        "{ts_client}"
+    );
+    assert!(
+        ts_client.contains("export type UploadFileBody =")
+            && ts_client.contains("contentType: \"application/json\"")
+            && ts_client.contains("contentType: \"multipart/form-data\"")
+            && ts_client.contains("files?: Array<Blob | ArrayBuffer | Uint8Array>")
+            && ts_client.contains("opaqueRedirect?: boolean;")
+            && ts_client
+                .contains("redirect: options.followRedirects === true ? \"follow\" : \"manual\""),
         "{ts_client}"
     );
 }
@@ -194,6 +214,10 @@ fn assert_python_models(py_models: &str) {
 }
 
 fn assert_openapi(openapi: &str) {
+    assert_openapi_request_contracts(openapi);
+    assert_openapi_response_contracts(openapi);
+    assert_openapi_parameter_contracts(openapi);
+
     let directional = openapi
         .split("    DirectionalResponse:\n")
         .nth(1)
@@ -236,6 +260,113 @@ fn assert_openapi(openapi: &str) {
     assert!(!ids.contains("null"), "{ids}");
 }
 
+fn assert_openapi_request_contracts(openapi: &str) {
+    let upload = path_section(openapi, "/v1/files/upload");
+    assert!(
+        upload.contains("required: true")
+            && upload.contains("application/json:")
+            && upload.contains("#/components/schemas/CreateUploadRequest")
+            && upload.contains("multipart/form-data:")
+            && upload.contains("#/components/schemas/UploadFileFormRequest"),
+        "{upload}"
+    );
+    let upload_form = openapi
+        .split("    UploadFileFormRequest:\n")
+        .nth(1)
+        .expect("UploadFileFormRequest component");
+    assert!(
+        upload_form.contains("files:")
+            && upload_form.contains("format: binary")
+            && upload_form.contains("request:\n          type: string")
+            && upload_form.contains("required: [request]"),
+        "{upload_form}"
+    );
+    let update_upload = path_section(openapi, "/v1/files/upload/{fileId}");
+    assert!(
+        update_upload.contains("application/json:")
+            && update_upload.contains("#/components/schemas/UpdateItemRequest")
+            && update_upload.contains("multipart/form-data:")
+            && update_upload.contains("required: true"),
+        "{update_upload}"
+    );
+}
+
+fn assert_openapi_response_contracts(openapi: &str) {
+    let redirect = path_section(openapi, "/v1/files/{fileId}/redirect");
+    assert!(
+        redirect.contains("'307':")
+            && redirect.contains("Location:")
+            && redirect.contains("X-Session-ID:"),
+        "{redirect}"
+    );
+    let helper_redirect = path_section(openapi, "/v1/files/{fileId}/helper-redirect");
+    assert!(
+        helper_redirect.contains("'302':") && helper_redirect.contains("Location:"),
+        "{helper_redirect}"
+    );
+    let read = path_section(openapi, "/v1/files/{fileId}/read");
+    for header in [
+        "Content-Disposition:",
+        "Content-Length:",
+        "Content-Type:",
+        "X-Session-ID:",
+    ] {
+        assert!(read.contains(header), "missing {header} in {read}");
+    }
+    let not_found = read
+        .split("      '404':\n")
+        .nth(1)
+        .expect("readFile 404 response")
+        .split("      '")
+        .next()
+        .expect("readFile 404 section");
+    for header in [
+        "Content-Disposition:",
+        "Content-Length:",
+        "Content-Type:",
+        "X-Session-ID:",
+    ] {
+        assert!(
+            !not_found.contains(header),
+            "success-only {header} leaked onto 404: {not_found}"
+        );
+    }
+}
+
+fn assert_openapi_parameter_contracts(openapi: &str) {
+    let observations = path_section(openapi, "/v1/items/request-observations");
+    assert!(
+        observations.contains("name: X-Observed\n        in: header\n        required: false")
+            && observations
+                .contains("name: X-Required\n        in: header\n        required: true")
+            && observations
+                .contains("name: X-Helper-Observed\n        in: header\n        required: false")
+            && observations
+                .contains("name: observed-cookie\n        in: cookie\n        required: false")
+            && observations
+                .contains("name: required-cookie\n        in: cookie\n        required: true")
+            && !observations.contains("Authorization"),
+        "{observations}"
+    );
+    let search = path_section(openapi, "/v1/items/search");
+    assert!(
+        search.contains("name: offset\n        in: query\n        required: false")
+            && search.contains("name: page\n        in: query\n        required: true")
+            && search.contains("default: first")
+            && search.contains("default: asc"),
+        "{search}"
+    );
+}
+
+fn path_section<'a>(openapi: &'a str, path: &str) -> &'a str {
+    let marker = format!("  '{path}':\n");
+    let section = openapi
+        .split(&marker)
+        .nth(1)
+        .unwrap_or_else(|| panic!("missing OpenAPI path {path}"));
+    section.split("\n  '").next().unwrap_or(section)
+}
+
 fn assert_go_operations(go_ops: &str) {
     assert!(go_ops.contains("\"PATCH\""), "{go_ops}");
     assert!(go_ops.contains("[]byte"), "{go_ops}");
@@ -247,6 +378,19 @@ fn assert_go_operations(go_ops: &str) {
     );
     assert!(go_ops.contains("type FilesAPI struct"), "{go_ops}");
     assert!(go_ops.contains("type ItemsAPI struct"), "{go_ops}");
+    assert!(go_ops.contains("type UploadFileBody interface"), "{go_ops}");
+    assert!(
+        go_ops.contains("type UploadFileJSONBody struct"),
+        "{go_ops}"
+    );
+    assert!(
+        go_ops.contains("type UploadFileMultipartBody struct"),
+        "{go_ops}"
+    );
+    assert!(
+        go_ops.contains("SuccessStatuses: map[int]bool{") && go_ops.contains("307: true,"),
+        "{go_ops}"
+    );
 }
 
 #[test]
@@ -261,6 +405,15 @@ fn go_gin_contract_pipeline_generates_expected_sdk_surfaces() {
     assert_openapi(artifact(&outcome, "generated/openapi.yaml"));
     assert_go_operations(artifact(&outcome, "generated/go/operations.go"));
 
+    assert!(
+        outcome.diagnostics.iter().any(|diagnostic| {
+            diagnostic.code == "security.requirement.missing"
+                && diagnostic.operation.as_deref() == Some("GET /v1/items/request-observations")
+        }),
+        "Authorization reads must remain actionable until user code configures security: {:?}",
+        outcome.diagnostics
+    );
+
     for file in &outcome.artifacts {
         assert!(
             !file.text.contains("gin.H") && !file.text.contains("github.com/gin-gonic/gin.H"),
@@ -271,7 +424,7 @@ fn go_gin_contract_pipeline_generates_expected_sdk_surfaces() {
 }
 
 #[test]
-fn generated_go_and_typescript_sdks_compile() {
+fn generated_sdks_compile() {
     let Some(outcome) = run_pipeline() else {
         return;
     };
@@ -279,8 +432,15 @@ fn generated_go_and_typescript_sdks_compile() {
     let root = unique_temp_dir("compile");
     let go_dir = root.join("go");
     let ts_dir = root.join("ts");
+    let py_dir = root.join("py-wire");
+    std::fs::write(
+        root.join("openapi.yaml"),
+        artifact(&outcome, "generated/openapi.yaml"),
+    )
+    .expect("write generated OpenAPI");
     write_artifacts(&outcome, "generated/go/", &go_dir);
     write_artifacts(&outcome, "generated/ts/", &ts_dir);
+    write_artifacts(&outcome, "generated/py-wire/", &py_dir);
 
     let go = Command::new("go")
         .args(["test", "./..."])
@@ -293,6 +453,18 @@ fn generated_go_and_typescript_sdks_compile() {
         "generated Go SDK must compile:\nstdout:\n{}\nstderr:\n{}",
         String::from_utf8_lossy(&go.stdout),
         String::from_utf8_lossy(&go.stderr)
+    );
+
+    let python = Command::new("python3")
+        .args(["-m", "compileall", "-q", "."])
+        .current_dir(&py_dir)
+        .output()
+        .expect("spawn python compileall");
+    assert!(
+        python.status.success(),
+        "generated Python SDK must compile:\nstdout:\n{}\nstderr:\n{}",
+        String::from_utf8_lossy(&python.stdout),
+        String::from_utf8_lossy(&python.stderr)
     );
 
     if !ts_available() {
@@ -325,6 +497,98 @@ fn generated_go_and_typescript_sdks_compile() {
         "generated TypeScript SDK must typecheck:\nstdout:\n{}\nstderr:\n{}",
         String::from_utf8_lossy(&ts.stdout),
         String::from_utf8_lossy(&ts.stderr)
+    );
+}
+
+#[test]
+fn generated_sdks_encode_body_variants_and_redirects_with_fake_transports() {
+    let Some(outcome) = run_pipeline() else {
+        return;
+    };
+    let root = unique_temp_dir("wire");
+
+    let go_dir = root.join("go");
+    write_artifacts(&outcome, "generated/go/", &go_dir);
+    std::fs::write(
+        go_dir.join("gin_contract_wire_test.go"),
+        include_str!("drivers/gin_contract/go_wire_test.go"),
+    )
+    .expect("write Go wire test");
+    let go = Command::new("go")
+        .args(["test", "./..."])
+        .current_dir(&go_dir)
+        .env("GOPROXY", "off")
+        .output()
+        .expect("spawn generated Go wire test");
+    assert_command_success("generated Go fake transport", &go);
+
+    let py_root = root.join("py");
+    let py_package = py_root.join("example_wire");
+    write_artifacts(&outcome, "generated/py-wire/", &py_package);
+    let py_driver = py_root.join("py_wire_driver.py");
+    std::fs::write(
+        &py_driver,
+        include_str!("drivers/gin_contract/py_wire_driver.py"),
+    )
+    .expect("write Python wire driver");
+    let python = Command::new("python3")
+        .arg(&py_driver)
+        .current_dir(&py_root)
+        .env("PYTHONDONTWRITEBYTECODE", "1")
+        .env("PYTHONNOUSERSITE", "1")
+        .output()
+        .expect("spawn generated Python wire driver");
+    assert_command_success("generated Python fake transport", &python);
+
+    if !ts_available() {
+        eprintln!("skipping TypeScript fake transport: node/tsc unavailable");
+        return;
+    }
+    let ts_dir = root.join("ts");
+    write_artifacts(&outcome, "generated/ts/", &ts_dir);
+    std::fs::write(
+        ts_dir.join("ts_wire_driver.ts"),
+        include_str!("drivers/gin_contract/ts_wire_driver.ts"),
+    )
+    .expect("write TypeScript wire driver");
+    let typescript = Command::new("node")
+        .args([
+            TSC,
+            "--strict",
+            "--target",
+            "es2022",
+            "--module",
+            "commonjs",
+            "--moduleResolution",
+            "node",
+            "--lib",
+            "es2022,dom",
+            "--outDir",
+            "dist",
+            "client.ts",
+            "errors.ts",
+            "index.ts",
+            "models.ts",
+            "ts_wire_driver.ts",
+        ])
+        .current_dir(&ts_dir)
+        .output()
+        .expect("spawn TypeScript compiler");
+    assert_command_success("generated TypeScript fake transport typecheck", &typescript);
+    let node = Command::new("node")
+        .arg("dist/ts_wire_driver.js")
+        .current_dir(&ts_dir)
+        .output()
+        .expect("spawn generated TypeScript wire driver");
+    assert_command_success("generated TypeScript fake transport", &node);
+}
+
+fn assert_command_success(label: &str, output: &std::process::Output) {
+    assert!(
+        output.status.success(),
+        "{label} failed:\nstdout:\n{}\nstderr:\n{}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
     );
 }
 

@@ -28,6 +28,7 @@ import (
 	"go/token"
 	gotypes "go/types"
 	"reflect"
+	"sort"
 	"strconv"
 	"strings"
 
@@ -53,6 +54,7 @@ type CodeFacts struct {
 	RequestBody            *facts.TypeRef
 	RequestBodyRequired    bool
 	RequestBodyContentType string
+	RequestBodyVariants    []facts.RequestBodyVariantFact
 	Responses              []facts.ResponseFact
 	Params                 []facts.ParamFact
 	Schemas                []facts.SchemaFact
@@ -405,6 +407,11 @@ func (a *Analyzer) analyzeContextHelperCall(
 	defer delete(traversal.stack, key)
 
 	optionalBindPositions := collectOptionalBindPositions(callee)
+	for name, field := range a.multipartFileMapFieldsInFrame(next, traversal.route, traversal.diagnostics) {
+		traversal.formFields[name] = field
+		traversal.manualFormFields[name] = true
+		*traversal.formHasFile = true
+	}
 	ast.Inspect(callee.decl.Body, func(node ast.Node) bool {
 		nested, ok := node.(*ast.CallExpr)
 		if !ok {
@@ -420,7 +427,7 @@ func (a *Analyzer) analyzeContextHelperCall(
 				a.addTraversedParameter(traversal, requestParameter(
 					pname,
 					"header",
-					true,
+					requestAccessRequired(callee, nested, "GetHeader"),
 					facts.PrimitiveType(facts.StringPrim()),
 					callee.fset,
 					nested.Pos(),
@@ -620,7 +627,7 @@ func (a *Analyzer) analyzeTraversedGinCall(
 			if hint.schemaKnown && hint.schema != nil {
 				schema = *hint.schema
 			}
-			required := true
+			required := requestAccessRequired(frame.decl, call, method)
 			if hint.requiredKnown {
 				required = hint.required
 			}
@@ -634,7 +641,7 @@ func (a *Analyzer) analyzeTraversedGinCall(
 			if hint.schemaKnown && hint.schema != nil {
 				schema = *hint.schema
 			}
-			required := true
+			required := requestAccessRequired(frame.decl, call, method)
 			if hint.requiredKnown {
 				required = hint.required
 			}
@@ -698,7 +705,11 @@ func (a *Analyzer) analyzeTraversedGinCall(
 		if name, ok := frameCallStringArg(frame, call, 0); ok {
 			traversal.manualFormFields[name] = true
 			if _, exists := traversal.formFields[name]; !exists {
-				field := formField(name, facts.PrimitiveType(facts.StringPrim()), false)
+				field := formField(
+					name,
+					facts.PrimitiveType(facts.StringPrim()),
+					requestAccessRequired(frame.decl, call, method),
+				)
 				if method == "DefaultPostForm" && len(call.Args) > 1 {
 					field.Meta = &facts.FieldMeta{Default: frameLiteralValue(frame, call.Args[1])}
 				}
@@ -848,6 +859,285 @@ func (a *Analyzer) reportDynamicBodyFieldName(
 	)
 }
 
+// multipartFileMapFields recognizes literal keys read from the File map of a
+// multipart.Form returned by Gin. A literal key is a bounded repeated-file
+// contract; a computed key can select an unbounded set and is diagnosed.
+func (a *Analyzer) multipartFileMapFields(
+	h handlerDecl,
+	route routes.Route,
+	diags *diag.Accumulator,
+) map[string]facts.FieldFact {
+	return a.multipartFileMapFieldsInFrame(
+		helperFrame{decl: h, bindings: map[gotypes.Object]helperBinding{}},
+		route,
+		diags,
+	)
+}
+
+func (a *Analyzer) multipartFileMapFieldsInFrame(
+	frame helperFrame,
+	route routes.Route,
+	diags *diag.Accumulator,
+) map[string]facts.FieldFact {
+	fields := map[string]facts.FieldFact{}
+	formVars := multipartFormResultVars(frame.decl)
+	if len(formVars) == 0 || frame.decl.decl == nil || frame.decl.decl.Body == nil {
+		return fields
+	}
+	ast.Inspect(frame.decl.decl.Body, func(node ast.Node) bool {
+		index, ok := node.(*ast.IndexExpr)
+		if !ok {
+			return true
+		}
+		selector, ok := index.X.(*ast.SelectorExpr)
+		if !ok || selector.Sel == nil || selector.Sel.Name != "File" {
+			return true
+		}
+		base, ok := selector.X.(*ast.Ident)
+		if !ok || !formVars[frame.decl.info.ObjectOf(base)] {
+			return true
+		}
+		name, resolved := frameStringValue(frame, index.Index)
+		if !resolved {
+			if diags != nil {
+				file, line := positionOf(frame.decl.fset, index.Pos())
+				diags.RequestBodyUnresolved(
+					"multipart file map",
+					route.Method,
+					untypedRouteLabel(route),
+					"multipart file field name is dynamic",
+					file,
+					line,
+				)
+			}
+			return true
+		}
+		fields[name] = formField(
+			name,
+			facts.ArrayType(facts.PrimitiveType(facts.BytesPrim())),
+			false,
+		)
+		return true
+	})
+	return fields
+}
+
+func multipartFormResultVars(h handlerDecl) map[gotypes.Object]bool {
+	vars := map[gotypes.Object]bool{}
+	if h.decl == nil || h.decl.Body == nil || h.info == nil {
+		return vars
+	}
+	ast.Inspect(h.decl.Body, func(node ast.Node) bool {
+		assign, ok := node.(*ast.AssignStmt)
+		if !ok || len(assign.Rhs) != 1 || len(assign.Lhs) == 0 {
+			return true
+		}
+		call, ok := assign.Rhs[0].(*ast.CallExpr)
+		if !ok {
+			return true
+		}
+		name, recvPkg, ok := routes.GinMethod(h.info, call)
+		if !ok || recvPkg != routes.GinPkgPath || name != "MultipartForm" {
+			return true
+		}
+		if ident, ok := assign.Lhs[0].(*ast.Ident); ok {
+			if object := h.info.ObjectOf(ident); object != nil {
+				vars[object] = true
+			}
+		}
+		return true
+	})
+	return vars
+}
+
+// requestAccessRequired answers requiredness from the handler's behavior. A
+// read is observational by default. It becomes required only when the handler
+// proves absence and rejects that branch with a declared 4xx response.
+func requestAccessRequired(h handlerDecl, target *ast.CallExpr, method string) bool {
+	if h.decl == nil || h.decl.Body == nil || h.info == nil || target == nil {
+		return false
+	}
+	switch method {
+	case "GetHeader", "PostForm":
+		values := callResultVars(h, target, 0)
+		return anyMatchingIf(h, func(ifStmt *ast.IfStmt) bool {
+			if !exprChecksMissingStringAccess(h.info, ifStmt.Cond, target, values) {
+				return false
+			}
+			return blockRejectsRequest(h, ifStmt.Body) || blockReturnsNonNilError(h, ifStmt.Body)
+		})
+	case "Cookie":
+		errors := callResultVars(h, target, 1)
+		return len(errors) > 0 && anyMatchingIf(h, func(ifStmt *ast.IfStmt) bool {
+			return exprChecksNonNil(h.info, ifStmt.Cond, errors) &&
+				blockRejectsRequest(h, ifStmt.Body)
+		})
+	default:
+		return false
+	}
+}
+
+func callResultVars(h handlerDecl, target *ast.CallExpr, resultIndex int) map[gotypes.Object]bool {
+	vars := map[gotypes.Object]bool{}
+	ast.Inspect(h.decl.Body, func(node ast.Node) bool {
+		assign, ok := node.(*ast.AssignStmt)
+		if !ok || len(assign.Rhs) != 1 || resultIndex >= len(assign.Lhs) {
+			return true
+		}
+		if !exprContainsCall(assign.Rhs[0], target) {
+			return true
+		}
+		if ident, ok := assign.Lhs[resultIndex].(*ast.Ident); ok && ident.Name != "_" {
+			if object := h.info.ObjectOf(ident); object != nil {
+				vars[object] = true
+			}
+		}
+		return true
+	})
+	return vars
+}
+
+func anyMatchingIf(h handlerDecl, condition func(*ast.IfStmt) bool) bool {
+	required := false
+	ast.Inspect(h.decl.Body, func(node ast.Node) bool {
+		if required {
+			return false
+		}
+		ifStmt, ok := node.(*ast.IfStmt)
+		if !ok || !condition(ifStmt) {
+			return true
+		}
+		required = true
+		return false
+	})
+	return required
+}
+
+func blockReturnsNonNilError(h handlerDecl, block *ast.BlockStmt) bool {
+	if block == nil || h.info == nil {
+		return false
+	}
+	errorType := gotypes.Universe.Lookup("error").Type()
+	returnsError := false
+	ast.Inspect(block, func(node ast.Node) bool {
+		if returnsError {
+			return false
+		}
+		ret, ok := node.(*ast.ReturnStmt)
+		if !ok {
+			return true
+		}
+		for _, result := range ret.Results {
+			resultType := h.info.TypeOf(result)
+			if resultType != nil && gotypes.AssignableTo(resultType, errorType) && !isNilIdent(result) {
+				returnsError = true
+				return false
+			}
+		}
+		return true
+	})
+	return returnsError
+}
+
+func exprChecksMissingStringAccess(
+	info *gotypes.Info,
+	expr ast.Expr,
+	target *ast.CallExpr,
+	values map[gotypes.Object]bool,
+) bool {
+	switch node := expr.(type) {
+	case *ast.BinaryExpr:
+		if node.Op == token.EQL {
+			return (exprIsAccessValue(info, node.X, target, values) && isEmptyStringLiteral(node.Y)) ||
+				(isEmptyStringLiteral(node.X) && exprIsAccessValue(info, node.Y, target, values)) ||
+				(exprIsAccessLength(info, node.X, target, values) && isZeroInteger(node.Y)) ||
+				(isZeroInteger(node.X) && exprIsAccessLength(info, node.Y, target, values))
+		}
+		return false
+	case *ast.ParenExpr:
+		return exprChecksMissingStringAccess(info, node.X, target, values)
+	}
+	return false
+}
+
+func exprIsAccessValue(
+	info *gotypes.Info,
+	expr ast.Expr,
+	target *ast.CallExpr,
+	values map[gotypes.Object]bool,
+) bool {
+	if call, ok := expr.(*ast.CallExpr); ok {
+		if call == target {
+			return true
+		}
+		if selectorName(call.Fun) == "TrimSpace" && len(call.Args) == 1 {
+			return exprIsAccessValue(info, call.Args[0], target, values)
+		}
+	}
+	ident, ok := expr.(*ast.Ident)
+	return ok && values[info.ObjectOf(ident)]
+}
+
+func exprIsAccessLength(
+	info *gotypes.Info,
+	expr ast.Expr,
+	target *ast.CallExpr,
+	values map[gotypes.Object]bool,
+) bool {
+	call, ok := expr.(*ast.CallExpr)
+	if !ok || len(call.Args) != 1 {
+		return false
+	}
+	ident, ok := call.Fun.(*ast.Ident)
+	return ok && ident.Name == "len" && exprIsAccessValue(info, call.Args[0], target, values)
+}
+
+func isZeroInteger(expr ast.Expr) bool {
+	literal, ok := expr.(*ast.BasicLit)
+	return ok && literal.Kind == token.INT && literal.Value == "0"
+}
+
+func exprChecksNonNil(info *gotypes.Info, expr ast.Expr, values map[gotypes.Object]bool) bool {
+	binary, ok := expr.(*ast.BinaryExpr)
+	if !ok || binary.Op != token.NEQ {
+		return false
+	}
+	return (exprIsObject(info, binary.X, values) && isNilIdent(binary.Y)) ||
+		(isNilIdent(binary.X) && exprIsObject(info, binary.Y, values))
+}
+
+func exprIsObject(info *gotypes.Info, expr ast.Expr, values map[gotypes.Object]bool) bool {
+	ident, ok := expr.(*ast.Ident)
+	return ok && values[info.ObjectOf(ident)]
+}
+
+func blockRejectsRequest(h handlerDecl, block *ast.BlockStmt) bool {
+	if block == nil {
+		return false
+	}
+	rejects := false
+	ast.Inspect(block, func(node ast.Node) bool {
+		if rejects {
+			return false
+		}
+		call, ok := node.(*ast.CallExpr)
+		if !ok || len(call.Args) == 0 {
+			return true
+		}
+		name, recvPkg, ok := routes.GinMethod(h.info, call)
+		if !ok || recvPkg != routes.GinPkgPath {
+			return true
+		}
+		switch name {
+		case "JSON", "Status", "AbortWithStatus":
+			status, known := statusOf(h.info, call.Args[0])
+			rejects = known && status >= 400 && status < 500
+		}
+		return !rejects
+	})
+	return rejects
+}
+
 func requestHeaderGet(info *gotypes.Info, call *ast.CallExpr) (string, bool, bool) {
 	return requestHeaderGetInFrame(helperFrame{decl: handlerDecl{info: info}}, call)
 }
@@ -923,11 +1213,17 @@ func (a *Analyzer) Analyze(route routes.Route, diags *diag.Accumulator) CodeFact
 	boundFormRefs := map[string]bool{}
 	manualFormFields := map[string]bool{}
 	formHasFile := false
+	for name, field := range a.multipartFileMapFields(h, route, diags) {
+		formFields[name] = field
+		manualFormFields[name] = true
+		formHasFile = true
+	}
 	contentTypeHint := ""
 	optionalBindPositions := collectOptionalBindPositions(h)
 	hasBodyBind := false
 	allBodyBindsOptional := true
 	delegatedResponseSeen := map[string]bool{}
+	responseHeaders := a.collectResponseHeadersByStatus(h, route, diags)
 
 	ast.Inspect(h.decl.Body, func(n ast.Node) bool {
 		call, ok := n.(*ast.CallExpr)
@@ -936,13 +1232,16 @@ func (a *Analyzer) Analyze(route routes.Route, diags *diag.Accumulator) CodeFact
 		}
 		name, recvPkg, ok := routes.GinMethod(h.info, call)
 		if !ok || recvPkg != routes.GinPkgPath {
+			if isHTTPRedirectCall(h.info, call) {
+				a.analyzeRedirect(h, call, 3, route, &cf, seenStatus, provisionalStatus, diags)
+			}
 			if pname, matched, resolved := requestHeaderGet(h.info, call); matched {
 				if resolved {
 					a.addExtractedParameter(
 						&cf,
 						seenParam,
 						resolvedParam,
-						requestParameter(pname, "header", true, facts.PrimitiveType(facts.StringPrim()), h.fset, call.Pos()),
+						requestParameter(pname, "header", requestAccessRequired(h, call, "GetHeader"), facts.PrimitiveType(facts.StringPrim()), h.fset, call.Pos()),
 						true,
 						route,
 						diags,
@@ -979,7 +1278,7 @@ func (a *Analyzer) Analyze(route routes.Route, diags *diag.Accumulator) CodeFact
 					reportedUnresolvedCall: map[token.Pos]bool{},
 				},
 			)
-			a.analyzeDelegatedResponses(h, call, route, &cf, seenStatus, provisionalStatus, diags, delegatedResponseSeen, contentTypeHint)
+			a.analyzeDelegatedResponses(helperFrame{decl: h, bindings: map[gotypes.Object]helperBinding{}}, call, route, &cf, seenStatus, provisionalStatus, diags, delegatedResponseSeen, contentTypeHint)
 			a.analyzePathHelperCall(h, call, &cf, seenParam)
 			a.analyzeQueryHelperCall(h, call, route, &cf, seenParam, resolvedParam, diags)
 			return true
@@ -1047,6 +1346,8 @@ func (a *Analyzer) Analyze(route routes.Route, diags *diag.Accumulator) CodeFact
 			a.analyzeData(h, call, route, &cf, seenStatus, provisionalStatus, diags)
 		case "DataFromReader":
 			a.analyzeDataFromReader(h, call, route, &cf, seenStatus, provisionalStatus, diags)
+		case "Redirect":
+			a.analyzeRedirect(h, call, 0, route, &cf, seenStatus, provisionalStatus, diags)
 		case "SSEvent":
 			a.addSSEResponse(&cf, seenStatus, provisionalStatus)
 		case "Stream":
@@ -1083,7 +1384,7 @@ func (a *Analyzer) Analyze(route routes.Route, diags *diag.Accumulator) CodeFact
 				a.addExtractedParameter(&cf, seenParam, resolvedParam, requestParameter(
 					pname,
 					"header",
-					true,
+					requestAccessRequired(h, call, name),
 					facts.PrimitiveType(facts.StringPrim()),
 					h.fset,
 					call.Pos(),
@@ -1096,7 +1397,7 @@ func (a *Analyzer) Analyze(route routes.Route, diags *diag.Accumulator) CodeFact
 				a.addExtractedParameter(&cf, seenParam, resolvedParam, requestParameter(
 					pname,
 					"cookie",
-					true,
+					requestAccessRequired(h, call, name),
 					facts.PrimitiveType(facts.StringPrim()),
 					h.fset,
 					call.Pos(),
@@ -1116,7 +1417,11 @@ func (a *Analyzer) Analyze(route routes.Route, diags *diag.Accumulator) CodeFact
 			if fname, ok := a.callStringArg(h, call, 0); ok {
 				manualFormFields[fname] = true
 				if _, seen := formFields[fname]; !seen {
-					field := formField(fname, facts.PrimitiveType(facts.StringPrim()), false)
+					field := formField(
+						fname,
+						facts.PrimitiveType(facts.StringPrim()),
+						requestAccessRequired(h, call, name),
+					)
 					if name == "DefaultPostForm" && len(call.Args) > 1 {
 						field.Meta = &facts.FieldMeta{Default: literalValue(h.info, call.Args[1])}
 					}
@@ -1126,18 +1431,20 @@ func (a *Analyzer) Analyze(route routes.Route, diags *diag.Accumulator) CodeFact
 				reportDirectUnresolvedBody(diags, h, route, call, name, "form field name is dynamic")
 			}
 		case "MultipartForm":
-			reportDirectUnresolvedBody(diags, h, route, call, name, "MultipartForm map access cannot be fully extracted")
+			// Literal accesses through the returned multipart.Form are collected in one
+			// typed pre-pass. The call alone does not state a field name.
 		}
 		return true
 	})
-	if cf.RequestBody == nil && (len(formFields) > 0 || len(boundFormRefs) > 0) {
+	if len(formFields) > 0 || len(boundFormRefs) > 0 {
+		var formBody *facts.TypeRef
+		formContentType := "application/x-www-form-urlencoded"
+		if formHasFile {
+			formContentType = "multipart/form-data"
+		}
 		if len(boundFormRefs) == 1 && len(manualFormFields) == 0 {
 			for refID := range boundFormRefs {
-				cf.RequestBody = &facts.TypeRef{RefID: refID}
-			}
-			cf.RequestBodyContentType = "application/x-www-form-urlencoded"
-			if formHasFile {
-				cf.RequestBodyContentType = "multipart/form-data"
+				formBody = &facts.TypeRef{RefID: refID}
 			}
 		} else {
 			schemaID, schemaName := syntheticFormSchemaIdentity(route.Handler)
@@ -1145,11 +1452,7 @@ func (a *Analyzer) Analyze(route routes.Route, diags *diag.Accumulator) CodeFact
 			for _, field := range formFields {
 				fields = append(fields, field)
 			}
-			cf.RequestBody = &facts.TypeRef{RefID: schemaID}
-			cf.RequestBodyContentType = "application/x-www-form-urlencoded"
-			if formHasFile {
-				cf.RequestBodyContentType = "multipart/form-data"
-			}
+			formBody = &facts.TypeRef{RefID: schemaID}
 			cf.Schemas = append(cf.Schemas, facts.SchemaFact{
 				ID:   schemaID,
 				Name: schemaName,
@@ -1157,17 +1460,8 @@ func (a *Analyzer) Analyze(route routes.Route, diags *diag.Accumulator) CodeFact
 				Span: spanOf(h.fset, declPos(h.decl)),
 			})
 		}
-	} else if cf.RequestBody != nil && len(formFields) > 0 {
-		if diags != nil {
-			file, line := positionOf(h.fset, declPos(h.decl))
-			diags.RequestBodyUnresolved(
-				"form fields",
-				route.Method,
-				untypedRouteLabel(route),
-				"form or multipart fields conflict with an independently extracted request body",
-				file,
-				line,
-			)
+		if formBody != nil {
+			a.setRequestBodyFact(&cf, formBody, formContentType, route, diags, h.fset, declPos(h.decl), "form fields")
 		}
 	}
 	if cf.RequestBody == nil {
@@ -1204,6 +1498,12 @@ func (a *Analyzer) Analyze(route routes.Route, diags *diag.Accumulator) CodeFact
 			route.Path,
 			route.Span.File,
 			route.Span.StartLine,
+		)
+	}
+	for index := range cf.Responses {
+		cf.Responses[index].Headers = append(
+			[]facts.ResponseHeaderFact(nil),
+			responseHeaders[cf.Responses[index].Status]...,
 		)
 	}
 	return cf
@@ -1263,14 +1563,38 @@ func (a *Analyzer) setRequestBodyFact(
 		cf.RequestBodyContentType = contentType
 		return
 	}
-	if cf.RequestBody.RefID != ref.RefID || (cf.RequestBodyContentType != "" && contentType != "" && cf.RequestBodyContentType != contentType) {
+	if cf.RequestBodyContentType != "" && contentType != "" && cf.RequestBodyContentType != contentType {
+		for _, variant := range cf.RequestBodyVariants {
+			if variant.ContentType != contentType {
+				continue
+			}
+			if variant.Body.RefID != ref.RefID && diags != nil {
+				file, line := positionOf(fset, pos)
+				diags.RequestBodyUnresolved(
+					subject,
+					route.Method,
+					untypedRouteLabel(route),
+					"conflicting body evidence for "+contentType+" ("+variant.Body.RefID+" versus "+ref.RefID+")",
+					file,
+					line,
+				)
+			}
+			return
+		}
+		cf.RequestBodyVariants = append(cf.RequestBodyVariants, facts.RequestBodyVariantFact{
+			Body:        *ref,
+			ContentType: contentType,
+		})
+		return
+	}
+	if cf.RequestBody.RefID != ref.RefID {
 		if diags != nil {
 			file, line := positionOf(fset, pos)
 			diags.RequestBodyUnresolved(
 				subject,
 				route.Method,
 				untypedRouteLabel(route),
-				"conflicting body evidence ("+cf.RequestBody.RefID+" as "+cf.RequestBodyContentType+" versus "+ref.RefID+" as "+contentType+")",
+				"conflicting body evidence for "+contentType+" ("+cf.RequestBody.RefID+" versus "+ref.RefID+")",
 				file,
 				line,
 			)
@@ -1664,7 +1988,7 @@ func helperReadsGinParamWithVar(h handlerDecl, keyVar *gotypes.Var) bool {
 }
 
 func (a *Analyzer) analyzeDelegatedResponses(
-	h handlerDecl,
+	caller helperFrame,
 	call *ast.CallExpr,
 	route routes.Route,
 	cf *CodeFacts,
@@ -1674,15 +1998,20 @@ func (a *Analyzer) analyzeDelegatedResponses(
 	seenHelpers map[string]bool,
 	inheritedContentTypeHint string,
 ) {
-	callee, ok := a.delegatedGinContextHelper(h, call)
+	if !frameCallPassesGinContext(caller, call) {
+		return
+	}
+	fn := calledFuncObject(caller.decl.info, call.Fun)
+	callee, ok := a.moduleOwnedCallee(fn)
 	if !ok {
 		return
 	}
-	key := callee.identityKey()
+	key := caller.decl.identityKey() + "@" + strconv.FormatInt(int64(call.Pos()), 10) + "->" + callee.identityKey()
 	if seenHelpers[key] {
 		return
 	}
 	seenHelpers[key] = true
+	frame := helperFrame{decl: callee, bindings: helperCallBindings(caller, call, fn)}
 
 	contentTypeHint := inheritedContentTypeHint
 	ast.Inspect(callee.decl.Body, func(n ast.Node) bool {
@@ -1692,7 +2021,10 @@ func (a *Analyzer) analyzeDelegatedResponses(
 		}
 		name, recvPkg, ok := routes.GinMethod(callee.info, nested)
 		if !ok || recvPkg != routes.GinPkgPath {
-			a.analyzeDelegatedResponses(callee, nested, route, cf, seenStatus, provisionalStatus, diags, seenHelpers, contentTypeHint)
+			if isHTTPRedirectCall(callee.info, nested) {
+				a.analyzeRedirectInFrame(frame, nested, 3, route, cf, seenStatus, provisionalStatus, diags)
+			}
+			a.analyzeDelegatedResponses(frame, nested, route, cf, seenStatus, provisionalStatus, diags, seenHelpers, contentTypeHint)
 			return true
 		}
 		switch name {
@@ -1704,7 +2036,7 @@ func (a *Analyzer) analyzeDelegatedResponses(
 			a.analyzeStatus(callee, nested, route, cf, seenStatus, provisionalStatus, false, diags)
 		case "Header":
 			if key, ok := stringArg(nested, 0); ok && strings.EqualFold(key, "Content-Type") {
-				if value, ok := a.stringValueOf(callee, nested.Args[1]); ok {
+				if value, ok := frameStringValue(frame, nested.Args[1]); ok {
 					contentTypeHint = value
 				}
 			}
@@ -1714,6 +2046,8 @@ func (a *Analyzer) analyzeDelegatedResponses(
 			a.analyzeData(callee, nested, route, cf, seenStatus, provisionalStatus, diags)
 		case "DataFromReader":
 			a.analyzeDataFromReader(callee, nested, route, cf, seenStatus, provisionalStatus, diags)
+		case "Redirect":
+			a.analyzeRedirectInFrame(frame, nested, 0, route, cf, seenStatus, provisionalStatus, diags)
 		case "SSEvent":
 			a.addSSEResponse(cf, seenStatus, provisionalStatus)
 		case "Stream":
@@ -2248,9 +2582,27 @@ func returnTreatsEmptyStringAsOptional(ret *ast.ReturnStmt) bool {
 		return false
 	}
 	for _, result := range ret.Results[:len(ret.Results)-1] {
-		if isNilIdent(result) {
+		if isZeroValueExpr(result) {
 			return true
 		}
+	}
+	return false
+}
+
+func isZeroValueExpr(expr ast.Expr) bool {
+	if isNilIdent(expr) {
+		return true
+	}
+	switch value := expr.(type) {
+	case *ast.BasicLit:
+		switch value.Kind {
+		case token.INT, token.FLOAT:
+			return value.Value == "0" || value.Value == "0.0"
+		case token.STRING:
+			return isEmptyStringLiteral(value)
+		}
+	case *ast.Ident:
+		return value.Name == "false"
 	}
 	return false
 }
@@ -2837,6 +3189,642 @@ func (a *Analyzer) analyzeDataFromReader(
 		ContentType:  contentType,
 		ContentTypes: responseContentTypes(contentType),
 	}, false)
+}
+
+func (a *Analyzer) analyzeRedirect(
+	h handlerDecl,
+	call *ast.CallExpr,
+	statusIndex int,
+	route routes.Route,
+	cf *CodeFacts,
+	seenStatus map[uint16]bool,
+	provisionalStatus map[uint16]bool,
+	diags *diag.Accumulator,
+) {
+	if call == nil || statusIndex >= len(call.Args) {
+		return
+	}
+	status, ok := statusOf(h.info, call.Args[statusIndex])
+	if !ok || status < 300 || status >= 400 {
+		if diags != nil {
+			file, line := positionOf(h.fset, call.Pos())
+			diags.DynamicResponse(
+				route.Method,
+				untypedRouteLabel(route),
+				route.Handler,
+				"redirect status must be a constant 3xx HTTP status",
+				file,
+				line,
+			)
+		}
+		return
+	}
+	a.addResponse(cf, seenStatus, provisionalStatus, facts.ResponseFact{
+		Status:   status,
+		BodyKind: "empty",
+	}, false)
+}
+
+func (a *Analyzer) analyzeRedirectInFrame(
+	frame helperFrame,
+	call *ast.CallExpr,
+	statusIndex int,
+	route routes.Route,
+	cf *CodeFacts,
+	seenStatus map[uint16]bool,
+	provisionalStatus map[uint16]bool,
+	diags *diag.Accumulator,
+) {
+	if call == nil || statusIndex >= len(call.Args) {
+		return
+	}
+	status, ok := statusOf(frame.decl.info, call.Args[statusIndex])
+	if !ok {
+		status, ok = statusFromLiteral(frameLiteralValue(frame, call.Args[statusIndex]))
+	}
+	if !ok || status < 300 || status >= 400 {
+		if diags != nil {
+			file, line := positionOf(frame.decl.fset, call.Pos())
+			diags.DynamicResponse(
+				route.Method,
+				untypedRouteLabel(route),
+				route.Handler,
+				"redirect status must be a constant 3xx HTTP status",
+				file,
+				line,
+			)
+		}
+		return
+	}
+	a.addResponse(cf, seenStatus, provisionalStatus, facts.ResponseFact{
+		Status:   status,
+		BodyKind: "empty",
+	}, false)
+}
+
+func statusFromLiteral(value *facts.LiteralValue) (uint16, bool) {
+	if value == nil || value.Type != "number" {
+		return 0, false
+	}
+	text, ok := value.Value.(string)
+	if !ok {
+		return 0, false
+	}
+	integer, err := strconv.ParseInt(text, 10, 64)
+	if err != nil {
+		return 0, false
+	}
+	return httpStatusInRange(integer)
+}
+
+func isHTTPRedirectCall(info *gotypes.Info, call *ast.CallExpr) bool {
+	function := calledFuncObject(info, call.Fun)
+	return function != nil && function.Pkg() != nil &&
+		function.Pkg().Path() == "net/http" && function.Name() == "Redirect"
+}
+
+type responseHeaderSet map[string]facts.ResponseHeaderFact
+
+type responseHeaderFlow struct {
+	next       responseHeaderSet
+	continues  bool
+	returns    responseHeaderSet
+	hasReturns bool
+}
+
+type responseHeaderCollector struct {
+	analyzer    *Analyzer
+	byStatus    map[uint16]responseHeaderSet
+	stack       map[string]bool
+	route       routes.Route
+	diagnostics *diag.Accumulator
+	// A helper reached from two call sites is walked twice, so an unresolved name is
+	// reported once per source position rather than once per walk.
+	reported map[token.Pos]bool
+}
+
+func (a *Analyzer) collectResponseHeadersByStatus(
+	h handlerDecl,
+	route routes.Route,
+	diags *diag.Accumulator,
+) map[uint16][]facts.ResponseHeaderFact {
+	collector := responseHeaderCollector{
+		analyzer:    a,
+		byStatus:    map[uint16]responseHeaderSet{},
+		stack:       map[string]bool{},
+		route:       route,
+		diagnostics: diags,
+		reported:    map[token.Pos]bool{},
+	}
+	collector.analyzeFunction(
+		helperFrame{decl: h, bindings: map[gotypes.Object]helperBinding{}},
+		responseHeaderSet{},
+		0,
+	)
+	out := make(map[uint16][]facts.ResponseHeaderFact, len(collector.byStatus))
+	for status, byName := range collector.byStatus {
+		headers := make([]facts.ResponseHeaderFact, 0, len(byName))
+		for _, header := range byName {
+			headers = append(headers, header)
+		}
+		sort.Slice(headers, func(i, j int) bool { return headers[i].Name < headers[j].Name })
+		out[status] = headers
+	}
+	return out
+}
+
+func (c *responseHeaderCollector) analyzeFunction(
+	frame helperFrame,
+	inherited responseHeaderSet,
+	depth int,
+) responseHeaderSet {
+	if frame.decl.decl == nil || frame.decl.decl.Body == nil || frame.decl.info == nil || depth >= maxContextHelperDepth {
+		return cloneResponseHeaderSet(inherited)
+	}
+	key := frame.decl.identityKey()
+	if c.stack[key] {
+		return cloneResponseHeaderSet(inherited)
+	}
+	c.stack[key] = true
+	defer delete(c.stack, key)
+	flow := c.analyzeStatements(frame, frame.decl.decl.Body.List, inherited, depth)
+	exits := responseHeaderSet{}
+	if flow.continues {
+		mergeResponseHeaderSets(exits, flow.next)
+	}
+	if flow.hasReturns {
+		mergeResponseHeaderSets(exits, flow.returns)
+	}
+	return exits
+}
+
+func (c *responseHeaderCollector) analyzeStatements(
+	frame helperFrame,
+	statements []ast.Stmt,
+	inherited responseHeaderSet,
+	depth int,
+) responseHeaderFlow {
+	current := cloneResponseHeaderSet(inherited)
+	flow := responseHeaderFlow{next: current, continues: true, returns: responseHeaderSet{}}
+	for _, statement := range statements {
+		if !flow.continues {
+			break
+		}
+		step := c.analyzeStatement(frame, statement, current, depth)
+		if step.hasReturns {
+			mergeResponseHeaderSets(flow.returns, step.returns)
+			flow.hasReturns = true
+		}
+		flow.continues = step.continues
+		current = step.next
+		flow.next = current
+	}
+	return flow
+}
+
+func (c *responseHeaderCollector) analyzeStatement(
+	frame helperFrame,
+	statement ast.Stmt,
+	inherited responseHeaderSet,
+	depth int,
+) responseHeaderFlow {
+	current := cloneResponseHeaderSet(inherited)
+	flow := responseHeaderFlow{next: current, continues: true, returns: responseHeaderSet{}}
+	switch stmt := statement.(type) {
+	case *ast.BlockStmt:
+		return c.analyzeStatements(frame, stmt.List, current, depth)
+	case *ast.ReturnStmt:
+		for _, result := range stmt.Results {
+			c.analyzeNodeCalls(frame, result, current, depth)
+		}
+		flow.continues = false
+		flow.returns = current
+		flow.hasReturns = true
+		return flow
+	case *ast.IfStmt:
+		if stmt.Init != nil {
+			c.analyzeNodeCalls(frame, stmt.Init, current, depth)
+		}
+		c.analyzeNodeCalls(frame, stmt.Cond, current, depth)
+		body := c.analyzeStatements(frame, stmt.Body.List, current, depth)
+		other := responseHeaderFlow{
+			next:      cloneResponseHeaderSet(current),
+			continues: true,
+			returns:   responseHeaderSet{},
+		}
+		if stmt.Else != nil {
+			other = c.analyzeElse(frame, stmt.Else, current, depth)
+		}
+		flow.next = responseHeaderSet{}
+		flow.continues = body.continues || other.continues
+		if body.continues {
+			mergeResponseHeaderSets(flow.next, body.next)
+		}
+		if other.continues {
+			mergeResponseHeaderSets(flow.next, other.next)
+		}
+		flow.returns = responseHeaderSet{}
+		flow.hasReturns = body.hasReturns || other.hasReturns
+		if body.hasReturns {
+			mergeResponseHeaderSets(flow.returns, body.returns)
+		}
+		if other.hasReturns {
+			mergeResponseHeaderSets(flow.returns, other.returns)
+		}
+		return flow
+	case *ast.ForStmt:
+		if stmt.Init != nil {
+			c.analyzeNodeCalls(frame, stmt.Init, current, depth)
+		}
+		if stmt.Cond != nil {
+			c.analyzeNodeCalls(frame, stmt.Cond, current, depth)
+		}
+		body := c.analyzeStatements(frame, stmt.Body.List, current, depth)
+		if stmt.Post != nil && body.continues {
+			c.analyzeNodeCalls(frame, stmt.Post, body.next, depth)
+		}
+		if body.continues {
+			mergeResponseHeaderSets(current, body.next)
+		}
+		flow.next = current
+		flow.returns = body.returns
+		flow.hasReturns = body.hasReturns
+		return flow
+	case *ast.RangeStmt:
+		c.analyzeNodeCalls(frame, stmt.X, current, depth)
+		body := c.analyzeStatements(frame, stmt.Body.List, current, depth)
+		if body.continues {
+			mergeResponseHeaderSets(current, body.next)
+		}
+		flow.next = current
+		flow.returns = body.returns
+		flow.hasReturns = body.hasReturns
+		return flow
+	case *ast.SwitchStmt:
+		if stmt.Init != nil {
+			c.analyzeNodeCalls(frame, stmt.Init, current, depth)
+		}
+		if stmt.Tag != nil {
+			c.analyzeNodeCalls(frame, stmt.Tag, current, depth)
+		}
+		return c.analyzeCaseClauses(frame, stmt.Body.List, current, depth)
+	case *ast.TypeSwitchStmt:
+		if stmt.Init != nil {
+			c.analyzeNodeCalls(frame, stmt.Init, current, depth)
+		}
+		if stmt.Assign != nil {
+			c.analyzeNodeCalls(frame, stmt.Assign, current, depth)
+		}
+		return c.analyzeCaseClauses(frame, stmt.Body.List, current, depth)
+	default:
+		c.analyzeNodeCalls(frame, statement, current, depth)
+		return flow
+	}
+}
+
+func (c *responseHeaderCollector) analyzeElse(
+	frame helperFrame,
+	node ast.Stmt,
+	inherited responseHeaderSet,
+	depth int,
+) responseHeaderFlow {
+	if block, ok := node.(*ast.BlockStmt); ok {
+		return c.analyzeStatements(frame, block.List, inherited, depth)
+	}
+	return c.analyzeStatement(frame, node, inherited, depth)
+}
+
+func (c *responseHeaderCollector) analyzeCaseClauses(
+	frame helperFrame,
+	clauses []ast.Stmt,
+	inherited responseHeaderSet,
+	depth int,
+) responseHeaderFlow {
+	flow := responseHeaderFlow{next: responseHeaderSet{}, returns: responseHeaderSet{}}
+	hasDefault := false
+	for _, statement := range clauses {
+		clause, ok := statement.(*ast.CaseClause)
+		if !ok {
+			continue
+		}
+		if len(clause.List) == 0 {
+			hasDefault = true
+		}
+		for _, expression := range clause.List {
+			c.analyzeNodeCalls(frame, expression, inherited, depth)
+		}
+		branch := c.analyzeStatements(frame, clause.Body, inherited, depth)
+		if branch.continues {
+			flow.continues = true
+			mergeResponseHeaderSets(flow.next, branch.next)
+		}
+		if branch.hasReturns {
+			flow.hasReturns = true
+			mergeResponseHeaderSets(flow.returns, branch.returns)
+		}
+	}
+	if !hasDefault {
+		flow.continues = true
+		mergeResponseHeaderSets(flow.next, inherited)
+	}
+	return flow
+}
+
+func (c *responseHeaderCollector) analyzeNodeCalls(
+	frame helperFrame,
+	node ast.Node,
+	headers responseHeaderSet,
+	depth int,
+) {
+	if node == nil {
+		return
+	}
+	ast.Inspect(node, func(child ast.Node) bool {
+		call, ok := child.(*ast.CallExpr)
+		if !ok {
+			return true
+		}
+		name, recvPkg, ginCall := routes.GinMethod(frame.decl.info, call)
+		if ginCall && recvPkg == routes.GinPkgPath {
+			if name == "Header" {
+				if header, ok := frameCallStringArg(frame, call, 0); ok {
+					addResponseHeader(headers, header)
+				} else {
+					c.reportUnresolvedHeaderName(frame, call.Pos(), "Header")
+				}
+				return true
+			}
+			c.recordGinResponse(frame, call, name, headers)
+			return true
+		}
+		if isHTTPRedirectCall(frame.decl.info, call) {
+			if status, ok := responseStatusInFrame(frame, call, 3); ok && status >= 300 && status < 400 {
+				responseHeaders := cloneResponseHeaderSet(headers)
+				addResponseHeader(responseHeaders, "Location")
+				c.record(status, responseHeaders)
+			}
+			return true
+		}
+		if responseHeaderMutation(frame, call) {
+			if header, ok := frameCallStringArg(frame, call, 0); ok {
+				addResponseHeader(headers, header)
+			} else {
+				c.reportUnresolvedHeaderName(frame, call.Pos(), selectorName(call.Fun))
+			}
+			return true
+		}
+		fn := calledFuncObject(frame.decl.info, call.Fun)
+		callee, ok := c.analyzer.moduleOwnedCallee(fn)
+		if !ok || !frameCallPassesResponseContext(frame, call) {
+			return true
+		}
+		next := helperFrame{decl: callee, bindings: helperCallBindings(frame, call, fn)}
+		mergeResponseHeaderSets(headers, c.analyzeFunction(next, headers, depth+1))
+		return true
+	})
+}
+
+func (c *responseHeaderCollector) recordGinResponse(
+	frame helperFrame,
+	call *ast.CallExpr,
+	name string,
+	headers responseHeaderSet,
+) {
+	status := uint16(0)
+	ok := false
+	switch name {
+	case "JSON", "Status", "AbortWithStatus", "Data", "DataFromReader", "Redirect":
+		status, ok = responseStatusInFrame(frame, call, 0)
+	case "File", "FileAttachment", "SSEvent":
+		status, ok = 200, true
+	case "Stream":
+		status, ok = 200, streamCallContainsSSEvent(frame.decl.info, call)
+	}
+	if !ok {
+		return
+	}
+	responseHeaders := cloneResponseHeaderSet(headers)
+	switch name {
+	case "Redirect":
+		if status < 300 || status >= 400 {
+			return
+		}
+		addResponseHeader(responseHeaders, "Location")
+	case "Data", "File":
+		addResponseHeader(responseHeaders, "Content-Type")
+	case "FileAttachment":
+		addResponseHeader(responseHeaders, "Content-Type")
+		addResponseHeader(responseHeaders, "Content-Disposition")
+	case "DataFromReader":
+		addResponseHeader(responseHeaders, "Content-Type")
+		if len(call.Args) > 1 && nonNegativeIntegerConstant(frame.decl.info, call.Args[1]) {
+			addResponseHeader(responseHeaders, "Content-Length")
+		}
+		if len(call.Args) > 4 {
+			extra, resolved := stringMapLiteralKeys(frame, call.Args[4])
+			for _, header := range extra {
+				addResponseHeader(responseHeaders, header)
+			}
+			if !resolved {
+				c.reportUnresolvedHeaderName(frame, call.Args[4].Pos(), "DataFromReader")
+			}
+		}
+	}
+	c.record(status, responseHeaders)
+}
+
+// reportUnresolvedHeaderName records a response header write whose name is not a
+// constant. The header is dropped rather than guessed (rule 3), so the omission
+// has to be visible or the generated contract silently loses it.
+func (c *responseHeaderCollector) reportUnresolvedHeaderName(
+	frame helperFrame,
+	pos token.Pos,
+	subject string,
+) {
+	if c.diagnostics == nil || c.reported[pos] {
+		return
+	}
+	c.reported[pos] = true
+	file, line := positionOf(frame.decl.fset, pos)
+	c.diagnostics.ResponseHeaderUnresolved(
+		c.route.Method,
+		untypedRouteLabel(c.route),
+		subject+" writes a response header under a name that is not a constant",
+		file,
+		line,
+	)
+}
+
+func (c *responseHeaderCollector) record(status uint16, headers responseHeaderSet) {
+	if len(headers) == 0 {
+		return
+	}
+	if c.byStatus[status] == nil {
+		c.byStatus[status] = responseHeaderSet{}
+	}
+	mergeResponseHeaderSets(c.byStatus[status], headers)
+}
+
+func responseStatusInFrame(frame helperFrame, call *ast.CallExpr, index int) (uint16, bool) {
+	if call == nil || index >= len(call.Args) {
+		return 0, false
+	}
+	if status, ok := statusOf(frame.decl.info, call.Args[index]); ok {
+		return status, true
+	}
+	return statusFromLiteral(frameLiteralValue(frame, call.Args[index]))
+}
+
+func addResponseHeader(headers responseHeaderSet, name string) {
+	if name == "" {
+		return
+	}
+	schema := facts.PrimitiveType(facts.StringPrim())
+	if strings.EqualFold(name, "Content-Length") {
+		schema = facts.PrimitiveType(facts.IntPrim(64, false))
+	}
+	headers[strings.ToLower(name)] = facts.ResponseHeaderFact{Name: name, Schema: schema}
+}
+
+func cloneResponseHeaderSet(headers responseHeaderSet) responseHeaderSet {
+	clone := make(responseHeaderSet, len(headers))
+	mergeResponseHeaderSets(clone, headers)
+	return clone
+}
+
+func mergeResponseHeaderSets(target, source responseHeaderSet) {
+	for name, header := range source {
+		target[name] = header
+	}
+}
+
+func nonNegativeIntegerConstant(info *gotypes.Info, expr ast.Expr) bool {
+	value, ok := info.Types[expr]
+	if !ok || value.Value == nil || value.Value.Kind() != constant.Int {
+		return false
+	}
+	integer, exact := constant.Int64Val(value.Value)
+	return exact && integer >= 0
+}
+
+// stringMapLiteralKeys reads the keys of a literal string map. The second result
+// reports whether the whole map was readable: an explicit nil states "no extra
+// headers", a literal whose keys evaluate to constants states exactly those, and
+// anything else is a name typed source cannot state.
+//
+// Keys go through the frame's constant evaluator rather than a literal-only read,
+// so a named constant is as statically known as the string it was declared from.
+func stringMapLiteralKeys(frame helperFrame, expr ast.Expr) ([]string, bool) {
+	if isNilIdent(expr) {
+		return nil, true
+	}
+	literal, ok := expr.(*ast.CompositeLit)
+	if !ok {
+		return nil, false
+	}
+	keys := make([]string, 0, len(literal.Elts))
+	resolved := true
+	for _, element := range literal.Elts {
+		pair, ok := element.(*ast.KeyValueExpr)
+		if !ok {
+			resolved = false
+			continue
+		}
+		if key, ok := frameStringValue(frame, pair.Key); ok {
+			keys = append(keys, key)
+		} else {
+			resolved = false
+		}
+	}
+	return keys, resolved
+}
+
+// responseHeaderMutation reports whether call writes a header on the map the
+// response is actually sent with.
+//
+// The receiver's type is a necessary condition, never a sufficient one:
+// `c.Request.Header` and a local `http.Header` have exactly the same type as
+// `c.Writer.Header()`, so classifying by type alone states inbound and scratch
+// headers as part of the outbound contract. The map has to be provably the
+// writer's own.
+func responseHeaderMutation(frame helperFrame, call *ast.CallExpr) bool {
+	selector, ok := call.Fun.(*ast.SelectorExpr)
+	if !ok || selector.Sel == nil || (selector.Sel.Name != "Set" && selector.Sel.Name != "Add") {
+		return false
+	}
+	if !isNamedType(frameTypeOf(frame, selector.X), "net/http", "Header") {
+		return false
+	}
+	return responseWriterHeaderExpr(frame, selector.X)
+}
+
+// responseWriterHeaderExpr reports whether expr is a response writer's own header
+// map: either `<writer>.Header()` directly, or a variable bound to one.
+func responseWriterHeaderExpr(frame helperFrame, expr ast.Expr) bool {
+	switch node := expr.(type) {
+	case *ast.ParenExpr:
+		return responseWriterHeaderExpr(frame, node.X)
+	case *ast.CallExpr:
+		return isResponseWriterHeaderCall(frame, node)
+	case *ast.Ident:
+		if frame.decl.info == nil {
+			return false
+		}
+		object := frame.decl.info.ObjectOf(node)
+		return object != nil && responseWriterHeaderVars(frame)[object]
+	}
+	return false
+}
+
+func isResponseWriterHeaderCall(frame helperFrame, call *ast.CallExpr) bool {
+	selector, ok := call.Fun.(*ast.SelectorExpr)
+	if !ok || selector.Sel == nil || selector.Sel.Name != "Header" || len(call.Args) != 0 {
+		return false
+	}
+	writer := frameTypeOf(frame, selector.X)
+	return isNamedType(writer, "net/http", "ResponseWriter") ||
+		isNamedType(writer, routes.GinPkgPath, "ResponseWriter")
+}
+
+// responseWriterHeaderVars collects the variables bound to a response writer's
+// header map, so the `h := c.Writer.Header(); h.Set(…)` idiom stays a response
+// fact while an unrelated `http.Header` value does not.
+func responseWriterHeaderVars(frame helperFrame) map[gotypes.Object]bool {
+	vars := map[gotypes.Object]bool{}
+	if frame.decl.decl == nil || frame.decl.decl.Body == nil || frame.decl.info == nil {
+		return vars
+	}
+	ast.Inspect(frame.decl.decl.Body, func(node ast.Node) bool {
+		assign, ok := node.(*ast.AssignStmt)
+		if !ok || len(assign.Rhs) != 1 || len(assign.Lhs) != 1 {
+			return true
+		}
+		call, ok := assign.Rhs[0].(*ast.CallExpr)
+		if !ok || !isResponseWriterHeaderCall(frame, call) {
+			return true
+		}
+		if ident, ok := assign.Lhs[0].(*ast.Ident); ok && ident.Name != "_" {
+			if object := frame.decl.info.ObjectOf(ident); object != nil {
+				vars[object] = true
+			}
+		}
+		return true
+	})
+	return vars
+}
+
+func frameCallPassesResponseContext(frame helperFrame, call *ast.CallExpr) bool {
+	if frameCallPassesGinContext(frame, call) {
+		return true
+	}
+	for _, argument := range call.Args {
+		argumentType := frameTypeOf(frame, argument)
+		if isNamedType(argumentType, "net/http", "Request") ||
+			isNamedType(argumentType, "net/http", "ResponseWriter") {
+			return true
+		}
+	}
+	return false
 }
 
 func (a *Analyzer) addResponse(
@@ -3531,6 +4519,18 @@ func (a *Analyzer) addExtractedParameter(
 	diags *diag.Accumulator,
 ) {
 	if param.Location == "header" && isOpenAPIRepresentationHeader(param.Name) {
+		if strings.EqualFold(param.Name, "Authorization") {
+			key := param.Location + "/authorization"
+			if !seen[key] && diags != nil {
+				seen[key] = true
+				diags.AuthorizationSecurityMissing(
+					route.Method,
+					untypedRouteLabel(route),
+					param.Span.File,
+					param.Span.StartLine,
+				)
+			}
+		}
 		return
 	}
 	key := param.Location + "/" + param.Name
