@@ -1481,6 +1481,7 @@ pub(crate) fn emit_client_with_models(
     if has_basic_auth {
         stdlib.push("import base64".to_string());
     }
+    stdlib.push("import copy".to_string());
     if let PyModelStyle::Dataclass = model_style {
         stdlib.push("import dataclasses".to_string());
     }
@@ -1673,6 +1674,44 @@ class _NoRedirectHandler(urllib.request.HTTPRedirectHandler):
         return None
 
 
+def _origin(url: str) -> tuple[str, str, Optional[int]]:
+    parts = urllib.parse.urlsplit(url)
+    port = parts.port
+    if port is None:
+        port = 443 if parts.scheme.lower() == \"https\" else 80
+    return parts.scheme.lower(), (parts.hostname or \"\").lower(), port
+
+
+class _SafeRedirectHandler(urllib.request.HTTPRedirectHandler):
+    def redirect_request(self, req, fp, code, msg, headers, newurl):
+        redirected = super().redirect_request(req, fp, code, msg, headers, newurl)
+        if redirected is None:
+            return None
+        sensitive = set(getattr(req, \"_gnr8_sensitive_headers\", ()))
+        sensitive.update((\"Authorization\", \"Cookie\", \"Proxy-Authorization\"))
+        setattr(redirected, \"_gnr8_sensitive_headers\", tuple(sensitive))
+        if _origin(req.full_url) != _origin(newurl):
+            for name in sensitive:
+                redirected.remove_header(name)
+        return redirected
+
+
+def _opener_with_redirect_policy(
+    opener: Optional[urllib.request.OpenerDirector],
+    redirect_handler: urllib.request.HTTPRedirectHandler,
+) -> urllib.request.OpenerDirector:
+    if opener is None:
+        return urllib.request.build_opener(redirect_handler)
+    handlers = [
+        copy.copy(handler)
+        for handler in opener.handlers
+        if not isinstance(handler, urllib.request.HTTPRedirectHandler)
+    ]
+    policy_opener = urllib.request.build_opener(*handlers, redirect_handler)
+    policy_opener.addheaders = list(opener.addheaders)
+    return policy_opener
+
+
 class RequestOptions:
     \"\"\"Per-request SDK runtime overrides.\"\"\"
 
@@ -1747,8 +1786,10 @@ class Client:
     ) -> None:
         self._base_url = base_url.rstrip(\"/\")
         self._api_key = api_key
-{auth_field}{bearer_field}{basic_field}{transport_auth_field}        self._opener = opener or urllib.request.build_opener(_NoRedirectHandler())
-        self._redirect_opener = opener or urllib.request.build_opener()
+{auth_field}{bearer_field}{basic_field}{transport_auth_field}        self._opener = _opener_with_redirect_policy(opener, _NoRedirectHandler())
+        self._redirect_opener = _opener_with_redirect_policy(
+            opener, _SafeRedirectHandler()
+        )
         self._timeout = timeout
         self._max_retries = max_retries
         self._retry_statuses = {retry_statuses}
@@ -1905,6 +1946,7 @@ class Client:
         idempotent: bool = False,
         idempotency_key_header: str = \"Idempotency-Key\",
         success_statuses: tuple[int, ...] = (),
+        sensitive_headers: tuple[str, ...] = (),
     ) -> tuple:
         data, content_type = self._encode_body(body, body_encoding, content_type)
         options = request_options or RequestOptions()
@@ -1934,6 +1976,7 @@ class Client:
             req = urllib.request.Request(url, data=data, method=method)
             for key, value in headers.items():
                 req.add_header(key, value)
+            setattr(req, \"_gnr8_sensitive_headers\", sensitive_headers)
             context = HookContext(
                 operation_id=operation_id,
                 method=method,
@@ -1970,10 +2013,7 @@ class Client:
                     _retry_budget -= _delay
                     time.sleep(_delay)
                     continue
-                if (
-                    (status < 200 or status >= 300)
-                    and status not in success_statuses
-                ):
+                if (status < 200 or status >= 300) and status not in success_statuses:
                     self._call_error_hooks(
                         context,
                         ApiError(
@@ -2635,6 +2675,14 @@ fn emit_operation(
     }
     if has_request_headers || has_auth_headers {
         do_args.push("request_headers=_request_headers".to_string());
+    }
+    if !auth_headers.is_empty() {
+        let sensitive_headers = auth_headers
+            .iter()
+            .map(|header| quoted_string_literal(&header.name))
+            .collect::<Vec<_>>()
+            .join(", ");
+        do_args.push(format!("sensitive_headers=({sensitive_headers},)"));
     }
     let runtime = py_operation_runtime(graph, op);
     do_args.push(format!("operation_id={}", quoted_string_literal(&op.id)));
@@ -4209,6 +4257,24 @@ mod tests {
         }
 
         #[test]
+        fn header_api_key_auth_is_removed_from_cross_origin_redirects() {
+            let mut g = ops_graph();
+            g.security = vec![crate::graph::SecurityScheme {
+                id: "HeaderAuth".to_string(),
+                kind: "apiKey".to_string(),
+                location: "header".to_string(),
+                name: "X-API-Key".to_string(),
+                global: true,
+            }];
+            let out = emit_operations(&g, "bookstore", "/", &ops_for(&g, "listBooks")).unwrap();
+            assert!(
+                out.contains("_request_headers[\"X-API-Key\"]")
+                    && out.contains("sensitive_headers=(\"X-API-Key\",)"),
+                "{out}"
+            );
+        }
+
+        #[test]
         fn http_auth_marks_operation_dispatch() {
             let mut g = ops_graph();
             g.security = vec![
@@ -4353,7 +4419,11 @@ mod tests {
                 out.contains("opener: Optional[urllib.request.OpenerDirector] = None"),
                 "{out}"
             );
-            assert!(out.contains("urllib.request.build_opener()"), "{out}");
+            assert!(
+                out.contains("_opener_with_redirect_policy(opener, _NoRedirectHandler())")
+                    && out.contains("opener, _SafeRedirectHandler()"),
+                "{out}"
+            );
             assert!(out.contains("except urllib.error.HTTPError as e:"), "{out}");
             // no third-party HTTP libs (PYSDK-01).
             assert!(!out.contains("import requests"), "{out}");

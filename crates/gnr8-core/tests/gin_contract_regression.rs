@@ -142,6 +142,7 @@ fn assert_typescript_client(ts_client: &str) {
             && ts_client.contains("contentType: \"application/json\"")
             && ts_client.contains("contentType: \"multipart/form-data\"")
             && ts_client.contains("files?: Array<Blob | ArrayBuffer | Uint8Array>")
+            && ts_client.contains("opaqueRedirect?: boolean;")
             && ts_client
                 .contains("redirect: options.followRedirects === true ? \"follow\" : \"manual\""),
         "{ts_client}"
@@ -213,69 +214,9 @@ fn assert_python_models(py_models: &str) {
 }
 
 fn assert_openapi(openapi: &str) {
-    let upload = path_section(openapi, "/v1/files/upload");
-    assert!(
-        upload.contains("required: true")
-            && upload.contains("application/json:")
-            && upload.contains("#/components/schemas/UpdateItemRequest")
-            && upload.contains("multipart/form-data:")
-            && upload.contains("#/components/schemas/UploadFileFormRequest"),
-        "{upload}"
-    );
-    let upload_form = openapi
-        .split("    UploadFileFormRequest:\n")
-        .nth(1)
-        .expect("UploadFileFormRequest component");
-    assert!(
-        upload_form.contains("files:")
-            && upload_form.contains("format: binary")
-            && upload_form.contains("request:\n          type: string")
-            && !upload_form.contains("required:"),
-        "{upload_form}"
-    );
-
-    let redirect = path_section(openapi, "/v1/files/{fileId}/redirect");
-    assert!(
-        redirect.contains("'307':")
-            && redirect.contains("Location:")
-            && redirect.contains("X-Session-ID:"),
-        "{redirect}"
-    );
-    let helper_redirect = path_section(openapi, "/v1/files/{fileId}/helper-redirect");
-    assert!(
-        helper_redirect.contains("'302':") && helper_redirect.contains("Location:"),
-        "{helper_redirect}"
-    );
-    let read = path_section(openapi, "/v1/files/{fileId}/read");
-    for header in [
-        "Content-Disposition:",
-        "Content-Length:",
-        "Content-Type:",
-        "X-Session-ID:",
-    ] {
-        assert!(read.contains(header), "missing {header} in {read}");
-    }
-
-    let observations = path_section(openapi, "/v1/items/request-observations");
-    assert!(
-        observations.contains("name: X-Observed\n        in: header\n        required: false")
-            && observations
-                .contains("name: X-Required\n        in: header\n        required: true")
-            && observations
-                .contains("name: observed-cookie\n        in: cookie\n        required: false")
-            && observations
-                .contains("name: required-cookie\n        in: cookie\n        required: true")
-            && !observations.contains("Authorization"),
-        "{observations}"
-    );
-    let search = path_section(openapi, "/v1/items/search");
-    assert!(
-        search.contains("name: offset\n        in: query\n        required: false")
-            && search.contains("name: page\n        in: query\n        required: true")
-            && search.contains("default: first")
-            && search.contains("default: asc"),
-        "{search}"
-    );
+    assert_openapi_request_contracts(openapi);
+    assert_openapi_response_contracts(openapi);
+    assert_openapi_parameter_contracts(openapi);
 
     let directional = openapi
         .split("    DirectionalResponse:\n")
@@ -317,6 +258,104 @@ fn assert_openapi(openapi: &str) {
         .next()
         .expect("bounded ids property");
     assert!(!ids.contains("null"), "{ids}");
+}
+
+fn assert_openapi_request_contracts(openapi: &str) {
+    let upload = path_section(openapi, "/v1/files/upload");
+    assert!(
+        upload.contains("required: true")
+            && upload.contains("application/json:")
+            && upload.contains("#/components/schemas/CreateUploadRequest")
+            && upload.contains("multipart/form-data:")
+            && upload.contains("#/components/schemas/UploadFileFormRequest"),
+        "{upload}"
+    );
+    let upload_form = openapi
+        .split("    UploadFileFormRequest:\n")
+        .nth(1)
+        .expect("UploadFileFormRequest component");
+    assert!(
+        upload_form.contains("files:")
+            && upload_form.contains("format: binary")
+            && upload_form.contains("request:\n          type: string")
+            && upload_form.contains("required: [request]"),
+        "{upload_form}"
+    );
+    let update_upload = path_section(openapi, "/v1/files/upload/{fileId}");
+    assert!(
+        update_upload.contains("application/json:")
+            && update_upload.contains("#/components/schemas/UpdateItemRequest")
+            && update_upload.contains("multipart/form-data:")
+            && update_upload.contains("required: true"),
+        "{update_upload}"
+    );
+}
+
+fn assert_openapi_response_contracts(openapi: &str) {
+    let redirect = path_section(openapi, "/v1/files/{fileId}/redirect");
+    assert!(
+        redirect.contains("'307':")
+            && redirect.contains("Location:")
+            && redirect.contains("X-Session-ID:"),
+        "{redirect}"
+    );
+    let helper_redirect = path_section(openapi, "/v1/files/{fileId}/helper-redirect");
+    assert!(
+        helper_redirect.contains("'302':") && helper_redirect.contains("Location:"),
+        "{helper_redirect}"
+    );
+    let read = path_section(openapi, "/v1/files/{fileId}/read");
+    for header in [
+        "Content-Disposition:",
+        "Content-Length:",
+        "Content-Type:",
+        "X-Session-ID:",
+    ] {
+        assert!(read.contains(header), "missing {header} in {read}");
+    }
+    let not_found = read
+        .split("      '404':\n")
+        .nth(1)
+        .expect("readFile 404 response")
+        .split("      '")
+        .next()
+        .expect("readFile 404 section");
+    for header in [
+        "Content-Disposition:",
+        "Content-Length:",
+        "Content-Type:",
+        "X-Session-ID:",
+    ] {
+        assert!(
+            !not_found.contains(header),
+            "success-only {header} leaked onto 404: {not_found}"
+        );
+    }
+}
+
+fn assert_openapi_parameter_contracts(openapi: &str) {
+    let observations = path_section(openapi, "/v1/items/request-observations");
+    assert!(
+        observations.contains("name: X-Observed\n        in: header\n        required: false")
+            && observations
+                .contains("name: X-Required\n        in: header\n        required: true")
+            && observations
+                .contains("name: X-Helper-Observed\n        in: header\n        required: false")
+            && observations
+                .contains("name: observed-cookie\n        in: cookie\n        required: false")
+            && observations
+                .contains("name: required-cookie\n        in: cookie\n        required: true")
+            && !observations.contains("Authorization"),
+        "{observations}"
+    );
+    let search = path_section(openapi, "/v1/items/search");
+    assert!(
+        search.contains("name: offset\n        in: query\n        required: false")
+            && search.contains("name: page\n        in: query\n        required: true")
+            && search.contains("default: first")
+            && search.contains("default: asc"),
+        "{search}"
+    );
 }
 
 fn path_section<'a>(openapi: &'a str, path: &str) -> &'a str {

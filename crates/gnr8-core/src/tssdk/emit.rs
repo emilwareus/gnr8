@@ -665,6 +665,7 @@ export interface HookContext {{
   requestMetadata: Record<string, string>;
   status?: number;
   responseHeaders?: Headers;
+  opaqueRedirect?: boolean;
 }}
 
 export type RequestHook = (
@@ -1028,8 +1029,15 @@ export class Client {{
       if (response === undefined) {{
         throw new Error(\"request failed without response\");
       }}
+      const opaqueRedirect =
+        response.type === \"opaqueredirect\" &&
+        options.followRedirects !== true &&
+        (context.successStatuses ?? []).some(
+          (status) => status >= 300 && status < 400,
+        );
       hookContext.status = response.status;
       hookContext.responseHeaders = response.headers;
+      hookContext.opaqueRedirect = opaqueRedirect;
       try {{
         for (const hook of this.hooks.response) {{
           await hook(hookContext, response);
@@ -1058,7 +1066,8 @@ export class Client {{
       }}
       if (
         (response.status < 200 || response.status >= 300) &&
-        !(context.successStatuses ?? []).includes(response.status)
+        !(context.successStatuses ?? []).includes(response.status) &&
+        !opaqueRedirect
       ) {{
         const error = new ApiError(response.status, {{
           headers: response.headers,
@@ -1977,10 +1986,15 @@ fn emit_operation(
         })
         .collect();
     let return_model = success.body_model.clone();
+    let has_redirect = success
+        .statuses
+        .iter()
+        .any(|status| (300..400).contains(status));
+    let has_empty_wire_outcome = success.has_bodyless_alternative() || has_redirect;
     // A typed body/response references a model symbol re-exported from ./models; reference it through the
     // `models` namespace import so client.ts has no per-name import to compute (determinism).
     let return_ty = if success.has_binary_body() {
-        if success.has_bodyless_alternative() {
+        if has_empty_wire_outcome {
             "Blob | undefined".to_string()
         } else {
             "Blob".to_string()
@@ -1989,7 +2003,7 @@ fn emit_operation(
         return_model.as_ref().map_or_else(
             || "void".to_string(),
             |m| {
-                if success.has_bodyless_alternative() {
+                if has_empty_wire_outcome {
                     format!("models.{m} | undefined")
                 } else {
                     format!("models.{m}")
@@ -3196,12 +3210,22 @@ fn emit_error_throw_branch(
     if redirects.is_empty() {
         writeln!(out, "    if (res.status < 200 || res.status >= 300) {{").map_err(sink)?;
     } else {
+        writeln!(out, "    if (").map_err(sink)?;
+        writeln!(out, "      (res.status < 200 || res.status >= 300) &&").map_err(sink)?;
         writeln!(
             out,
-            "    if ((res.status < 200 || res.status >= 300) && !({})) {{",
+            "      !({}) &&",
             ts_status_match("res.status", &redirects)
         )
         .map_err(sink)?;
+        writeln!(out, "      !(").map_err(sink)?;
+        writeln!(
+            out,
+            "        res.type === \"opaqueredirect\" && options?.followRedirects !== true"
+        )
+        .map_err(sink)?;
+        writeln!(out, "      )").map_err(sink)?;
+        writeln!(out, "    ) {{").map_err(sink)?;
     }
     writeln!(
         out,
@@ -3324,6 +3348,10 @@ fn emit_op_dispatch(
     graph: &ApiGraph,
     args: &ResolvedArgs,
 ) -> Result<(), CoreError> {
+    let has_redirect = success
+        .statuses
+        .iter()
+        .any(|status| (300..400).contains(status));
     writeln!(out, "    const headers: Record<string, string> = {{}};").map_err(sink)?;
     emit_ts_header_parameters(out, args)?;
     for (idx, header) in auth_headers.iter().enumerate() {
@@ -3453,6 +3481,15 @@ fn emit_op_dispatch(
     writeln!(out, "      options,").map_err(sink)?;
     writeln!(out, "    );").map_err(sink)?;
     emit_error_throw_branch(out, error_bodies, success)?;
+    if has_redirect {
+        writeln!(
+            out,
+            "    if (res.type === \"opaqueredirect\" && options?.followRedirects !== true) {{"
+        )
+        .map_err(sink)?;
+        writeln!(out, "      return undefined;").map_err(sink)?;
+        writeln!(out, "    }}").map_err(sink)?;
+    }
     if success.has_binary_body() {
         writeln!(
             out,

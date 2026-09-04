@@ -24,6 +24,7 @@ export interface HookContext {
   requestMetadata: Record<string, string>;
   status?: number;
   responseHeaders?: Headers;
+  opaqueRedirect?: boolean;
 }
 
 export type RequestHook = (
@@ -389,8 +390,15 @@ export class Client {
       if (response === undefined) {
         throw new Error("request failed without response");
       }
+      const opaqueRedirect =
+        response.type === "opaqueredirect" &&
+        options.followRedirects !== true &&
+        (context.successStatuses ?? []).some(
+          (status) => status >= 300 && status < 400,
+        );
       hookContext.status = response.status;
       hookContext.responseHeaders = response.headers;
+      hookContext.opaqueRedirect = opaqueRedirect;
       try {
         for (const hook of this.hooks.response) {
           await hook(hookContext, response);
@@ -419,7 +427,8 @@ export class Client {
       }
       if (
         (response.status < 200 || response.status >= 300) &&
-        !(context.successStatuses ?? []).includes(response.status)
+        !(context.successStatuses ?? []).includes(response.status) &&
+        !opaqueRedirect
       ) {
         const error = new ApiError(response.status, {
           headers: response.headers,

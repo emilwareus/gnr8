@@ -74,11 +74,11 @@ func TestRequestBodyVariantsAndRedirectPolicy(t *testing.T) {
 	)
 
 	if _, err := client.UploadFile(context.Background(), UploadFileJSONBody{
-		Value: UpdateItemRequest{Name: Ptr(Ptr("json"))},
+		Value: CreateUploadRequest{Title: Ptr(Ptr("json"))},
 	}); err != nil {
 		t.Fatalf("JSON upload: %v", err)
 	}
-	if got := transport.requests[len(transport.requests)-1]; got.contentType != "application/json" || string(got.body) != `{"name":"json"}` {
+	if got := transport.requests[len(transport.requests)-1]; got.contentType != "application/json" || string(got.body) != `{"title":"json"}` {
 		t.Fatalf("JSON wire body: %+v", got)
 	}
 
@@ -91,10 +91,7 @@ func TestRequestBodyVariantsAndRedirectPolicy(t *testing.T) {
 			NewMultipartFile("two.txt", []byte("two")),
 		},
 	} {
-		body := UploadFileFormRequest{Files: files}
-		if len(files) > 0 {
-			body.Request = &requestJSON
-		}
+		body := UploadFileFormRequest{Request: requestJSON, Files: files}
 		if _, err := client.UploadFile(context.Background(), UploadFileMultipartBody{Value: body}); err != nil {
 			t.Fatalf("multipart upload with %d files: %v", len(files), err)
 		}
@@ -104,10 +101,11 @@ func TestRequestBodyVariantsAndRedirectPolicy(t *testing.T) {
 			t.Fatalf("multipart files: got %d, want %d (%+v)", len(parts["files"]), len(files), parts)
 		}
 		if len(files) == 0 {
-			if _, emitted := parts["request"]; emitted {
-				t.Fatalf("nil multipart fields must be omitted: %+v", parts)
+			if _, emitted := parts["files"]; emitted {
+				t.Fatalf("nil multipart file field must be omitted: %+v", parts)
 			}
-		} else if got := string(parts["request"][0]); got != requestJSON {
+		}
+		if got := string(parts["request"][0]); got != requestJSON {
 			t.Fatalf("multipart JSON string part = %q, want %q", got, requestJSON)
 		}
 	}

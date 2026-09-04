@@ -25,6 +25,10 @@ type UpdateItemRequest struct {
 	Name string `json:"name"`
 }
 
+type CreateUploadRequest struct {
+	Title string `json:"title"`
+}
+
 type ItemResponse struct {
 	ID   string `json:"id"`
 	Name string `json:"name"`
@@ -101,6 +105,7 @@ func RegisterRoutes(r *gin.Engine, h *Handler) {
 	files.GET("/:fileId/redirect", h.redirectFile)
 	files.GET("/:fileId/helper-redirect", h.helperRedirectFile)
 	files.POST("/upload", h.uploadFile)
+	files.PATCH("/upload/:fileId", h.updateUploadFile)
 	files.POST("/dynamic-upload", h.dynamicUpload)
 
 	items := v1.Group("/items")
@@ -183,6 +188,10 @@ func (h *Handler) streamFile(c *gin.Context) {
 }
 
 func (h *Handler) readFile(c *gin.Context) {
+	if c.GetHeader("X-Force-Missing") != "" {
+		c.JSON(http.StatusNotFound, MessageResponse{Message: "not found"})
+		return
+	}
 	c.DataFromReader(http.StatusOK, 12, attachmentContentType(), strings.NewReader("hello"), map[string]string{
 		"Content-Disposition": `attachment; filename="report.pdf"`,
 		"X-Session-ID":        "session-123",
@@ -203,17 +212,43 @@ func redirectResponse(c *gin.Context, location string, status int) {
 }
 
 func (h *Handler) uploadFile(c *gin.Context) {
-	var body UpdateItemRequest
+	_, err := parseUploadRequest[CreateUploadRequest](c)
+	if err != nil {
+		c.JSON(http.StatusBadRequest, MessageResponse{Message: err.Error()})
+		return
+	}
+	c.Status(http.StatusNoContent)
+}
+
+func (h *Handler) updateUploadFile(c *gin.Context) {
+	_ = c.Param("fileId")
+	_, err := parseUploadRequest[UpdateItemRequest](c)
+	if err != nil {
+		c.JSON(http.StatusBadRequest, MessageResponse{Message: err.Error()})
+		return
+	}
+	c.Status(http.StatusNoContent)
+}
+
+func parseUploadRequest[T any](c *gin.Context) (T, error) {
+	var body T
 	if c.GetHeader("Content-Type") == "application/json" {
 		_ = c.ShouldBindJSON(&body)
 	} else {
 		raw := c.PostForm("request")
+		if raw == "" {
+			return body, fmt.Errorf("request is required")
+		}
 		_ = json.Unmarshal([]byte(raw), &body)
-		form, _ := c.MultipartForm()
-		files := form.File["files"]
-		_ = files
+		parseUploadFiles(c)
 	}
-	c.Status(http.StatusNoContent)
+	return body, nil
+}
+
+func parseUploadFiles(c *gin.Context) {
+	form, _ := c.MultipartForm()
+	files := form.File["files"]
+	_ = files
 }
 
 func (h *Handler) dynamicUpload(c *gin.Context) {
@@ -285,6 +320,7 @@ func (h *Handler) searchItems(c *gin.Context) {
 
 func (h *Handler) requestObservations(c *gin.Context) {
 	_ = c.GetHeader("X-Observed")
+	_ = helperObservedHeader(c)
 	if c.GetHeader("X-Required") == "" {
 		c.AbortWithStatus(http.StatusBadRequest)
 		return
@@ -297,6 +333,10 @@ func (h *Handler) requestObservations(c *gin.Context) {
 	}
 	_ = c.GetHeader("Authorization")
 	c.Status(http.StatusNoContent)
+}
+
+func helperObservedHeader(c *gin.Context) string {
+	return c.Request.Header.Get("X-Helper-Observed")
 }
 
 func (h *Handler) attendance(c *gin.Context) {

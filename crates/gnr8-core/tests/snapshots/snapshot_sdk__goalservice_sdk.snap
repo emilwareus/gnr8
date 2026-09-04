@@ -1,6 +1,5 @@
 ---
 source: crates/gnr8-core/tests/snapshot_sdk.rs
-assertion_line: 27
 expression: sdk
 ---
 // ==== gnr8:file client.go ====

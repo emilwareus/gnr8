@@ -257,11 +257,17 @@ JSON, `application/*+json`, form, multipart, text, and binary choices use the sa
 classification in every target. Multipart array fields become repeated parts; absent or null fields
 are omitted.
 
-Declared 3xx responses are successful operation outcomes. Their status and headers are visible to
-response hooks. Generated clients do not follow redirects by default, so a download location or
-session header is not silently lost. Callers opt in per request with `WithFollowRedirects(true)` in
-Go, `{ followRedirects: true }` in TypeScript, or
-`RequestOptions(follow_redirects=True)` in Python.
+Declared 3xx responses are successful operation outcomes. Generated clients do not follow redirects
+by default. Go, Python, and server-side TypeScript Fetch implementations expose the actual status and
+headers to response hooks. Browser Fetch instead returns an `opaqueredirect` response whose status is
+`0` and whose headers are inaccessible; for an operation with a declared 3xx, TypeScript accepts that
+as an opaque success and sets `HookContext.opaqueRedirect` without inventing a status or `Location`.
+
+Callers opt in per request with `WithFollowRedirects(true)` in Go,
+`{ followRedirects: true }` in TypeScript, or `RequestOptions(follow_redirects=True)` in Python. The
+Python client enforces both policies even when an `OpenerDirector` is injected, and strips
+`Authorization`, `Cookie`, `Proxy-Authorization`, and configured header API-key credentials before a
+cross-origin redirect.
 
 ## Static companion files
 

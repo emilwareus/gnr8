@@ -121,6 +121,7 @@ func TestGinContractRegressionFacts(t *testing.T) {
 	}
 	for _, name := range []string{"Content-Disposition", "Content-Length", "Content-Type", "X-Session-ID"} {
 		assertResponseHeader(t, reader, 200, name)
+		assertNoResponseHeader(t, reader, 404, name)
 	}
 	redirect := routeByHandler(t, doc, "redirectFile")
 	assertBodylessStatus(t, redirect, 307)
@@ -131,7 +132,7 @@ func TestGinContractRegressionFacts(t *testing.T) {
 	assertResponseHeader(t, helperRedirect, 302, "Location")
 
 	upload := routeByHandler(t, doc, "uploadFile")
-	if upload.RequestBody == nil || upload.RequestBody.RefID != "UpdateItemRequest" || upload.RequestBodyContentType != "application/json" {
+	if upload.RequestBody == nil || upload.RequestBody.RefID != "CreateUploadRequest" || upload.RequestBodyContentType != "application/json" {
 		t.Fatalf("upload JSON request body mismatch: %+v", upload)
 	}
 	if len(upload.RequestBodyVariants) != 1 || upload.RequestBodyVariants[0].ContentType != "multipart/form-data" {
@@ -150,7 +151,7 @@ func TestGinContractRegressionFacts(t *testing.T) {
 	for _, field := range uploadFields {
 		fieldByName[field.JSONName] = field
 	}
-	if fieldByName["request"].Schema.Type != facts.TypePrimitive || fieldByName["request"].ValidatorRequiresPresence {
+	if fieldByName["request"].Schema.Type != facts.TypePrimitive || !fieldByName["request"].ValidatorRequiresPresence {
 		t.Fatalf("upload JSON string part mismatch: %+v", fieldByName["request"])
 	}
 	files := fieldByName["files"]
@@ -160,6 +161,12 @@ func TestGinContractRegressionFacts(t *testing.T) {
 	}
 	if !jsonEqual(t, filesSchema, []byte(`{"type":"array","of":{"type":"primitive","of":{"prim":"bytes"}}}`)) || files.ValidatorRequiresPresence {
 		t.Fatalf("upload repeated file parts mismatch: %+v", files)
+	}
+	updateUpload := routeByHandler(t, doc, "updateUploadFile")
+	if updateUpload.RequestBody == nil || updateUpload.RequestBody.RefID != "UpdateItemRequest" ||
+		len(updateUpload.RequestBodyVariants) != 1 ||
+		updateUpload.RequestBodyVariants[0].ContentType != "multipart/form-data" {
+		t.Fatalf("second generic upload instantiation mismatch: %+v", updateUpload)
 	}
 	events := routeByHandler(t, doc, "itemEvents")
 	if events.Responses[0].BodyKind != "sse" || events.Responses[0].ContentType != "text/event-stream" {
@@ -183,6 +190,7 @@ func TestGinContractRegressionFacts(t *testing.T) {
 
 	observations := routeByHandler(t, doc, "requestObservations")
 	assertRequestParam(t, observations, "header", "X-Observed", false)
+	assertRequestParam(t, observations, "header", "X-Helper-Observed", false)
 	assertRequestParam(t, observations, "header", "X-Required", true)
 	assertRequestParam(t, observations, "cookie", "observed-cookie", false)
 	assertRequestParam(t, observations, "cookie", "required-cookie", true)
@@ -374,6 +382,22 @@ func assertResponseHeader(t *testing.T, route facts.RouteFact, status uint16, na
 			}
 		}
 		t.Fatalf("%s response %d should declare header %s, got %+v", route.Handler, status, name, response.Headers)
+	}
+	t.Fatalf("%s should have response %d, got %+v", route.Handler, status, route.Responses)
+}
+
+func assertNoResponseHeader(t *testing.T, route facts.RouteFact, status uint16, name string) {
+	t.Helper()
+	for _, response := range route.Responses {
+		if response.Status != status {
+			continue
+		}
+		for _, header := range response.Headers {
+			if header.Name == name {
+				t.Fatalf("%s response %d must not declare header %s, got %+v", route.Handler, status, name, response.Headers)
+			}
+		}
+		return
 	}
 	t.Fatalf("%s should have response %d, got %+v", route.Handler, status, route.Responses)
 }
