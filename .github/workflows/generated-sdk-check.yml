@@ -125,11 +125,9 @@ jobs:
           # pull requests do not want the comment, and the report still reaches the job summary and
           # the uploaded artifact, which is what this job asserts the composite path produces.
           report-api-changes: ${{ matrix.report_changes }}
-          # HEAD, not origin/main: the base must already carry the committed graph artifact this
-          # release introduces, and main does not until this branch merges. HEAD asserts that the
-          # committed artifact matches a fresh projection, which is deterministic before and after
-          # the merge; switch it to origin/main once main carries the artifacts.
-          base-ref: HEAD
+          # Main now carries the committed graph artifact, so this exercise uses the same base
+          # the action documents for callers.
+          base-ref: origin/main
 
   check:
     name: gnr8 check

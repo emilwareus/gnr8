@@ -9,6 +9,8 @@ must move the minor version.
 
 ## Unreleased
 
+## 0.12.0 — 2026-09-04
+
 ### Breaking
 
 - **`OperationSelector` adds the `SourcePrefix` variant.** Custom Rust code that exhaustively matches
@@ -47,6 +49,20 @@ must move the minor version.
 - **The GitHub Action can publish API-change reports.** `report-api-changes`, `base-ref`, and
   `exempt-tags` add Markdown/JSON artifacts, a job summary, a marker-owned pull-request comment when
   permitted, and a final checked-breaking gate.
+
+### Changed
+
+- **The GitHub Action's in-repo API-change reporting exercise now compares against `origin/main`.**
+  The bookstore job used `HEAD` until main carried the committed graph artifact; that base is now
+  the same default the action documents for callers.
+
+### Fixed
+
+- **Change-taxonomy tests now pin request-body presence and requiredness, security-scheme removal
+  and shape change, and schema rename.** The codes `request.body.added`, `request.body.removed`,
+  `request.body.required.added`, `request.body.required.removed`, `security.scheme.removed`,
+  `security.scheme.changed`, and `schema.name.changed` already classified those diffs; the tests
+  record their kind, message, and span.
 
 ## 0.11.0 — 2026-09-04
 
