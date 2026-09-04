@@ -153,6 +153,16 @@ and deterministically sorted changes with stable dotted codes, effective tags an
 for both graph sides, the derived `gating` result, affected SDK operations on both extant sides, and
 current source locations where available.
 
+Human output keeps the three columns — kind, operation, message — and appends an exemption suffix
+when a breaking finding is not gating. When a current source location exists, it also appends
+`file:line` (or `file` when the line is unknown):
+
+```text
+BREAKING  POST /books         request field `title` became required  handlers.go:42
+BREAKING  GET /tasks/_debug   response field `count` removed  (exempt on both sides; not gating)
+ADDITIVE  GET /books          optional response field `nextCursor` added  handlers.go:88
+```
+
 The dotted codes are a stable machine-facing taxonomy:
 
 ```text

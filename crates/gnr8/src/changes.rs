@@ -101,13 +101,15 @@ pub(crate) fn render_human(report: &ChangeReport) -> String {
     for change in &report.changes {
         let operation = change.operation.as_deref().unwrap_or("-");
         let suffix = exemption_suffix(change);
+        let location = location_suffix(change);
         let _ = writeln!(
             text,
-            "{:<9} {:<19} {}{}",
+            "{:<9} {:<19} {}{}{}",
             kind_label(change.kind),
             operation,
             change.message,
-            suffix
+            suffix,
+            location
         );
     }
     text
@@ -254,6 +256,16 @@ fn exemption_suffix(change: &Change) -> &'static str {
     }
 }
 
+fn location_suffix(change: &Change) -> String {
+    let Some(file) = change.file.as_deref().filter(|file| !file.is_empty()) else {
+        return String::new();
+    };
+    match change.line {
+        Some(line) => format!("  {file}:{line}"),
+        None => format!("  {file}"),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     #![allow(clippy::expect_used)]
@@ -327,6 +339,65 @@ mod tests {
         assert!(rendered.contains("BREAKING  DELETE /books/{id}  operation removed\n"));
         assert!(rendered.contains("(exempt on base side; not gating)"));
         assert!(rendered.starts_with("changes: exempt tags: internal\n"));
+    }
+
+    #[test]
+    fn human_report_appends_source_location_when_present() {
+        let mut located = finding(
+            ChangeKind::Breaking,
+            true,
+            Sides {
+                base: Some(false),
+                current: Some(false),
+            },
+        );
+        located.file = Some("handlers/books.go".to_string());
+        located.line = Some(42);
+        located.message = "request field `title` became required".to_string();
+        located.operation = Some("POST /books".to_string());
+
+        let mut exempt_located = finding(
+            ChangeKind::Breaking,
+            false,
+            Sides {
+                base: Some(true),
+                current: None,
+            },
+        );
+        exempt_located.file = Some("handlers/debug.go".to_string());
+        exempt_located.line = Some(12);
+
+        let mut file_only = located.clone();
+        file_only.line = None;
+        file_only.file = Some("handlers/books.go".to_string());
+
+        let mut empty_file = located.clone();
+        empty_file.file = Some(String::new());
+        empty_file.line = Some(42);
+
+        let report = ChangeReport {
+            policy: ChangePolicy {
+                exempt_tags: vec!["internal".to_string()],
+            },
+            summary: ChangeSummary {
+                breaking: 2,
+                additive: 0,
+                doc_only: 0,
+                gating: 1,
+            },
+            changes: vec![located, exempt_located, file_only, empty_file],
+        };
+        let rendered = render_human(&report);
+        assert_eq!(
+            rendered,
+            concat!(
+                "changes: exempt tags: internal\n",
+                "BREAKING  POST /books         request field `title` became required  handlers/books.go:42\n",
+                "BREAKING  DELETE /books/{id}  operation removed  (exempt on base side; not gating)  handlers/debug.go:12\n",
+                "BREAKING  POST /books         request field `title` became required  handlers/books.go\n",
+                "BREAKING  POST /books         request field `title` became required\n",
+            )
+        );
     }
 
     #[test]

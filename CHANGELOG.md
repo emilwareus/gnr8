@@ -36,9 +36,10 @@ must move the minor version.
 - **`gnr8 changes --base <ref> [--exempt-tag <name>]...` classifies committed API changes.** It
   compares the current projected graph with `generated/gnr8.graph.json` at the base commit, reports
   breaking, additive, and documentation-only findings in human or JSON form, and exits 1 only when a
-  checked breaking finding exists. Exact standard operation tags can exempt a finding only when
-  every extant side is exempt; schema scope follows all transitive consumers independently on both
-  graphs.
+  checked breaking finding exists. The human report is the three-column kind/operation/message
+  layout; a current `file:line` is appended when the finding has one. Exact standard operation tags
+  can exempt a finding only when every extant side is exempt; schema scope follows all transitive
+  consumers independently on both graphs.
 - **`gnr8 changes --markdown` prints the report as Markdown.** It carries the base revision, the
   exempt-tag policy, the summary counts, and every finding with its affected SDK operations and
   source location, ready for a job summary or a pull-request comment. It selects the report format,
