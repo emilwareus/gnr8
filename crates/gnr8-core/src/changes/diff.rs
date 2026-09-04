@@ -1586,68 +1586,15 @@ fn compare_fields(
                 );
             }
             Some(current_field) => {
-                compare_field_axes(field, current_field, name, &subject, directions, scope, out);
-                compare_type(
-                    &field.schema,
-                    &current_field.schema,
+                compare_existing_field(
+                    field,
+                    current_field,
+                    name,
                     &subject,
                     directions,
                     scope,
                     out,
                 );
-                if field.description != current_field.description
-                    || field.example != current_field.example
-                {
-                    out.push(
-                        scope,
-                        ChangeKind::DocOnly,
-                        "schema.property.documentation.changed",
-                        Some(subject.clone()),
-                        format!("field `{name}` documentation changed"),
-                    );
-                }
-                // An imported OpenAPI inline enum is represented as `Type::Enum` for SDK typing
-                // and mirrored in field constraints for exact schema keywords. It is one public
-                // fact, and `compare_type` immediately above already reported its membership and
-                // order. Constraint-only string enums still need this separate path.
-                let constraints_mirror_type = enum_constraints_mirror_type(field)
-                    && enum_constraints_mirror_type(current_field);
-                if !constraints_mirror_type {
-                    compare_enum(
-                        &field.meta.constraints.enum_values,
-                        &current_field.meta.constraints.enum_values,
-                        &subject,
-                        directions,
-                        scope,
-                        out,
-                    );
-                    if enum_source_order_changed(
-                        &field.meta.constraints.enum_values,
-                        &current_field.meta.constraints.enum_values,
-                    ) {
-                        out.push(
-                            scope,
-                            ChangeKind::DocOnly,
-                            "schema.enum.order.changed",
-                            Some(subject.clone()),
-                            format!("field `{name}` enum declaration order changed"),
-                        );
-                    }
-                }
-                let mut base_meta = field.meta.clone();
-                let mut current_meta = current_field.meta.clone();
-                base_meta.constraints.enum_values.clear();
-                current_meta.constraints.enum_values.clear();
-                if base_meta != current_meta {
-                    let prefix = directions.prefix(true);
-                    out.push(
-                        scope,
-                        ChangeKind::Breaking,
-                        property_code(prefix, "constraints.changed"),
-                        Some(subject),
-                        format!("{prefix} field `{name}` constraints changed"),
-                    );
-                }
             }
         }
     }
@@ -1671,6 +1618,78 @@ fn compare_fields(
                 ),
             );
         }
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+fn compare_existing_field(
+    base: &Field,
+    current: &Field,
+    name: &str,
+    subject: &str,
+    directions: TypeDirections,
+    scope: &Scope,
+    out: &mut Collector,
+) {
+    compare_field_axes(base, current, name, subject, directions, scope, out);
+    compare_type(
+        &base.schema,
+        &current.schema,
+        subject,
+        directions,
+        scope,
+        out,
+    );
+    if base.description != current.description || base.example != current.example {
+        out.push(
+            scope,
+            ChangeKind::DocOnly,
+            "schema.property.documentation.changed",
+            Some(subject.to_string()),
+            format!("field `{name}` documentation changed"),
+        );
+    }
+    // An imported OpenAPI inline enum is represented as `Type::Enum` for SDK typing and mirrored
+    // in field constraints for exact schema keywords. It is one public fact, and `compare_type`
+    // immediately above already reported its membership and order. Constraint-only string enums
+    // still need this separate path.
+    let constraints_mirror_type =
+        enum_constraints_mirror_type(base) && enum_constraints_mirror_type(current);
+    if !constraints_mirror_type {
+        compare_enum(
+            &base.meta.constraints.enum_values,
+            &current.meta.constraints.enum_values,
+            subject,
+            directions,
+            scope,
+            out,
+        );
+        if enum_source_order_changed(
+            &base.meta.constraints.enum_values,
+            &current.meta.constraints.enum_values,
+        ) {
+            out.push(
+                scope,
+                ChangeKind::DocOnly,
+                "schema.enum.order.changed",
+                Some(subject.to_string()),
+                format!("field `{name}` enum declaration order changed"),
+            );
+        }
+    }
+    let mut base_meta = base.meta.clone();
+    let mut current_meta = current.meta.clone();
+    base_meta.constraints.enum_values.clear();
+    current_meta.constraints.enum_values.clear();
+    if base_meta != current_meta {
+        let prefix = directions.prefix(true);
+        out.push(
+            scope,
+            ChangeKind::Breaking,
+            property_code(prefix, "constraints.changed"),
+            Some(subject.to_string()),
+            format!("{prefix} field `{name}` constraints changed"),
+        );
     }
 }
 

@@ -236,7 +236,7 @@ fn collect_named_refs<'a>(ty: &'a Type, out: &mut Vec<&'a str>) {
 ///
 /// Imported parameters retain documentation examples and opaque vendor extensions beside their
 /// schema. A user payload or extension object may itself contain a property named `$ref`; that value
-/// is data, not an OpenAPI Reference Object, and must not turn an otherwise consumerless schema into
+/// is data, not an `OpenAPI` Reference Object, and must not turn an otherwise consumerless schema into
 /// an operation-scoped schema. Visit only the typed schema and the exact schema-bearing positions of
 /// the preserved Parameter/Content Objects.
 fn collect_parameter_refs<'a>(
