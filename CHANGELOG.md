@@ -31,9 +31,10 @@ must move the minor version.
 - **Multipart SDK encoding omits absent values and emits zero, one, or many binary values as zero, one, or many repeated parts.**
 - **Declared 3xx responses are accepted operation outcomes and expose their status and headers to response hooks instead of being reported as API errors.**
 - **TypeScript treats browser `opaqueredirect` results as opaque success only for declared redirect operations while preserving real 3xx metadata in server runtimes.**
-- **Python enforces redirect policy for injected openers and strips authorization, cookie, proxy authorization, and configured header API-key credentials on cross-origin redirects.** Removal matches the stored header name case-insensitively, so a configured spelling such as `X-API-Key` is dropped rather than surviving the hop.
-- **A response header written under a name that is not a constant is reported as `response.header.unresolved` instead of being silently omitted.** A named constant key resolves like the string it was declared from.
+- **Python enforces redirect policy for injected openers and strips authorization, cookie, proxy authorization, and configured header API-key credentials case-insensitively on cross-origin redirects.**
+- **A response header written under a name that is not a constant is reported as `response.header.unresolved` instead of being silently omitted.**
 - **Response headers are read only from the response writer's own header map, so mutating `c.Request.Header` or a local `http.Header` no longer states an outbound header the handler never sends.**
+- **Named constant keys in a `DataFromReader` response-header map resolve exactly like their declared string values.**
 - **SDK planning now carries all request choices and response headers and classifies declared redirects consistently across targets.**
 - **Graph projection and direction analysis now traverse every request-body alternative and response-header schema.**
 - **Regression drivers run on Python 3.9, snapshots avoid line-number churn, parallel TypeScript tests use collision-free temporary directories, and TypeScript toolchain restoration no longer waits on an unrelated npm audit request.**
