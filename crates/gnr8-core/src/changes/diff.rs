@@ -3786,4 +3786,122 @@ mod tests {
         assert_eq!(report.changes[0].code, "schema.enum.order.changed");
         assert_eq!(report.changes[0].kind, ChangeKind::DocOnly);
     }
+
+    fn request_body_graph(required: bool) -> ApiGraph {
+        let mut graph = request_graph(&[], "Payload", vec![schema("Payload", Vec::new())]);
+        graph.operations[0].request_body_required = required;
+        graph
+    }
+
+    #[test]
+    fn request_body_presence_and_requiredness_have_explicit_taxonomy() {
+        let none = graph_with_tags(&[]);
+        let optional = request_body_graph(false);
+        let required = request_body_graph(true);
+
+        let added_report = diff_graphs(&none, &optional, &BTreeSet::new());
+        let added = change(&added_report, "request.body.added");
+        assert_eq!(added.kind, ChangeKind::Additive);
+        assert_eq!(added.message, "optional request body added");
+        assert!(!added_report
+            .changes
+            .iter()
+            .any(|change| change.code == "request.body.required.added"));
+
+        let required_added = change(
+            &diff_graphs(&none, &required, &BTreeSet::new()),
+            "request.body.required.added",
+        )
+        .clone();
+        assert_eq!(required_added.kind, ChangeKind::Breaking);
+        assert_eq!(required_added.message, "required request body added");
+
+        let became_required = change(
+            &diff_graphs(&optional, &required, &BTreeSet::new()),
+            "request.body.required.added",
+        )
+        .clone();
+        assert_eq!(became_required.kind, ChangeKind::Breaking);
+        assert_eq!(became_required.message, "request body became required");
+
+        let became_optional = change(
+            &diff_graphs(&required, &optional, &BTreeSet::new()),
+            "request.body.required.removed",
+        )
+        .clone();
+        assert_eq!(became_optional.kind, ChangeKind::Additive);
+        assert_eq!(became_optional.message, "request body became optional");
+
+        let removed = change(
+            &diff_graphs(&optional, &none, &BTreeSet::new()),
+            "request.body.removed",
+        )
+        .clone();
+        assert_eq!(removed.kind, ChangeKind::Breaking);
+        assert_eq!(removed.message, "request body removed");
+        assert!(removed.span.is_none());
+    }
+
+    fn unused_scheme(id: &str, kind: &str, location: &str, name: &str) -> SecurityScheme {
+        SecurityScheme {
+            id: id.to_string(),
+            kind: kind.to_string(),
+            location: location.to_string(),
+            name: name.to_string(),
+            global: false,
+        }
+    }
+
+    #[test]
+    fn security_scheme_removal_and_shape_change_are_breaking() {
+        let base = ApiGraph {
+            security: vec![unused_scheme("ApiKey", "apiKey", "header", "X-API-Key")],
+            ..graph_with_tags(&[])
+        };
+        let removed = diff_graphs(&base, &graph_with_tags(&[]), &BTreeSet::new());
+        let finding = change(&removed, "security.scheme.removed");
+        assert_eq!(finding.kind, ChangeKind::Breaking);
+        assert_eq!(finding.subject.as_deref(), Some("ApiKey"));
+        assert_eq!(finding.message, "security scheme `ApiKey` removed");
+        assert!(finding.gating);
+        assert!(!removed
+            .changes
+            .iter()
+            .any(|change| change.code == "security.global.changed"));
+
+        let mut current = base.clone();
+        current.security[0] = unused_scheme("ApiKey", "apiKey", "query", "api_key");
+        let changed = diff_graphs(&base, &current, &BTreeSet::new());
+        let finding = change(&changed, "security.scheme.changed");
+        assert_eq!(finding.kind, ChangeKind::Breaking);
+        assert_eq!(finding.subject.as_deref(), Some("ApiKey"));
+        assert_eq!(finding.message, "security scheme `ApiKey` changed");
+        assert_eq!(changed.changes.len(), 1, "{:?}", changed.changes);
+    }
+
+    #[test]
+    fn schema_name_change_is_breaking() {
+        let mut named = schema("Book", vec![field("title")]);
+        let base = ApiGraph {
+            schemas: vec![named.clone()],
+            ..ApiGraph::default()
+        };
+        named.name = "Volume".to_string();
+        let current = ApiGraph {
+            schemas: vec![named],
+            ..ApiGraph::default()
+        };
+
+        let report = diff_graphs(&base, &current, &BTreeSet::new());
+        assert_eq!(report.changes.len(), 1, "{:?}", report.changes);
+        let finding = change(&report, "schema.name.changed");
+        assert_eq!(finding.kind, ChangeKind::Breaking);
+        assert_eq!(finding.subject.as_deref(), Some("Book"));
+        assert_eq!(
+            finding.message,
+            "schema name changed from `Book` to `Volume`"
+        );
+        assert_eq!(finding.file.as_deref(), Some("models.rs"));
+        assert_eq!(finding.line, Some(10));
+    }
 }
