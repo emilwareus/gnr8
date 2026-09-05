@@ -340,6 +340,8 @@ runs:
         set -euo pipefail
         if [[ "$IS_FORK" == "true" ]]; then
           echo "::notice::gnr8 action: pull-request comments are unavailable on fork pull requests (the token is read-only); reports are in this job's summary and the \"$ARTIFACT_NAME\" artifact. See https://github.com/oaiz-io/gnr8/blob/main/docs/operations/artifacts-and-ci.md#fork-pull-requests for the workflow_run recipe."
+        elif [[ "$(wc -c < "$REPORT_PATH")" -gt $((60 * 1024)) ]]; then
+          echo "::warning::gnr8 action: comment exceeds gnr8's 60 KiB budget; the full Markdown and JSON reports are in the \"$ARTIFACT_NAME\" artifact."
         elif ! "$GITHUB_ACTION_PATH/scripts/upsert-action-comment.sh"; then
           echo "::warning::gnr8 action: could not comment on the pull request. Check \"permissions: pull-requests: write\" in the workflow and the API error above. Reports are in this job's summary and the \"$ARTIFACT_NAME\" artifact."
         fi

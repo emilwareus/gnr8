@@ -109,4 +109,23 @@ if MARKER='")) | .[]' "$upsert" 2> "$tmp/error"; then exit 1; fi
 grep -F 'invalid API change comment marker' "$tmp/error" >/dev/null
 test ! -s "$GH_LOG"
 
-echo "action comment tests: OK (6 cases)"
+# Exercise the composite step's actual shell, including its publication preconditions.
+python3 - "$repo_root/action.yml" "$tmp/comment-step" <<'PYTHON'
+from pathlib import Path
+import sys, textwrap
+step = Path(sys.argv[1]).read_text().split('    - name: Comment API changes on pull request\n')[1].split('\n    - name: ')[0]
+Path(sys.argv[2]).write_text(textwrap.dedent(step.split('      run: |\n')[1]))
+PYTHON
+export GITHUB_ACTION_PATH="$repo_root" ARTIFACT_NAME=gnr8-api-changes-test-12345678
+seed
+IS_FORK=true bash "$tmp/comment-step" > "$tmp/notice"
+grep -F '::notice::gnr8 action: pull-request comments are unavailable on fork' "$tmp/notice" >/dev/null
+grep -F "$ARTIFACT_NAME" "$tmp/notice" >/dev/null
+test ! -s "$GH_LOG"
+python3 -c 'print("x" * (60 * 1024 + 1))' > "$REPORT_PATH"
+IS_FORK=false bash "$tmp/comment-step" > "$tmp/notice"
+grep -F "comment exceeds gnr8's 60 KiB budget" "$tmp/notice" >/dev/null
+grep -F "$ARTIFACT_NAME" "$tmp/notice" >/dev/null
+test ! -s "$GH_LOG"
+
+echo "action comment tests: OK (8 cases)"

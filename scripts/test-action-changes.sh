@@ -17,8 +17,13 @@ cat > "$fake" <<'SH'
 #!/usr/bin/env bash
 printf '%q ' "$@" >> "$FAKE_LOG"
 printf '\n' >> "$FAKE_LOG"
+if [[ -n "${FAIL_PROJECT:-}" && "$PWD" == "$FAIL_PROJECT" ]]; then exit 2; fi
 for arg in "$@"; do
   if [[ "$arg" == "--markdown" ]]; then
+    if [[ "${OVERSIZED:-false}" == true ]]; then
+      python3 -c 'print("    " + "x" * (901 * 1024))'
+      exit 1
+    fi
     cat <<'MARKDOWN'
 Base: <code>HEAD</code> → <code>0123456789012345678901234567890123456789</code>
 
@@ -160,4 +165,36 @@ if GNR8_BIN="$fake" \
 fi
 grep -F 'checkout with fetch-depth: 0' "$stderr" >/dev/null
 
-echo "action changes tests: OK"
+# A complete first project survives a failed second project. Only completion outputs stay absent.
+: > "$output"
+: > "$summary"
+if GNR8_BIN="$fake" BASE_REF=HEAD FAIL_PROJECT="$weird_dir" \
+  WORKING_DIRECTORIES="$repo_root/examples/bookstore"$'\n'"$weird_dir" \
+  RUNNER_TEMP="$tmp" GITHUB_OUTPUT="$output" GITHUB_STEP_SUMMARY="$summary" \
+  GITHUB_JOB=test FAKE_LOG="$log" "$runner" 2> "$stderr"; then
+  echo "expected project 2 to fail" >&2; exit 1
+fi
+grep -F 'report-root=' "$output" >/dev/null
+grep -F 'artifact-name=' "$output" >/dev/null
+grep -F 'BREAKING  DELETE /books/{id}' "$summary" >/dev/null
+! grep -E '^(combined-report|gating)=' "$output"
+report_root="$(sed -n 's/^report-root=//p' "$output")"
+test -s "$report_root/001/report.md"
+test -s "$report_root/001/report.json"
+
+# Keep both full artifacts when the summary budget cannot accommodate a whole project block.
+: > "$output"
+: > "$summary"
+GNR8_BIN="$fake" BASE_REF=HEAD OVERSIZED=true \
+  WORKING_DIRECTORIES="$repo_root/examples/bookstore"$'\n'"$weird_dir" \
+  RUNNER_TEMP="$tmp" GITHUB_OUTPUT="$output" GITHUB_STEP_SUMMARY="$summary" \
+  GITHUB_JOB=test FAKE_LOG="$log" "$runner"
+grep -F 'Report truncated at 900 KiB' "$summary" >/dev/null
+test "$(grep -c 'Report truncated' "$summary")" -eq 1
+test "$(wc -c < "$summary")" -lt $((1024 * 1024))
+grep -Fx 'gating=true' "$output" >/dev/null
+report_root="$(sed -n 's/^report-root=//p' "$output")"
+test "$(wc -c < "$report_root/report.md")" -gt $((1800 * 1024))
+test "$(grep -c '^<!-- gnr8-api-changes:' "$report_root/report.md")" -eq 2
+
+echo "action changes tests: OK (6 cases)"

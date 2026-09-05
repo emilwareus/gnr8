@@ -42,6 +42,18 @@ artifact_name="gnr8-api-changes-${GITHUB_JOB:-job}-$artifact_suffix"
 marker="<!-- gnr8-api-changes:${artifact_name} -->"
 combined="$report_root/report.md"
 printf '# gnr8 API changes\n\n' > "$combined"
+# These outputs describe the publication destination even when a later project cannot be analyzed.
+{
+  echo "report-root=$report_root"
+  echo "artifact-name=$artifact_name"
+  echo "marker=$marker"
+} >> "$GITHUB_OUTPUT"
+
+# Budget whole project blocks, never cut the CLI's Markdown or re-render findings.
+summary_budget=$((900 * 1024))
+summary_stopped=false
+cat "$combined" >> "$GITHUB_STEP_SUMMARY"
+summary_bytes="$(wc -c < "$GITHUB_STEP_SUMMARY")"
 
 dirs=()
 while IFS= read -r dir || [[ -n "$dir" ]]; do
@@ -107,14 +119,23 @@ for dir in "${dirs[@]}"; do
   } > "$markdown"
 
   cat "$markdown" >> "$combined"
+  if [[ "$summary_stopped" == false ]]; then
+    project_bytes="$(wc -c < "$markdown")"
+    if [[ $((summary_bytes + project_bytes)) -le "$summary_budget" ]]; then
+      cat "$markdown" >> "$GITHUB_STEP_SUMMARY"
+      summary_bytes=$((summary_bytes + project_bytes))
+    else
+      {
+        printf '\nReport truncated at 900 KiB (GitHub limits a step summary to 1 MiB).\n'
+        printf 'Full Markdown and JSON: the "%s" artifact.\n' "$artifact_name"
+      } >> "$GITHUB_STEP_SUMMARY"
+      summary_stopped=true
+    fi
+  fi
   echo "::endgroup::"
 done
 
-cat "$combined" >> "$GITHUB_STEP_SUMMARY"
 {
   echo "gating=$gating"
-  echo "report-root=$report_root"
   echo "combined-report=$combined"
-  echo "artifact-name=$artifact_name"
-  echo "marker=$marker"
 } >> "$GITHUB_OUTPUT"
