@@ -39,8 +39,9 @@ def emit(report, project_dir, artifact, stream):
             level = 'notice'
         else:
             raise ValueError('unknown change kind')
-        file = change['file']
-        line = change['line']
+        # Rust omits absent Option fields from JSON; an absent location is unanchorable.
+        file = change.get('file')
+        line = change.get('line')
         if not file or type(line) is not int or line < 1:
             unanchorable += 1
             continue

@@ -41,6 +41,14 @@ class AnnotationTests(unittest.TestCase):
         text = render([change(file=None, line=None, span=None), change(line=None), change(line=0)])
         self.assertEqual(text, '::notice::gnr8: 3 further findings not annotated (3 unanchorable); see the job summary and the "report" artifact.\n')
 
+    def test_omitted_location_fields_are_skipped_without_stopping_later_findings(self):
+        removed = change(code='operation.removed')
+        for key in ('file', 'line', 'span'):
+            del removed[key]
+        text = render([removed, change()])
+        self.assertEqual(text.count('::error file='), 1)
+        self.assertIn('1 further findings not annotated (1 unanchorable)', text)
+
     def test_cap_counts_all_omissions(self):
         text = render([change() for _ in range(60)] + [change(file=None, line=None)])
         self.assertEqual(text.count('::error '), 50)

@@ -459,6 +459,10 @@ mod tests {
         assert_eq!(value["base"]["ref"], "origin/main");
         assert_eq!(value["policy"]["exempt_tags"][0], "internal");
         assert_eq!(value["changes"][0]["exempt"]["base"], true);
+        // Machine consumers must handle omitted current locations, not just explicit nulls.
+        for field in ["file", "line", "span"] {
+            assert!(value["changes"][0].get(field).is_none());
+        }
         assert_eq!(
             value["changes"][0]["affected_operations"]["base"][0]["operation_id"],
             "deleteBook"

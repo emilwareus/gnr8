@@ -19,7 +19,7 @@ changes = []
 for kind, gating in [('breaking', True), ('breaking', False), ('additive', False), ('doc_only', False)]:
     changes.append(dict(kind=kind, gating=gating, code='request.property.required.added',
                         message='hostile\n%::,\rmessage', file='main.go', line=25, span=dict(end_line=25)))
-changes.append(dict(kind='breaking', gating=True, code='operation.removed', message='removed', file=None, line=None, span=None))
+changes.append(dict(kind='breaking', gating=True, code='operation.removed', message='removed'))
 changes.extend([changes[0].copy() for _ in range(60)])
 with open(sys.argv[1], 'w') as out:
     json.dump(dict(schema_version=1, changes=changes), out)
