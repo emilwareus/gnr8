@@ -1,6 +1,16 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
+# `! grep` alone is exempt from errexit, so negative assertions must fail explicitly.
+assert_absent() {
+  local status=0
+  grep "$@" || status=$?
+  if [[ "$status" -ne 1 ]]; then
+    echo "expected no matching output (grep status $status)" >&2
+    exit 1
+  fi
+}
+
 repo_root="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 upsert="$repo_root/scripts/upsert-action-comment.sh"
 tmp="$(mktemp -d)"
@@ -19,6 +29,9 @@ with open(os.environ['GH_LOG'], 'a') as log:
     log.write(json.dumps(args) + '\n')
 state = Path(os.environ['GH_STATE'])
 comments = json.loads(state.read_text())
+if os.environ.get('GH_FAIL') == 'list' or (os.environ.get('GH_FAIL') == 'write' and '--paginate' not in args):
+    print('simulated permission failure', file=sys.stderr)
+    sys.exit(1)
 if args[:2] == ['api', '--paginate']:
     marker = os.environ['MARKER']
     query = args[args.index('--jq') + 1]
@@ -74,14 +87,14 @@ PY
 seed own
 "$upsert"
 grep -F '"PATCH", "repos/oaiz-io/gnr8/issues/comments/1"' "$GH_LOG" >/dev/null
-! grep -F '"pr", "comment"' "$GH_LOG"
-! grep -F 'github-actions[bot]' "$GH_LOG"
+assert_absent -F '"pr", "comment"' "$GH_LOG"
+assert_absent -F 'github-actions[bot]' "$GH_LOG"
 
 # Identical second publication lists once and performs no writes.
 : > "$GH_LOG"
 "$upsert"
 test "$(wc -l < "$GH_LOG")" -eq 1
-! grep -F '"PATCH"' "$GH_LOG"
+assert_absent -F '"PATCH"' "$GH_LOG"
 
 # Duplicates converge on the first (oldest), without touching another key or a quoted marker.
 seed own own own other quoted
@@ -89,19 +102,19 @@ seed own own own other quoted
 grep -F '"PATCH", "repos/oaiz-io/gnr8/issues/comments/1"' "$GH_LOG" >/dev/null
 grep -F '"DELETE", "repos/oaiz-io/gnr8/issues/comments/2"' "$GH_LOG" >/dev/null
 grep -F '"DELETE", "repos/oaiz-io/gnr8/issues/comments/3"' "$GH_LOG" >/dev/null
-! grep -E 'issues/comments/[45]' "$GH_LOG"
+assert_absent -E 'issues/comments/[45]' "$GH_LOG"
 
 # A previous bare marker is adopted for one release.
 seed old
 "$upsert"
 grep -F '"PATCH", "repos/oaiz-io/gnr8/issues/comments/1"' "$GH_LOG" >/dev/null
-! grep -F '"pr", "comment"' "$GH_LOG"
+assert_absent -F '"pr", "comment"' "$GH_LOG"
 
 # Another key and source quoting our marker cannot claim this invocation.
 seed other quoted
 "$upsert"
 grep -F '"pr", "comment", "85", "--repo", "oaiz-io/gnr8"' "$GH_LOG" >/dev/null
-! grep -F '"PATCH"' "$GH_LOG"
+assert_absent -F '"PATCH"' "$GH_LOG"
 
 # Reject a marker that could change the jq program before making any request.
 seed
@@ -128,4 +141,23 @@ grep -F "comment exceeds gnr8's 60 KiB budget" "$tmp/notice" >/dev/null
 grep -F "$ARTIFACT_NAME" "$tmp/notice" >/dev/null
 test ! -s "$GH_LOG"
 
-echo "action comment tests: OK (8 cases)"
+# Failed list requests never append, and write failures use the permission message.
+seed own
+if GH_FAIL=list "$upsert" 2> "$tmp/error"; then exit 1; fi
+test "$(wc -l < "$GH_LOG")" -eq 1
+printf '%s\nreport\n' "$MARKER" > "$REPORT_PATH"
+seed own
+GH_FAIL=write IS_FORK=false bash "$tmp/comment-step" > "$tmp/notice" 2> "$tmp/error"
+grep -F 'permissions: pull-requests: write' "$tmp/notice" >/dev/null
+grep -F "$ARTIFACT_NAME" "$tmp/notice" >/dev/null
+assert_absent -F '"pr", "comment"' "$GH_LOG"
+
+# No findings still updates the existing comment, preserving the result on the PR.
+seed own
+printf '%s\n    No API changes.\n' "$MARKER" > "$REPORT_PATH"
+"$upsert"
+grep -F '"PATCH", "repos/oaiz-io/gnr8/issues/comments/1"' "$GH_LOG" >/dev/null
+grep -F 'No API changes.' "$GH_STATE" >/dev/null
+assert_absent -F '"DELETE"' "$GH_LOG"
+
+echo "action comment tests: OK (11 cases)"

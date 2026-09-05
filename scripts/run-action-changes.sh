@@ -13,8 +13,28 @@ set -euo pipefail
 # `gnr8 changes --markdown`, which is the one renderer for that format. The directory lands in a
 # Markdown document outside a code block, so it is escaped the way the CLI escapes what it puts there.
 escape_html() {
-  printf '%s' "$1" | sed -e 's/&/\&amp;/g' -e 's/</\&lt;/g' -e 's/>/\&gt;/g' \
+  local flat="$1"
+  flat="${flat//$'\r'/ }"
+  flat="${flat//$'\n'/ }"
+  printf '%s' "$flat" | sed -e 's/&/\&amp;/g' -e 's/</\&lt;/g' -e 's/>/\&gt;/g' \
     -e 's/"/\&quot;/g' -e "s/'/\&#x27;/g"
+}
+
+# GitHub output values can contain newlines (for example, a runner temp path). Delimit those
+# values by their own content hash rather than exposing embedded lines as additional outputs.
+write_output() {
+  local name="$1" value="$2" delimiter
+  if [[ "$value" == *$'\n'* ]]; then
+    delimiter="gnr8_$(printf '%s' "$value" | git hash-object --stdin)"
+    printf '%s<<%s\n%s\n%s\n' "$name" "$delimiter" "$value" "$delimiter"
+  else
+    printf '%s=%s\n' "$name" "$value"
+  fi
+}
+
+summary_failed() {
+  echo "::warning::gnr8 action: could not publish the step summary; full reports are in the \"$artifact_name\" artifact. The API change gate is unchanged."
+  summary_stopped=true
 }
 
 # Run one report for $dir into $1 and hand back the gate status. Only 0 and 1 are gate answers; any
@@ -44,16 +64,18 @@ combined="$report_root/report.md"
 printf '# gnr8 API changes\n\n' > "$combined"
 # These outputs describe the publication destination even when a later project cannot be analyzed.
 {
-  echo "report-root=$report_root"
-  echo "artifact-name=$artifact_name"
-  echo "marker=$marker"
+  write_output report-root "$report_root"
+  write_output artifact-name "$artifact_name"
+  write_output marker "$marker"
 } >> "$GITHUB_OUTPUT"
 
 # Budget whole project blocks, never cut the CLI's Markdown or re-render findings.
 summary_budget=$((900 * 1024))
 summary_stopped=false
-cat "$combined" >> "$GITHUB_STEP_SUMMARY"
-summary_bytes="$(wc -c < "$GITHUB_STEP_SUMMARY")"
+summary_bytes=0
+if ! cat "$combined" >> "$GITHUB_STEP_SUMMARY" || ! summary_bytes="$(wc -c < "$GITHUB_STEP_SUMMARY")"; then
+  summary_failed
+fi
 
 dirs=()
 while IFS= read -r dir || [[ -n "$dir" ]]; do
@@ -103,7 +125,7 @@ for dir in "${dirs[@]}"; do
   body="$work_root/$(printf '%03d' "$index").md"
   stderr="$project_root/stderr.txt"
 
-  echo "::group::gnr8 changes $dir"
+  echo "::group::gnr8 changes project $index"
   # Each format is rendered by the CLI. The Markdown report is a second invocation rather than a
   # second implementation of the format here: `changes` is deterministic and this run reads the
   # cache the first one just filled, so it costs a fraction of it and no formatting lives here.
@@ -129,13 +151,18 @@ for dir in "${dirs[@]}"; do
   if [[ "$summary_stopped" == false ]]; then
     project_bytes="$(wc -c < "$markdown")"
     if [[ $((summary_bytes + project_bytes)) -le "$summary_budget" ]]; then
-      cat "$markdown" >> "$GITHUB_STEP_SUMMARY"
-      summary_bytes=$((summary_bytes + project_bytes))
+      if cat "$markdown" >> "$GITHUB_STEP_SUMMARY"; then
+        summary_bytes=$((summary_bytes + project_bytes))
+      else
+        summary_failed
+      fi
     else
-      {
+      if ! {
         printf '\nReport truncated at 900 KiB (GitHub limits a step summary to 1 MiB).\n'
         printf 'Full Markdown and JSON: the "%s" artifact.\n' "$artifact_name"
-      } >> "$GITHUB_STEP_SUMMARY"
+      } >> "$GITHUB_STEP_SUMMARY"; then
+        summary_failed
+      fi
       summary_stopped=true
     fi
   fi
@@ -148,6 +175,6 @@ for dir in "${dirs[@]}"; do
 done
 
 {
-  echo "gating=$gating"
-  echo "combined-report=$combined"
+  write_output gating "$gating"
+  write_output combined-report "$combined"
 } >> "$GITHUB_OUTPUT"

@@ -1,5 +1,15 @@
 #!/usr/bin/env bash
 set -euo pipefail
+
+# `! grep` alone is exempt from errexit, so negative assertions must fail explicitly.
+assert_absent() {
+  local status=0
+  grep "$@" || status=$?
+  if [[ "$status" -ne 1 ]]; then
+    echo "expected no matching output (grep status $status)" >&2
+    exit 1
+  fi
+}
 repo_root="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 tmp="$(mktemp -d)"
 trap 'rm -rf "$tmp"' EXIT
@@ -21,9 +31,24 @@ grep -F '::notice file=examples/bookstore/main.go' "$tmp/commands" >/dev/null
 test "$(grep -c '^::.* file=' "$tmp/commands")" -eq 50
 grep -Fx '::notice::gnr8: 14 further findings not annotated (1 unanchorable); see the job summary and the "test-artifact" artifact.' "$tmp/commands" >/dev/null
 test "$(wc -l < "$tmp/commands")" -eq 51
-! grep -F 'operation.removed' "$tmp/commands"
+assert_absent -F 'operation.removed' "$tmp/commands"
 printf '{"schema_version":2,"changes":[]}' > "$tmp/report.json"
 if python3 "$repo_root/scripts/emit-action-annotations.py" "$tmp/report.json" . report > "$tmp/commands" 2> "$tmp/error"; then exit 1; fi
 grep -F 'gnr8 action: cannot emit API change annotations' "$tmp/error" >/dev/null
 test ! -s "$tmp/commands"
-echo 'action annotation tests: OK (2 cases)'
+# Execute the action's real input validation with both accepted boolean spellings and a bad one.
+python3 - "$repo_root/action.yml" "$tmp/validate-step" <<'PYTHON'
+from pathlib import Path
+import sys, textwrap
+step = Path(sys.argv[1]).read_text().split('    - name: Validate gnr8 action inputs\n')[1].split('\n    - name: ')[0]
+Path(sys.argv[2]).write_text(textwrap.dedent(step.split('      run: |\n')[1]))
+PYTHON
+export CACHE_ENABLED=false INPUT_BINARY=gnr8 INSTALL_METHOD=path REQUESTED_VERSION=lock
+export REPORT_API_CHANGES=false BASE_REF=HEAD SETUP_GO=false SETUP_NODE=false SETUP_PYTHON=false SETUP_RUST=false
+export WORKING_DIRECTORIES="$repo_root/examples/bookstore"
+ANNOTATE_API_CHANGES=false bash "$tmp/validate-step"
+ANNOTATE_API_CHANGES=true bash "$tmp/validate-step"
+if ANNOTATE_API_CHANGES=yes bash "$tmp/validate-step" 2> "$tmp/error"; then exit 1; fi
+grep -F 'annotate-api-changes must be "true" or "false"' "$tmp/error" >/dev/null
+
+echo 'action annotation tests: OK (4 cases)'

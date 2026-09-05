@@ -452,9 +452,9 @@ mod tests {
                 },
             )],
         };
-        let value: serde_json::Value =
-            serde_json::from_str(&render_json(&base, &report).expect("render JSON"))
-                .expect("parse JSON");
+        let rendered = render_json(&base, &report).expect("render JSON");
+        assert!(rendered.starts_with("{\n  \"schema_version\": 1,\n"));
+        let value: serde_json::Value = serde_json::from_str(&rendered).expect("parse JSON");
         assert_eq!(value["schema_version"], 1);
         assert_eq!(value["base"]["ref"], "origin/main");
         assert_eq!(value["policy"]["exempt_tags"][0], "internal");
