@@ -36,12 +36,12 @@ if args[:2] == ['api', '--paginate']:
     marker = os.environ['MARKER']
     query = args[args.index('--jq') + 1]
     digest = '<!-- gnr8-api-changes-digest:'
-    assert query.startswith('.[] | select(.body | split("\\n") | any(. == "' + marker + '" or . == "<!-- gnr8-api-changes -->")) | [.id, (.body | startswith("' + digest)
+    assert query.startswith('.[] | select(.body | split("\\n") | map(rtrimstr("\\r")) | any(. == "' + marker + '" or . == "<!-- gnr8-api-changes -->")) | [.id, (.body | startswith("' + digest)
     assert query.endswith('\\n"))] | @tsv')
     prefix = query.split('startswith("', 1)[1].split('\\n"', 1)[0] + '\n'
     assert 'user' not in query
     for comment in comments:
-        if any(line in (marker, '<!-- gnr8-api-changes -->') for line in comment['body'].split('\n')):
+        if any(line.rstrip('\r') in (marker, '<!-- gnr8-api-changes -->') for line in comment['body'].split('\n')):
             print(str(comment['id']) + '\t' + str(comment['body'].startswith(prefix)).lower())
 else:
     if args[:3] == ['api', '--method', 'PATCH']:
@@ -160,4 +160,18 @@ grep -F '"PATCH", "repos/oaiz-io/gnr8/issues/comments/1"' "$GH_LOG" >/dev/null
 grep -F 'No API changes.' "$GH_STATE" >/dev/null
 assert_absent -F '"DELETE"' "$GH_LOG"
 
-echo "action comment tests: OK (11 cases)"
+# Native comment markers also remain owned after an editor writes CRLF line endings.
+seed own
+python3 - "$GH_STATE" <<'PYTHON'
+from pathlib import Path
+import json, sys
+path = Path(sys.argv[1])
+comments = json.loads(path.read_text())
+comments[0]['body'] = comments[0]['body'].replace('\n', '\r\n')
+path.write_text(json.dumps(comments))
+PYTHON
+"$upsert"
+grep -F '"PATCH", "repos/oaiz-io/gnr8/issues/comments/1"' "$GH_LOG" >/dev/null
+assert_absent -F '"pr", "comment"' "$GH_LOG"
+
+echo "action comment tests: OK (12 cases)"

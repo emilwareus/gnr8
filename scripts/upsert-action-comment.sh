@@ -22,7 +22,7 @@ trap 'rm -f "$body"' EXIT
 # TODO: Remove the old bare marker match after one release of keyed comments.
 # Match whole marker lines, so a marker quoted by an indented finding cannot own a comment.
 comments="$(gh api --paginate "repos/$REPOSITORY/issues/$PR_NUMBER/comments" \
-  --jq ".[] | select(.body | split(\"\\n\") | any(. == \"$MARKER\" or . == \"<!-- gnr8-api-changes -->\")) | [.id, (.body | startswith(\"$digest_marker\\n\"))] | @tsv")"
+  --jq ".[] | select(.body | split(\"\\n\") | map(rtrimstr(\"\\r\")) | any(. == \"$MARKER\" or . == \"<!-- gnr8-api-changes -->\")) | [.id, (.body | startswith(\"$digest_marker\\n\"))] | @tsv")"
 
 first=true
 while IFS=$'\t' read -r comment_id unchanged; do
