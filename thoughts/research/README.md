@@ -26,6 +26,7 @@ The current research question:
 - [API tags and breaking-change gating](2026-09-03-api-tags-breaking-change-gating.md) — replacement design using standard OpenAPI tags
 - [Publishing API change reports on pull requests](2026-09-05-pr-change-reports.md)
   — what issue #76 still needs after `gnr8 changes` shipped, and how the Action should publish it
+  ([implementation review](2026-09-05-pr85-implementation-review.md))
 
 ## Current Position
 
