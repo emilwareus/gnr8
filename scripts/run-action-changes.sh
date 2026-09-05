@@ -37,6 +37,9 @@ report() {
 report_root="$(mktemp -d "$RUNNER_TEMP/gnr8-api-changes.XXXXXXXX")"
 # Intermediates live outside report_root, which is uploaded verbatim as the run's artifact.
 work_root="$(mktemp -d "$RUNNER_TEMP/gnr8-api-changes-work.XXXXXXXX")"
+artifact_suffix="$(printf '%s\n%s\n' "$WORKING_DIRECTORIES" "$BASE_REF" | git hash-object --stdin | cut -c1-8)"
+artifact_name="gnr8-api-changes-${GITHUB_JOB:-job}-$artifact_suffix"
+marker="<!-- gnr8-api-changes:${artifact_name} -->"
 combined="$report_root/report.md"
 printf '# gnr8 API changes\n\n' > "$combined"
 
@@ -98,7 +101,7 @@ for dir in "${dirs[@]}"; do
   fi
 
   {
-    printf '<!-- gnr8-api-changes -->\n'
+    printf '%s\n' "$marker"
     printf '## API changes for %s\n\n' "$(escape_html "$dir")"
     cat "$body"
   } > "$markdown"
@@ -108,10 +111,10 @@ for dir in "${dirs[@]}"; do
 done
 
 cat "$combined" >> "$GITHUB_STEP_SUMMARY"
-artifact_suffix="$(printf '%s\n%s\n' "$WORKING_DIRECTORIES" "$BASE_REF" | git hash-object --stdin | cut -c1-8)"
 {
   echo "gating=$gating"
   echo "report-root=$report_root"
   echo "combined-report=$combined"
-  echo "artifact-name=gnr8-api-changes-${GITHUB_JOB:-job}-$artifact_suffix"
+  echo "artifact-name=$artifact_name"
+  echo "marker=$marker"
 } >> "$GITHUB_OUTPUT"

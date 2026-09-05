@@ -333,10 +333,15 @@ runs:
         PR_NUMBER: ${{ github.event.pull_request.number }}
         REPOSITORY: ${{ github.repository }}
         REPORT_PATH: ${{ steps.api-changes.outputs.combined-report }}
+        MARKER: ${{ steps.api-changes.outputs.marker }}
+        ARTIFACT_NAME: ${{ steps.api-changes.outputs.artifact-name }}
+        IS_FORK: ${{ github.event.pull_request.head.repo.fork }}
       run: |
         set -euo pipefail
-        if ! "$GITHUB_ACTION_PATH/scripts/upsert-action-comment.sh"; then
-          echo "::warning::gnr8 action could not comment on the pull request; the step summary and artifacts contain the report"
+        if [[ "$IS_FORK" == "true" ]]; then
+          echo "::notice::gnr8 action: pull-request comments are unavailable on fork pull requests (the token is read-only); reports are in this job's summary and the \"$ARTIFACT_NAME\" artifact. See https://github.com/oaiz-io/gnr8/blob/main/docs/operations/artifacts-and-ci.md#fork-pull-requests for the workflow_run recipe."
+        elif ! "$GITHUB_ACTION_PATH/scripts/upsert-action-comment.sh"; then
+          echo "::warning::gnr8 action: could not comment on the pull request. Check \"permissions: pull-requests: write\" in the workflow and the API error above. Reports are in this job's summary and the \"$ARTIFACT_NAME\" artifact."
         fi
 
     - name: Run gnr8 check

@@ -26,7 +26,10 @@ Exempt tags: <code>internal</code>
 
 Summary: 1 breaking, 0 additive, 0 doc-only, 1 gating.
 
+Breaking — gating (1)
+
     BREAKING  DELETE /books/{id}  operation removed ## injected heading
+        Code: operation.removed
         SDK operations: deleteBook (DELETE /books/{id}), listBooks (GET /books)
         Source: handlers/<books>.go:42
 MARKDOWN
@@ -35,6 +38,7 @@ MARKDOWN
 done
 cat <<'JSON'
 {
+  "schema_version": 1,
   "base": {"ref": "HEAD", "resolved": "0123456789012345678901234567890123456789"},
   "policy": {"exempt_tags": ["internal"]},
   "summary": {"breaking": 1, "additive": 0, "doc_only": 0, "gating": 1},
@@ -85,7 +89,10 @@ grep -F 'artifact-name=gnr8-api-changes-test-' "$output" >/dev/null
 grep -F 'BREAKING  DELETE /books/{id}  operation removed ## injected heading' "$summary" >/dev/null
 grep -F 'SDK operations: deleteBook (DELETE /books/{id}), listBooks (GET /books)' "$summary" >/dev/null
 grep -F 'Source: handlers/<books>.go:42' "$summary" >/dev/null
-grep -Fx '<!-- gnr8-api-changes -->' "$summary" >/dev/null
+artifact_name="$(sed -n 's/^artifact-name=//p' "$output")"
+grep -Ex 'artifact-name=gnr8-api-changes-test-[0-9a-f]{8}' "$output" >/dev/null
+grep -Fx "<!-- gnr8-api-changes:$artifact_name -->" "$summary" >/dev/null
+grep -Fx "marker=<!-- gnr8-api-changes:$artifact_name -->" "$output" >/dev/null
 if grep -E '^## injected heading$|^```' "$summary" >/dev/null; then
   echo "report content escaped its indented code block" >&2
   exit 1
@@ -133,6 +140,11 @@ if grep -F 'a<b>&c' "$empty_summary" >/dev/null; then
   echo "working directory reached the heading unescaped" >&2
   exit 1
 fi
+
+# Separate matrix invocations own distinct markers, each derived from its artifact name.
+second_name="$(sed -n 's/^artifact-name=//p' "$empty_output")"
+test "$artifact_name" != "$second_name"
+grep -Fx "<!-- gnr8-api-changes:$second_name -->" "$empty_summary" >/dev/null
 
 stderr="$tmp/missing-stderr"
 if GNR8_BIN="$fake" \
