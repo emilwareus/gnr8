@@ -9,6 +9,8 @@ must move the minor version.
 
 ## Unreleased
 
+## 0.12.1 — 2026-09-05
+
 ### Added
 
 - API change workflow annotations for current source locations, enabled by `annotate-api-changes`
