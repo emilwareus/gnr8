@@ -247,6 +247,9 @@ mixed-snapshot outputs are accepted.
 ```yaml
 name: generated
 on: [pull_request]
+permissions:
+  contents: read
+  pull-requests: write
 jobs:
   check:
     runs-on: ubuntu-latest
@@ -254,7 +257,7 @@ jobs:
       - uses: actions/checkout@v7
         with:
           fetch-depth: 0
-      - uses: oaiz-io/gnr8@v0.11.0 # first release with API change reporting
+      - uses: oaiz-io/gnr8@v0.12.0 # first release with API change reporting
         with:
           working-directories: |
             services/books
@@ -280,6 +283,7 @@ Action inputs:
 | `version` | `lock` | exact release or version resolved from every `.gnr8/Cargo.lock` |
 | `extra-args` | empty | shell-split arguments passed to `gnr8 check` |
 | `report-api-changes` | `false` | publish Markdown/JSON change reports and fail on gating breaking changes |
+| `annotate-api-changes` | `true` | emit current-source workflow annotations when change reporting is enabled; requires `python3` |
 | `base-ref` | `origin/main` | revision containing each project's committed graph artifact |
 | `exempt-tags` | empty | newline-separated exact operation tags exempted from the change gate |
 | `cache` | `true` | cache `.gnr8/cache` and `.gnr8/target` |
@@ -295,10 +299,88 @@ Change reporting requires checkout history, so use `actions/checkout` with `fetc
 base history fails with an error that names this requirement. The action writes a combined Markdown
 report with affected SDK operations and current source locations to the job summary, uploads the
 Markdown and JSON reports, and creates or updates its marker-owned pull-request comment when the
-workflow token permits comments. A comment permission failure does not hide or weaken the gate.
+workflow token permits comments. Without `pull-requests: write`, use the summary and artifact;
+fork PRs use those surfaces regardless of the permissions block. Comment API failures produce a
+warning naming the permission to check and the artifact. Publication does not hide or weaken the gate.
 
 Both reports are rendered by `gnr8 changes` itself — `--json` and `--markdown` — so the published
 Markdown is the CLI's own output rather than a second rendering of the JSON.
+
+Each invocation owns one comment using
+`<!-- gnr8-api-changes:gnr8-api-changes-<job>-<8-hex-digest> -->`, where the digest is the first eight
+hex characters of Git's blob hash of `working-directories`, a newline, `base-ref`, and a newline.
+The key is also the artifact name. Matrix jobs with different project inputs therefore own different
+comments; all project blocks in a single invocation share its key. Changing the job, working
+directories, or base ref leaves the previous keyed comment behind. Ownership follows whole marker
+lines, regardless of author, so GitHub App tokens and PATs upsert too. The oldest matching comment
+is updated and duplicates are deleted. For one release the old bare gnr8 marker is also adopted.
+A body digest avoids writes for unchanged reports. Empty reports update the comment to show no
+findings rather than deleting it.
+
+Completed projects reach the summary incrementally and remain in the uploaded artifact if a later
+project fails. Incomplete runs do not post a combined comment. The summary appends whole project
+blocks up to **900 KiB**, then names the artifact containing the full Markdown and JSON. This leaves
+room under [GitHub's 1 MiB per-step summary limit](https://docs.github.com/en/actions/reference/workflows-and-actions/workflow-commands#step-isolation-and-limits).
+Comments over **60 KiB** are skipped with a warning naming the artifact. That is gnr8's conservative
+budget, not a published GitHub comment limit. Artifacts are never truncated.
+
+### Source annotations
+
+With `report-api-changes: "true"`, `annotate-api-changes` defaults to `"true"`. It requires `python3`
+on PATH; `setup-python: "true"` installs it. Absence is a named prerequisite error, and
+`annotate-api-changes: "false"` turns this publication surface off. An emitter failure is reported
+without changing the API gate.
+
+The Action reads each project's versioned `report.json` to emit
+[workflow annotations](https://docs.github.com/en/actions/reference/workflows-and-actions/workflow-commands#setting-an-error-message)
+associated with current source files. Gating breaking findings are errors, exempt breaking findings
+are warnings, and additive findings are notices. Documentation-only findings remain in the reports
+and emit no annotations. Titles carry the stable dotted change code. gnr8 caps located annotations
+at **50 per project**, retaining the JSON report's order, and reports how many further findings were
+omitted, including those with no current location. This is our cap, not a GitHub platform limit.
+
+Removals have no current source location because the source they describe is gone, so they cannot
+be anchored. Field-level findings use the enclosing schema's span. Paths use exactly
+`normpath(join(project_dir, change["file"]))`: provenance is relative to the analyzed module and the
+working directory supplies the workspace prefix. Source inputs rooted below the project directory
+can therefore produce a path that does not locate the intended file; the full reports retain the
+original provenance. No alternative path is inferred or searched.
+
+### Fork pull requests
+
+The Action skips the comment API on fork PRs and emits a notice naming the artifact. The workflow's
+`permissions:` block does not enable this comment path. `merge_group` runs can still publish the
+summary and artifacts and enforce the gate, but have no PR comment. `pull_request_target` is not
+supported or recommended: this Action compiles and runs repository-authored `.gnr8/` Rust code.
+
+For callers that need fork comments, use two workflows following
+[GitHub's privilege separation recipe](https://securitylab.github.com/resources/github-actions-preventing-pwn-requests/):
+
+1. An unprivileged `pull_request` workflow with `contents: read` runs the Action and uploads its
+   reports. In an `always()` step, write `github.event.pull_request.number` through an environment
+   variable to a separate `pr-number` text artifact and upload it too. The Action's report paths are
+   internal step outputs; the publisher downloads the already-uploaded report artifact.
+2. A separate workflow uses `on: workflow_run` with the first workflow's name and
+   `types: [completed]`. Give its publication job `permissions: { actions: read, pull-requests: write }`.
+   Download the expected report artifact and PR-number artifact from exactly
+   `github.event.workflow_run.id`, using `actions/download-artifact` with `run-id` and `github-token`.
+   Select the expected report key for your configured job and inputs, rather than an arbitrary artifact.
+3. Validate the downloaded PR number as a positive integer before putting it in any API path, for
+   example `[[ "$PR_NUMBER" =~ ^[1-9][0-9]*$ ]] || exit 2` in Bash. Verify through GitHub's API that
+   this PR belongs to the receiving repository and its head repository and SHA match the triggering
+   run. Treat all downloaded contents as untrusted data. Never execute artifact content, check out
+   fork code, or run its `.gnr8/` crate in the privileged workflow.
+4. Use publisher code owned by your default branch to create/update the marker-owned comment from
+   the downloaded Markdown, passing it as a body file. Apply the same 60 KiB precondition; leave the
+   complete report in the originating run's artifacts. Keep this publication workflow independent
+   of the unprivileged workflow's gate result.
+
+The [`workflow_run` workflow file must exist on the default branch](https://docs.github.com/en/actions/reference/workflows-and-actions/events-that-trigger-workflows#workflow_run).
+Do not use `concurrency: ${{ github.ref }}` there: that ref is the default branch, which collapses all
+PRs into one concurrency group. Key by the verified PR number or the triggering run's head repository
+and branch. gnr8 does not ship this workflow; a composite action cannot declare caller triggers.
+
+### Installation
 
 The release installer rejects `latest`: generated checks must use an exact version. `version: lock`
 uses `cargo tree --locked` to find the direct normal `gnr8` dependency. Every working directory must
