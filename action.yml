@@ -26,6 +26,10 @@ inputs:
     description: Run gnr8 changes, publish reports, and gate on checked breaking changes.
     required: false
     default: "false"
+  annotate-api-changes:
+    description: Emit workflow annotations for findings that carry a current source location.
+    required: false
+    default: "true"
   base-ref:
     description: Git revision containing the committed base graph artifact.
     required: false
@@ -97,6 +101,7 @@ runs:
         INSTALL_METHOD: ${{ inputs.install-method }}
         REQUESTED_VERSION: ${{ inputs.version }}
         REPORT_API_CHANGES: ${{ inputs.report-api-changes }}
+        ANNOTATE_API_CHANGES: ${{ inputs.annotate-api-changes }}
         BASE_REF: ${{ inputs.base-ref }}
         SETUP_GO: ${{ inputs.setup-go }}
         SETUP_NODE: ${{ inputs.setup-node }}
@@ -116,6 +121,7 @@ runs:
 
         validate_boolean cache "$CACHE_ENABLED"
         validate_boolean report-api-changes "$REPORT_API_CHANGES"
+        validate_boolean annotate-api-changes "$ANNOTATE_API_CHANGES"
         validate_boolean setup-go "$SETUP_GO"
         validate_boolean setup-node "$SETUP_NODE"
         validate_boolean setup-python "$SETUP_PYTHON"
@@ -305,6 +311,7 @@ runs:
       shell: bash
       env:
         BASE_REF: ${{ inputs.base-ref }}
+        ANNOTATE_API_CHANGES: ${{ inputs.annotate-api-changes }}
         EXEMPT_TAGS: ${{ inputs.exempt-tags }}
         GNR8_BIN: ${{ steps.binary.outputs.path }}
         INPUT_BINARY: ${{ inputs.gnr8-binary }}

@@ -80,6 +80,13 @@ while IFS= read -r tag || [[ -n "$tag" ]]; do
   change_args+=(--exempt-tag "$tag")
 done <<< "${EXEMPT_TAGS:-}"
 
+annotate="${ANNOTATE_API_CHANGES:-true}"
+if [[ "$annotate" == true ]] && ! command -v python3 >/dev/null 2>&1; then
+  echo 'gnr8 action: annotate-api-changes requires python3; install python3 or set annotate-api-changes to "false"' >&2
+  exit 2
+fi
+script_dir="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+
 gating=false
 index=0
 for dir in "${dirs[@]}"; do
@@ -130,6 +137,11 @@ for dir in "${dirs[@]}"; do
         printf 'Full Markdown and JSON: the "%s" artifact.\n' "$artifact_name"
       } >> "$GITHUB_STEP_SUMMARY"
       summary_stopped=true
+    fi
+  fi
+  if [[ "$annotate" == true ]]; then
+    if ! python3 "$script_dir/emit-action-annotations.py" "$json" "$dir" "$artifact_name"; then
+      echo "::warning::gnr8 action: could not publish API change annotations; see the reports in the \"$artifact_name\" artifact. The API change gate is unchanged."
     fi
   fi
   echo "::endgroup::"

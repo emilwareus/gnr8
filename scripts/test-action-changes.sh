@@ -197,4 +197,26 @@ report_root="$(sed -n 's/^report-root=//p' "$output")"
 test "$(wc -c < "$report_root/report.md")" -gt $((1800 * 1024))
 test "$(grep -c '^<!-- gnr8-api-changes:' "$report_root/report.md")" -eq 2
 
-echo "action changes tests: OK (6 cases)"
+# The explicit off switch emits no annotations while retaining the gate.
+: > "$output"
+: > "$summary"
+GNR8_BIN="$fake" BASE_REF=HEAD ANNOTATE_API_CHANGES=false \
+  WORKING_DIRECTORIES="$repo_root/examples/bookstore" RUNNER_TEMP="$tmp" \
+  GITHUB_OUTPUT="$output" GITHUB_STEP_SUMMARY="$summary" FAKE_LOG="$log" \
+  "$runner" > "$tmp/off"
+! grep -E '^::(error|warning|notice)' "$tmp/off"
+grep -Fx 'gating=true' "$output" >/dev/null
+
+# An interpreter prerequisite is explicit; no second JSON-reading path exists.
+mkdir -p "$tmp/no-python"
+for tool in bash git cut mktemp cat wc dirname; do
+  ln -s "$(command -v "$tool")" "$tmp/no-python/$tool"
+done
+: > "$output"
+if PATH="$tmp/no-python" GNR8_BIN="$fake" BASE_REF=HEAD ANNOTATE_API_CHANGES=true \
+  WORKING_DIRECTORIES="$repo_root/examples/bookstore" RUNNER_TEMP="$tmp" \
+  GITHUB_OUTPUT="$output" GITHUB_STEP_SUMMARY="$summary" FAKE_LOG="$log" \
+  "$runner" 2> "$stderr"; then exit 1; fi
+grep -F 'annotate-api-changes requires python3' "$stderr" >/dev/null
+
+echo "action changes tests: OK (8 cases)"

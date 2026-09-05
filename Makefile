@@ -7,7 +7,7 @@
 # The Go/Python/TypeScript contract snapshots are GREEN and blocking. `make gates` runs the Rust
 # contract set; `make check` adds direct sidecar tests and release-example regeneration.
 
-.PHONY: fmt fmt-check clippy test gates fixture-build goextract-build pyextract-test tsextract-deps tsextract-test action-test release-notes-test red check all examples-check install invariants
+.PHONY: fmt fmt-check clippy test gates fixture-build goextract-build pyextract-test tsextract-deps tsextract-test action-test action-annotations-test release-notes-test red check all examples-check install invariants
 
 # Auto-format the workspace in place.
 fmt:
@@ -92,11 +92,16 @@ tsextract-test: tsextract-deps
 # Exercise the composite action's exact direct-dependency version resolver against real and
 # adversarial lock graphs (including a conflicting transitive gnr8 version), and its Rust toolchain
 # resolver against repository pins (so CI compiles `.gnr8` with the same rustc as developer machines).
-action-test:
+action-test: action-annotations-test
 	bash scripts/test-action-version.sh
 	bash scripts/test-action-toolchain.sh
 	bash scripts/test-action-changes.sh
 	bash scripts/test-action-comment.sh
+	bash scripts/test-action-annotations.sh
+
+# Unit coverage for the workflow-command encoder, alongside the release script tests.
+action-annotations-test:
+	python3 -m unittest discover -s scripts -p 'test_emit_action_annotations.py'
 
 # Keep release publication tied to a dated changelog section with an empty Unreleased section.
 release-notes-test:
