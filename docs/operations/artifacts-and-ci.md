@@ -310,12 +310,15 @@ Each invocation owns one comment using
 `<!-- gnr8-api-changes:gnr8-api-changes-<job>-<8-hex-digest> -->`, where the digest is the first eight
 hex characters of Git's blob hash of `working-directories`, a newline, `base-ref`, and a newline.
 The key is also the artifact name. Matrix jobs with different project inputs therefore own different
-comments; all project blocks in a single invocation share its key. Changing the job, working
-directories, or base ref leaves the previous keyed comment behind. Ownership follows whole marker
-lines, regardless of author, so GitHub App tokens and PATs upsert too. The oldest matching comment
-is updated and duplicates are deleted. For one release the old bare gnr8 marker is also adopted.
-A body digest avoids writes for unchanged reports. Empty reports update the comment to show no
-findings rather than deleting it.
+comments; all project blocks in a single invocation share its key. A matrix dimension outside those
+three inputs — a runner OS or a toolchain version, say — is not part of the key, so those legs share
+one comment and concurrent legs can briefly create duplicates, which the next run collapses onto the
+oldest. Changing the job, working directories, or base ref leaves the previous keyed comment behind.
+Ownership follows whole marker lines, regardless of author, so GitHub App tokens and PATs upsert
+too. The oldest matching comment is updated and duplicates are deleted. For one release the old
+bare gnr8 marker is also adopted. A body digest avoids writes for unchanged reports, comparing
+CR-trimmed lines so a body GitHub stored with CRLF endings is still recognised. Empty reports update
+the comment to show no findings rather than deleting it.
 
 Completed projects reach the summary incrementally and remain in the uploaded artifact if a later
 project fails. Incomplete runs do not post a combined comment. The summary appends whole project

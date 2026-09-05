@@ -36,13 +36,14 @@ if args[:2] == ['api', '--paginate']:
     marker = os.environ['MARKER']
     query = args[args.index('--jq') + 1]
     digest = '<!-- gnr8-api-changes-digest:'
-    assert query.startswith('.[] | select(.body | split("\\n") | map(rtrimstr("\\r")) | any(. == "' + marker + '" or . == "<!-- gnr8-api-changes -->")) | [.id, (.body | startswith("' + digest)
-    assert query.endswith('\\n"))] | @tsv')
-    prefix = query.split('startswith("', 1)[1].split('\\n"', 1)[0] + '\n'
+    assert query.startswith('.[] | (.body | split("\\n") | map(rtrimstr("\\r"))) as $lines | select($lines | any(. == "' + marker + '" or . == "<!-- gnr8-api-changes -->")) | [.id, ($lines[0] == "' + digest)
+    assert query.endswith('")] | @tsv')
+    expected = query.split('($lines[0] == "', 1)[1].rsplit('")] | @tsv', 1)[0]
     assert 'user' not in query
     for comment in comments:
-        if any(line.rstrip('\r') in (marker, '<!-- gnr8-api-changes -->') for line in comment['body'].split('\n')):
-            print(str(comment['id']) + '\t' + str(comment['body'].startswith(prefix)).lower())
+        lines = [line.rstrip('\r') for line in comment['body'].split('\n')]
+        if any(line in (marker, '<!-- gnr8-api-changes -->') for line in lines):
+            print(str(comment['id']) + '\t' + str(lines[0] == expected).lower())
 else:
     if args[:3] == ['api', '--method', 'PATCH']:
         comment_id = int(args[3].rsplit('/', 1)[1])
@@ -174,4 +175,24 @@ PYTHON
 grep -F '"PATCH", "repos/oaiz-io/gnr8/issues/comments/1"' "$GH_LOG" >/dev/null
 assert_absent -F '"pr", "comment"' "$GH_LOG"
 
-echo "action comment tests: OK (12 cases)"
+# The digest guard reads the same CR-trimmed lines as the ownership match, so a body GitHub stored
+# with CRLF endings is still recognised as unchanged instead of being rewritten on every run.
+seed own
+python3 - "$GH_STATE" "$REPORT_PATH" <<'PYTHON'
+from pathlib import Path
+import json, subprocess, sys
+state, report = Path(sys.argv[1]), Path(sys.argv[2])
+digest = subprocess.run(['git', 'hash-object', '--no-filters', '--', str(report)],
+                        capture_output=True, text=True, check=True).stdout.strip()
+comments = json.loads(state.read_text())
+body = '<!-- gnr8-api-changes-digest:%s -->\n%s' % (digest, report.read_text())
+comments[0]['body'] = body.replace('\n', '\r\n')
+state.write_text(json.dumps(comments))
+PYTHON
+: > "$GH_LOG"
+"$upsert"
+test "$(wc -l < "$GH_LOG")" -eq 1
+assert_absent -F '"PATCH"' "$GH_LOG"
+assert_absent -F '"pr", "comment"' "$GH_LOG"
+
+echo "action comment tests: OK (13 cases)"

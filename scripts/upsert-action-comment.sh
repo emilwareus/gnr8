@@ -20,9 +20,11 @@ trap 'rm -f "$body"' EXIT
 { printf '%s\n' "$digest_marker"; cat "$REPORT_PATH"; } > "$body"
 
 # TODO: Remove the old bare marker match after one release of keyed comments.
-# Match whole marker lines, so a marker quoted by an indented finding cannot own a comment.
+# Match whole marker lines, so a marker quoted by an indented finding cannot own a comment. Both the
+# ownership match and the digest guard read the same CR-trimmed lines: GitHub stores a body edited
+# through the web UI with CRLF endings, and a guard that only accepted LF would rewrite every run.
 comments="$(gh api --paginate "repos/$REPOSITORY/issues/$PR_NUMBER/comments" \
-  --jq ".[] | select(.body | split(\"\\n\") | map(rtrimstr(\"\\r\")) | any(. == \"$MARKER\" or . == \"<!-- gnr8-api-changes -->\")) | [.id, (.body | startswith(\"$digest_marker\\n\"))] | @tsv")"
+  --jq ".[] | (.body | split(\"\\n\") | map(rtrimstr(\"\\r\"))) as \$lines | select(\$lines | any(. == \"$MARKER\" or . == \"<!-- gnr8-api-changes -->\")) | [.id, (\$lines[0] == \"$digest_marker\")] | @tsv")"
 
 first=true
 while IFS=$'\t' read -r comment_id unchanged; do
