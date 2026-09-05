@@ -12,8 +12,11 @@ struct BaseRevision<'a> {
     resolved: &'a str,
 }
 
+const CHANGE_REPORT_SCHEMA_VERSION: u32 = 1;
+
 #[derive(serde::Serialize)]
 struct MachineReport<'a> {
+    schema_version: u32,
     base: BaseRevision<'a>,
     policy: &'a gnr8_engine::changes::ChangePolicy,
     summary: &'a gnr8_engine::changes::ChangeSummary,
@@ -71,6 +74,7 @@ pub(crate) fn render_json(
     report: &ChangeReport,
 ) -> Result<String, serde_json::Error> {
     let output = MachineReport {
+        schema_version: CHANGE_REPORT_SCHEMA_VERSION,
         base: BaseRevision {
             reference: &base.reference,
             resolved: &base.commit,
@@ -158,44 +162,66 @@ pub(crate) fn render_markdown(base: &BaseGraph, report: &ChangeReport) -> String
         text.push_str("    No API changes.\n");
         return text;
     }
-    for change in &report.changes {
-        let operation = one_line(change.operation.as_deref().unwrap_or("-"));
-        let _ = writeln!(
-            text,
-            "    {:<9} {:<19} {}{}",
-            kind_label(change.kind),
-            operation,
-            one_line(&change.message),
-            exemption_suffix(change)
-        );
-        let affected: BTreeSet<(String, String)> = [
-            change.affected_operations.base.as_ref(),
-            change.affected_operations.current.as_ref(),
-        ]
-        .into_iter()
-        .flatten()
-        .flatten()
-        .map(|item| (one_line(&item.operation_id), one_line(&item.operation)))
-        .collect();
-        if !affected.is_empty() {
-            let rendered = affected
-                .iter()
-                .map(|(operation_id, operation)| format!("{operation_id} ({operation})"))
-                .collect::<Vec<_>>()
-                .join(", ");
-            let _ = writeln!(text, "        SDK operations: {rendered}");
+    // Partition without re-sorting: retain the machine report's order within every group.
+    // Headings are static text plus counts, never values drawn from analyzed source.
+    for (heading, kind, gating) in [
+        ("Breaking — gating", ChangeKind::Breaking, true),
+        ("Breaking — not gating", ChangeKind::Breaking, false),
+        ("Additive", ChangeKind::Additive, false),
+        ("Documentation-only", ChangeKind::DocOnly, false),
+    ] {
+        let group: Vec<_> = report
+            .changes
+            .iter()
+            .filter(|change| {
+                change.kind == kind && (kind != ChangeKind::Breaking || change.gating == gating)
+            })
+            .collect();
+        if group.is_empty() {
+            continue;
         }
-        if let Some(file) = change.file.as_deref().filter(|file| !file.is_empty()) {
-            let location = one_line(file);
-            match change.line {
-                Some(line) => {
-                    let _ = writeln!(text, "        Source: {location}:{line}");
-                }
-                None => {
-                    let _ = writeln!(text, "        Source: {location}");
+        let _ = writeln!(text, "{heading} ({})\n", group.len());
+        for change in &group {
+            let operation = one_line(change.operation.as_deref().unwrap_or("-"));
+            let _ = writeln!(
+                text,
+                "    {:<9} {:<19} {}{}",
+                kind_label(change.kind),
+                operation,
+                one_line(&change.message),
+                exemption_suffix(change)
+            );
+            let _ = writeln!(text, "        Code: {}", one_line(&change.code));
+            let affected: BTreeSet<(String, String)> = [
+                change.affected_operations.base.as_ref(),
+                change.affected_operations.current.as_ref(),
+            ]
+            .into_iter()
+            .flatten()
+            .flatten()
+            .map(|item| (one_line(&item.operation_id), one_line(&item.operation)))
+            .collect();
+            if !affected.is_empty() {
+                let rendered = affected
+                    .iter()
+                    .map(|(operation_id, operation)| format!("{operation_id} ({operation})"))
+                    .collect::<Vec<_>>()
+                    .join(", ");
+                let _ = writeln!(text, "        SDK operations: {rendered}");
+            }
+            if let Some(file) = change.file.as_deref().filter(|file| !file.is_empty()) {
+                let location = one_line(file);
+                match change.line {
+                    Some(line) => {
+                        let _ = writeln!(text, "        Source: {location}:{line}");
+                    }
+                    None => {
+                        let _ = writeln!(text, "        Source: {location}");
+                    }
                 }
             }
         }
+        text.push('\n');
     }
     text
 }
@@ -426,12 +452,17 @@ mod tests {
                 },
             )],
         };
-        let value: serde_json::Value =
-            serde_json::from_str(&render_json(&base, &report).expect("render JSON"))
-                .expect("parse JSON");
+        let rendered = render_json(&base, &report).expect("render JSON");
+        assert!(rendered.starts_with("{\n  \"schema_version\": 1,\n"));
+        let value: serde_json::Value = serde_json::from_str(&rendered).expect("parse JSON");
+        assert_eq!(value["schema_version"], 1);
         assert_eq!(value["base"]["ref"], "origin/main");
         assert_eq!(value["policy"]["exempt_tags"][0], "internal");
         assert_eq!(value["changes"][0]["exempt"]["base"], true);
+        // Machine consumers must handle omitted current locations, not just explicit nulls.
+        for field in ["file", "line", "span"] {
+            assert!(value["changes"][0].get(field).is_none());
+        }
         assert_eq!(
             value["changes"][0]["affected_operations"]["base"][0]["operation_id"],
             "deleteBook"
@@ -508,10 +539,12 @@ mod tests {
                 "\n",
                 "Summary: 1 breaking, 0 additive, 0 doc-only, 0 gating.\n",
                 "\n",
+                "Breaking — not gating (1)\n\n",
                 "    BREAKING  DELETE /books/{id}  operation removed",
                 "  (exempt on base side; not gating)\n",
+                "        Code: operation.removed\n",
                 "        SDK operations: deleteBook (DELETE /books/{id}), listBooks (GET /books)\n",
-                "        Source: handlers/books.go:42\n",
+                "        Source: handlers/books.go:42\n\n",
             )
         );
     }
@@ -532,6 +565,7 @@ mod tests {
             },
         );
         change.message = "operation removed\r\n## injected heading\n```".to_string();
+        change.code = "operation.removed\r\n## hostile code".to_string();
         change.operation = Some("GET /a\nb".to_string());
         change.file = Some("handlers/<books>.go".to_string());
         change.line = None;
@@ -572,7 +606,10 @@ mod tests {
             .lines()
             .skip_while(|line| !line.starts_with("    "))
         {
-            assert!(line.starts_with("    "), "escaped the code block: {line:?}");
+            assert!(
+                line.is_empty() || line.starts_with("    "),
+                "escaped the code block: {line:?}"
+            );
         }
     }
 
@@ -593,6 +630,75 @@ mod tests {
         let rendered = render_markdown(&base, &report);
         assert!(rendered.contains("Exempt tags: none\n"), "{rendered}");
         assert!(rendered.ends_with("    No API changes.\n"), "{rendered}");
+        for heading in ["Breaking —", "Additive (", "Documentation-only ("] {
+            assert!(!rendered.contains(heading));
+        }
+    }
+
+    #[test]
+    fn markdown_report_partitions_all_four_groups_in_stable_order() {
+        let base = BaseGraph {
+            reference: "HEAD".to_string(),
+            commit: "0123456789012345678901234567890123456789".to_string(),
+            graph: gnr8_engine::graph::ApiGraph::default(),
+        };
+        let mut changes = Vec::new();
+        for (kind, gating) in [
+            (ChangeKind::Breaking, false),
+            (ChangeKind::Breaking, true),
+            (ChangeKind::Breaking, true),
+            (ChangeKind::Additive, false),
+            (ChangeKind::DocOnly, false),
+        ] {
+            let mut change = finding(
+                kind,
+                gating,
+                Sides {
+                    base: Some(!gating),
+                    current: None,
+                },
+            );
+            change.message = format!("finding {}\n## hostile heading", changes.len());
+            change.code = "code\r\n```".to_string();
+            changes.push(change);
+        }
+        let report = ChangeReport {
+            policy: ChangePolicy {
+                exempt_tags: Vec::new(),
+            },
+            summary: ChangeSummary {
+                breaking: 3,
+                additive: 1,
+                doc_only: 1,
+                gating: 2,
+            },
+            changes,
+        };
+        let rendered = render_markdown(&base, &report);
+        let headings: Vec<_> = rendered
+            .lines()
+            .skip(6)
+            .filter(|line| !line.is_empty() && !line.starts_with("    "))
+            .collect();
+        assert_eq!(
+            headings,
+            [
+                "Breaking — gating (2)",
+                "Breaking — not gating (1)",
+                "Additive (1)",
+                "Documentation-only (1)"
+            ]
+        );
+        let positions: Vec<_> = [1, 2, 0, 3, 4]
+            .iter()
+            .map(|index| {
+                rendered
+                    .find(&format!("finding {index} ## hostile heading"))
+                    .expect("finding")
+            })
+            .collect();
+        assert!(positions.windows(2).all(|pair| pair[0] < pair[1]));
+        assert_eq!(rendered.matches("        Code: code ```\n").count(), 5);
     }
 
     #[test]

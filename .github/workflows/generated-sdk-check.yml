@@ -51,9 +51,7 @@ jobs:
       fail-fast: false
       matrix:
         include:
-          # `report_changes` runs the action's changes mode against the real binary. One project is
-          # enough — that path is language-agnostic — and one keeps the pull-request comment step
-          # from racing five jobs over the same marker comment.
+          # Two projects exercise changes mode with distinct artifact and comment keys.
           - project: bookstore
             setup_go: "true"
             setup_python: "false"
@@ -63,7 +61,7 @@ jobs:
             setup_go: "true"
             setup_python: "false"
             setup_node: "false"
-            report_changes: "false"
+            report_changes: "true"
           - project: fastapi-bookstore
             setup_go: "false"
             setup_python: "true"

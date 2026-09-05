@@ -145,14 +145,18 @@ this comparison; their media types still participate in `request.body.media_type
 
 `--markdown` prints the same report as a Markdown block for a job summary or a pull-request
 comment: the base revision, the exempt-tag policy, the summary counts, and the findings in an
-indented code block with their affected SDK operations and source locations. It selects the report
+indented code block with a `Code:` line, their affected SDK operations, and source locations.
+Non-empty groups appear in this order: `Breaking — gating`, `Breaking — not gating`, `Additive`,
+and `Documentation-only`, each with its count. Empty groups are omitted. It selects the report
 format, so it cannot be combined with `--json`. The GitHub Action publishes this output rather than
 formatting one of its own.
 
 JSON contains the requested and resolved base revision, sorted exempt-tag policy, summary counts,
 and deterministically sorted changes with stable dotted codes, effective tags and exemption state
 for both graph sides, the derived `gating` result, affected SDK operations on both extant sides, and
-current source locations where available.
+current source locations where available. The JSON envelope starts with `schema_version: 1`;
+`report.json` is a documented, versioned artifact for machine consumers. Consumers should check
+that version before interpreting the payload.
 
 Human output keeps the three columns — kind, operation, message — and appends an exemption suffix
 when a breaking finding is not gating. When a current source location exists, it also appends

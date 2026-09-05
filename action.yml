@@ -26,6 +26,10 @@ inputs:
     description: Run gnr8 changes, publish reports, and gate on checked breaking changes.
     required: false
     default: "false"
+  annotate-api-changes:
+    description: Emit workflow annotations for findings that carry a current source location.
+    required: false
+    default: "true"
   base-ref:
     description: Git revision containing the committed base graph artifact.
     required: false
@@ -97,6 +101,7 @@ runs:
         INSTALL_METHOD: ${{ inputs.install-method }}
         REQUESTED_VERSION: ${{ inputs.version }}
         REPORT_API_CHANGES: ${{ inputs.report-api-changes }}
+        ANNOTATE_API_CHANGES: ${{ inputs.annotate-api-changes }}
         BASE_REF: ${{ inputs.base-ref }}
         SETUP_GO: ${{ inputs.setup-go }}
         SETUP_NODE: ${{ inputs.setup-node }}
@@ -116,6 +121,7 @@ runs:
 
         validate_boolean cache "$CACHE_ENABLED"
         validate_boolean report-api-changes "$REPORT_API_CHANGES"
+        validate_boolean annotate-api-changes "$ANNOTATE_API_CHANGES"
         validate_boolean setup-go "$SETUP_GO"
         validate_boolean setup-node "$SETUP_NODE"
         validate_boolean setup-python "$SETUP_PYTHON"
@@ -305,6 +311,7 @@ runs:
       shell: bash
       env:
         BASE_REF: ${{ inputs.base-ref }}
+        ANNOTATE_API_CHANGES: ${{ inputs.annotate-api-changes }}
         EXEMPT_TAGS: ${{ inputs.exempt-tags }}
         GNR8_BIN: ${{ steps.binary.outputs.path }}
         INPUT_BINARY: ${{ inputs.gnr8-binary }}
@@ -333,10 +340,17 @@ runs:
         PR_NUMBER: ${{ github.event.pull_request.number }}
         REPOSITORY: ${{ github.repository }}
         REPORT_PATH: ${{ steps.api-changes.outputs.combined-report }}
+        MARKER: ${{ steps.api-changes.outputs.marker }}
+        ARTIFACT_NAME: ${{ steps.api-changes.outputs.artifact-name }}
+        IS_FORK: ${{ github.event.pull_request.head.repo.fork }}
       run: |
         set -euo pipefail
-        if ! "$GITHUB_ACTION_PATH/scripts/upsert-action-comment.sh"; then
-          echo "::warning::gnr8 action could not comment on the pull request; the step summary and artifacts contain the report"
+        if [[ "$IS_FORK" == "true" ]]; then
+          echo "::notice::gnr8 action: pull-request comments are unavailable on fork pull requests (the token is read-only); reports are in this job's summary and the \"$ARTIFACT_NAME\" artifact. See https://github.com/oaiz-io/gnr8/blob/main/docs/operations/artifacts-and-ci.md#fork-pull-requests for the workflow_run recipe."
+        elif [[ "$(wc -c < "$REPORT_PATH")" -gt $((60 * 1024)) ]]; then
+          echo "::warning::gnr8 action: comment exceeds gnr8's 60 KiB budget; the full Markdown and JSON reports are in the \"$ARTIFACT_NAME\" artifact."
+        elif ! "$GITHUB_ACTION_PATH/scripts/upsert-action-comment.sh"; then
+          echo "::warning::gnr8 action: could not comment on the pull request. Check \"permissions: pull-requests: write\" in the workflow and the API error above. Reports are in this job's summary and the \"$ARTIFACT_NAME\" artifact."
         fi
 
     - name: Run gnr8 check

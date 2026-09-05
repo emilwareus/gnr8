@@ -9,6 +9,25 @@ must move the minor version.
 
 ## Unreleased
 
+### Added
+
+- API change workflow annotations for current source locations, enabled by `annotate-api-changes`
+  when reporting is on. Gating breaks are errors, exempt breaks warnings, and additions notices;
+  gnr8 caps them at 50 per project. Requires `python3`; documentation-only findings stay in reports.
+- PR comment keys shared with artifact names, separating jobs and project inputs. Unchanged report
+  bodies avoid API writes, and fork PR notices name the report artifact.
+- `schema_version: 1` in the documented JSON change report artifact.
+- Markdown change reports show stable `Code:` identifiers and counted groups for gating breaks,
+  exempt breaks, additions, and documentation-only findings.
+
+### Fixed
+
+- Non-bot tokens now upsert PR comments by marker; existing duplicates converge on the oldest
+  comment and the old bare gnr8 marker is adopted for one release.
+- Completed project reports remain in summaries and artifacts when a later project fails.
+- Step summaries stop at whole project blocks within a 900 KiB budget and identify the full
+  artifact. Comments over gnr8's 60 KiB budget skip publication with a specific warning.
+
 ## 0.12.0 — 2026-09-04
 
 ### Breaking

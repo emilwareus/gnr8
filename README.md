@@ -138,6 +138,10 @@ name: gnr8
 
 on: [push, pull_request]
 
+permissions:
+  contents: read
+  pull-requests: write
+
 jobs:
   check-generated:
     runs-on: ubuntu-latest
@@ -145,11 +149,14 @@ jobs:
       - uses: actions/checkout@v7
         with:
           fetch-depth: 0
-      - uses: oaiz-io/gnr8@v0.11.0 # first release with API change reporting
+      - uses: oaiz-io/gnr8@v0.12.0 # first release with API change reporting
         with:
           setup-go: "true"
           report-api-changes: "true"
 ```
+
+Without `pull-requests: write`, reports remain in the job summary and uploaded artifact. Fork PRs
+use those surfaces regardless of the permissions block; see the [fork publishing recipe](docs/operations/artifacts-and-ci.md#fork-pull-requests).
 
 Pin an exact released tag. For Python and TypeScript sources, use the matching setup input. See
 [Artifacts and CI](docs/operations/artifacts-and-ci.md) for all inputs and multi-project examples.

@@ -1,6 +1,16 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
+# `! grep` alone is exempt from errexit, so negative assertions must fail explicitly.
+assert_absent() {
+  local status=0
+  grep "$@" || status=$?
+  if [[ "$status" -ne 1 ]]; then
+    echo "expected no matching output (grep status $status)" >&2
+    exit 1
+  fi
+}
+
 repo_root="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 runner="$repo_root/scripts/run-action-changes.sh"
 tmp="$(mktemp -d)"
@@ -17,8 +27,17 @@ cat > "$fake" <<'SH'
 #!/usr/bin/env bash
 printf '%q ' "$@" >> "$FAKE_LOG"
 printf '\n' >> "$FAKE_LOG"
+if [[ -n "${FAIL_PROJECT:-}" && "$PWD" == "$FAIL_PROJECT" ]]; then exit 2; fi
+if [[ "${INVALID_JSON:-false}" == true && "$1" == --json ]]; then
+  printf '{}\n'
+  exit 1
+fi
 for arg in "$@"; do
   if [[ "$arg" == "--markdown" ]]; then
+    if [[ "${OVERSIZED:-false}" == true ]]; then
+      python3 -c 'print("    " + "x" * (901 * 1024))'
+      exit 1
+    fi
     cat <<'MARKDOWN'
 Base: <code>HEAD</code> → <code>0123456789012345678901234567890123456789</code>
 
@@ -26,7 +45,10 @@ Exempt tags: <code>internal</code>
 
 Summary: 1 breaking, 0 additive, 0 doc-only, 1 gating.
 
+Breaking — gating (1)
+
     BREAKING  DELETE /books/{id}  operation removed ## injected heading
+        Code: operation.removed
         SDK operations: deleteBook (DELETE /books/{id}), listBooks (GET /books)
         Source: handlers/<books>.go:42
 MARKDOWN
@@ -35,6 +57,7 @@ MARKDOWN
 done
 cat <<'JSON'
 {
+  "schema_version": 1,
   "base": {"ref": "HEAD", "resolved": "0123456789012345678901234567890123456789"},
   "policy": {"exempt_tags": ["internal"]},
   "summary": {"breaking": 1, "additive": 0, "doc_only": 0, "gating": 1},
@@ -78,14 +101,17 @@ GITHUB_OUTPUT="$output" \
 GITHUB_STEP_SUMMARY="$summary" \
 GITHUB_JOB=test \
 FAKE_LOG="$log" \
-  "$runner"
+  "$runner" > "$tmp/run-stdout"
 
 grep -Fx 'gating=true' "$output" >/dev/null
 grep -F 'artifact-name=gnr8-api-changes-test-' "$output" >/dev/null
 grep -F 'BREAKING  DELETE /books/{id}  operation removed ## injected heading' "$summary" >/dev/null
 grep -F 'SDK operations: deleteBook (DELETE /books/{id}), listBooks (GET /books)' "$summary" >/dev/null
 grep -F 'Source: handlers/<books>.go:42' "$summary" >/dev/null
-grep -Fx '<!-- gnr8-api-changes -->' "$summary" >/dev/null
+artifact_name="$(sed -n 's/^artifact-name=//p' "$output")"
+grep -Ex 'artifact-name=gnr8-api-changes-test-[0-9a-f]{8}' "$output" >/dev/null
+grep -Fx "<!-- gnr8-api-changes:$artifact_name -->" "$summary" >/dev/null
+grep -Fx "marker=<!-- gnr8-api-changes:$artifact_name -->" "$output" >/dev/null
 if grep -E '^## injected heading$|^```' "$summary" >/dev/null; then
   echo "report content escaped its indented code block" >&2
   exit 1
@@ -119,7 +145,7 @@ GITHUB_OUTPUT="$empty_output" \
 GITHUB_STEP_SUMMARY="$empty_summary" \
 GITHUB_JOB=test \
 FAKE_LOG="$empty_log" \
-  "$runner"
+  "$runner" > "$tmp/run-stdout"
 
 grep -Fx 'gating=true' "$empty_output" >/dev/null
 grep -F -- '--base HEAD' "$empty_log" >/dev/null
@@ -134,6 +160,11 @@ if grep -F 'a<b>&c' "$empty_summary" >/dev/null; then
   exit 1
 fi
 
+# Separate matrix invocations own distinct markers, each derived from its artifact name.
+second_name="$(sed -n 's/^artifact-name=//p' "$empty_output")"
+test "$artifact_name" != "$second_name"
+grep -Fx "<!-- gnr8-api-changes:$second_name -->" "$empty_summary" >/dev/null
+
 stderr="$tmp/missing-stderr"
 if GNR8_BIN="$fake" \
   BASE_REF=refs/heads/not-present \
@@ -142,10 +173,128 @@ if GNR8_BIN="$fake" \
   GITHUB_OUTPUT="$output" \
   GITHUB_STEP_SUMMARY="$summary" \
   FAKE_LOG="$log" \
-  "$runner" 2> "$stderr"; then
+  "$runner" > "$tmp/run-stdout" 2> "$stderr"; then
   echo "expected missing base history to fail" >&2
   exit 1
 fi
 grep -F 'checkout with fetch-depth: 0' "$stderr" >/dev/null
 
-echo "action changes tests: OK"
+# A complete first project survives a failed second project. Only completion outputs stay absent.
+: > "$output"
+: > "$summary"
+if GNR8_BIN="$fake" BASE_REF=HEAD FAIL_PROJECT="$weird_dir" \
+  WORKING_DIRECTORIES="$repo_root/examples/bookstore"$'\n'"$weird_dir" \
+  RUNNER_TEMP="$tmp" GITHUB_OUTPUT="$output" GITHUB_STEP_SUMMARY="$summary" \
+  GITHUB_JOB=test FAKE_LOG="$log" "$runner" > "$tmp/run-stdout" 2> "$stderr"; then
+  echo "expected project 2 to fail" >&2; exit 1
+fi
+grep -F 'report-root=' "$output" >/dev/null
+grep -F 'artifact-name=' "$output" >/dev/null
+grep -F 'BREAKING  DELETE /books/{id}' "$summary" >/dev/null
+assert_absent -E '^(combined-report|gating)=' "$output"
+report_root="$(sed -n 's/^report-root=//p' "$output")"
+test -s "$report_root/001/report.md"
+test -s "$report_root/001/report.json"
+
+# Keep both full artifacts when the summary budget cannot accommodate a whole project block.
+: > "$output"
+: > "$summary"
+GNR8_BIN="$fake" BASE_REF=HEAD OVERSIZED=true \
+  WORKING_DIRECTORIES="$repo_root/examples/bookstore"$'\n'"$weird_dir" \
+  RUNNER_TEMP="$tmp" GITHUB_OUTPUT="$output" GITHUB_STEP_SUMMARY="$summary" \
+  GITHUB_JOB=test FAKE_LOG="$log" "$runner" > "$tmp/run-stdout"
+grep -F 'Report truncated at 900 KiB' "$summary" >/dev/null
+test "$(grep -c 'Report truncated' "$summary")" -eq 1
+test "$(wc -c < "$summary")" -lt $((1024 * 1024))
+grep -Fx 'gating=true' "$output" >/dev/null
+report_root="$(sed -n 's/^report-root=//p' "$output")"
+test "$(wc -c < "$report_root/report.md")" -gt $((1800 * 1024))
+test "$(grep -c '^<!-- gnr8-api-changes:' "$report_root/report.md")" -eq 2
+
+# The explicit off switch emits no annotations while retaining the gate.
+: > "$output"
+: > "$summary"
+GNR8_BIN="$fake" BASE_REF=HEAD ANNOTATE_API_CHANGES=false \
+  WORKING_DIRECTORIES="$repo_root/examples/bookstore" RUNNER_TEMP="$tmp" \
+  GITHUB_OUTPUT="$output" GITHUB_STEP_SUMMARY="$summary" FAKE_LOG="$log" \
+  "$runner" > "$tmp/off"
+assert_absent -E '^::(error|warning|notice)' "$tmp/off"
+grep -Fx 'gating=true' "$output" >/dev/null
+
+# An interpreter prerequisite is explicit; no second JSON-reading path exists.
+mkdir -p "$tmp/no-python"
+for tool in bash git cut mktemp cat wc dirname mkdir sed; do
+  ln -s "$(command -v "$tool")" "$tmp/no-python/$tool"
+done
+: > "$output"
+if PATH="$tmp/no-python" GNR8_BIN="$fake" BASE_REF=HEAD ANNOTATE_API_CHANGES=true \
+  WORKING_DIRECTORIES="$repo_root/examples/bookstore" RUNNER_TEMP="$tmp" \
+  GITHUB_OUTPUT="$output" GITHUB_STEP_SUMMARY="$summary" FAKE_LOG="$log" \
+  "$runner" > "$tmp/run-stdout" 2> "$stderr"; then exit 1; fi
+grep -F 'annotate-api-changes requires python3' "$stderr" >/dev/null
+
+# Disabled annotations also work without the interpreter.
+: > "$output"
+PATH="$tmp/no-python" GNR8_BIN="$fake" BASE_REF=HEAD ANNOTATE_API_CHANGES=false \
+  WORKING_DIRECTORIES="$repo_root/examples/bookstore" RUNNER_TEMP="$tmp" \
+  GITHUB_OUTPUT="$output" GITHUB_STEP_SUMMARY="$summary" FAKE_LOG="$log" \
+  "$runner" > "$tmp/off"
+grep -Fx 'gating=true' "$output" >/dev/null
+assert_absent -E '^::(error|warning|notice)' "$tmp/off"
+
+# Summary write and emitter failures still publish the completed gate and report path.
+: > "$output"
+GNR8_BIN="$fake" BASE_REF=HEAD INVALID_JSON=true \
+  WORKING_DIRECTORIES="$repo_root/examples/bookstore" RUNNER_TEMP="$tmp" \
+  GITHUB_OUTPUT="$output" GITHUB_STEP_SUMMARY="$tmp/missing/summary" FAKE_LOG="$log" \
+  "$runner" > "$tmp/failures" 2> "$stderr"
+grep -F 'could not publish the step summary' "$tmp/failures" >/dev/null
+grep -F 'could not publish API change annotations' "$tmp/failures" >/dev/null
+grep -Fx 'gating=true' "$output" >/dev/null
+grep -F 'combined-report=' "$output" >/dev/null
+
+# Multiline runner paths cannot inject extra GitHub outputs.
+multiline_temp="$tmp/line"$'\n'"gating=false"
+mkdir -p "$multiline_temp"
+: > "$output"
+GNR8_BIN="$fake" BASE_REF=HEAD ANNOTATE_API_CHANGES=false \
+  WORKING_DIRECTORIES="$repo_root/examples/bookstore" RUNNER_TEMP="$multiline_temp" \
+  GITHUB_OUTPUT="$output" GITHUB_STEP_SUMMARY="$summary" FAKE_LOG="$log" \
+  "$runner" > "$tmp/run-stdout"
+python3 - "$output" <<'PYTHON'
+from pathlib import Path
+import sys
+lines = iter(Path(sys.argv[1]).read_text().splitlines())
+outputs = {}
+for line in lines:
+    if '<<' in line:
+        name, delimiter = line.split('<<', 1)
+        values = []
+        for part in lines:
+            if part == delimiter:
+                break
+            values.append(part)
+        outputs[name] = '\n'.join(values)
+    else:
+        name, value = line.split('=', 1)
+        outputs[name] = value
+assert set(outputs) == {'report-root', 'artifact-name', 'marker', 'gating', 'combined-report'}
+assert outputs['gating'] == 'true'
+assert '\ngating=false/' in outputs['report-root']
+assert Path(outputs['combined-report']).is_file()
+PYTHON
+
+# A carriage return in a directory cannot split Markdown or workflow commands.
+control_dir="$repo_root/target/gnr8-action-changes-test/a"$'\r'"## injected heading"
+mkdir -p "$control_dir"
+: > "$output"
+: > "$summary"
+GNR8_BIN="$fake" BASE_REF=HEAD WORKING_DIRECTORIES="$control_dir" RUNNER_TEMP="$tmp" \
+  GITHUB_OUTPUT="$output" GITHUB_STEP_SUMMARY="$summary" FAKE_LOG="$log" \
+  "$runner" > "$tmp/control"
+assert_absent -F $'\r' "$summary" "$tmp/control"
+assert_absent -E '^## injected heading$' "$summary"
+grep -Fx '::group::gnr8 changes project 1' "$tmp/control" >/dev/null
+grep -F '%0D## injected heading/' "$tmp/control" >/dev/null
+
+echo "action changes tests: OK (12 cases)"
